@@ -1,0 +1,222 @@
+import type {
+  Project, Song, Scene, SceneAsset, Character, GenerationJob, ModelsConfig, ProjectCosts,
+} from "./types";
+
+const BASE = "/api";
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    headers: { "Content-Type": "application/json", ...init?.headers },
+    ...init,
+  });
+  if (!res.ok) {
+    // FastAPI returns errors as `{"detail": "..."}` — extract that so toasts
+    // show the actionable message instead of the raw JSON wrapper. Falls
+    // back to the body as-is for non-JSON / non-standard error shapes.
+    const raw = await res.text();
+    let msg = raw;
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.detail === "string") {
+        msg = parsed.detail;
+      } else if (parsed && Array.isArray(parsed.detail)) {
+        // FastAPI validation errors come as an array of issue objects.
+        msg = parsed.detail.map((d: any) => d.msg || JSON.stringify(d)).join("; ");
+      }
+    } catch {
+      // raw wasn't JSON — leave msg as the raw text
+    }
+    throw new Error(`${res.status}: ${msg}`);
+  }
+  if (res.status === 204) return undefined as T;
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Projects
+// ---------------------------------------------------------------------------
+export const api = {
+  projects: {
+    list: () => request<Project[]>("/projects"),
+    get: (id: number) => request<Project>(`/projects/${id}`),
+    create: (data: { name: string; description?: string; style?: string; aspect_ratio?: string }) =>
+      request<Project>("/projects", { method: "POST", body: JSON.stringify(data) }),
+    update: (id: number, data: Partial<Project>) =>
+      request<Project>(`/projects/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
+    delete: (id: number) => request<void>(`/projects/${id}`, { method: "DELETE" }),
+    expandStyle: (style: string, llm_model?: string) =>
+      request<{ expanded: string }>("/projects/expand-style", {
+        method: "POST",
+        body: JSON.stringify({ style, llm_model }),
+      }),
+    addCharacter: (projectId: number, data: { name: string; description: string; trigger_word?: string }) =>
+      request<Character>(`/projects/${projectId}/characters`, { method: "POST", body: JSON.stringify(data) }),
+    updateCharacter: (projectId: number, charId: number, data: { name?: string; description?: string; trigger_word?: string }) =>
+      request<Character>(`/projects/${projectId}/characters/${charId}`, { method: "PATCH", body: JSON.stringify(data) }),
+    deleteCharacter: (projectId: number, charId: number) =>
+      request<void>(`/projects/${projectId}/characters/${charId}`, { method: "DELETE" }),
+    uploadCharacterImage: async (projectId: number, charId: number, file: File): Promise<Character> => {
+      const form = new FormData();
+      form.append("file", file);
+      const res = await fetch(`${BASE}/projects/${projectId}/characters/${charId}/image`, { method: "POST", body: form });
+      if (!res.ok) throw new Error(await res.text());
+      return res.json();
+    },
+    generateCharacterPortrait: (projectId: number, charId: number, image_model = "gemini-flash-image") =>
+      request<{ message: string; character_id: number }>(`/projects/${projectId}/characters/${charId}/portrait`, {
+        method: "POST",
+        body: JSON.stringify({ image_model }),
+      }),
+    suggestCharacters: (projectId: number, data: { visual_style?: string; count?: number }) =>
+      request<{ characters: Character[]; visual_style_used: string }>(
+        `/projects/${projectId}/characters/suggest`,
+        { method: "POST", body: JSON.stringify(data) },
+      ),
+    listPortraits: (projectId: number, charId: number) =>
+      request<import("./types").CharacterPortrait[]>(
+        `/projects/${projectId}/characters/${charId}/portraits`,
+      ),
+    activatePortrait: (projectId: number, charId: number, assetId: number) =>
+      request<Character>(
+        `/projects/${projectId}/characters/${charId}/portraits/${assetId}/activate`,
+        { method: "POST" },
+      ),
+    deletePortrait: (projectId: number, charId: number, assetId: number) =>
+      request<void>(
+        `/projects/${projectId}/characters/${charId}/portraits/${assetId}`,
+        { method: "DELETE" },
+      ),
+    expandCharacter: (projectId: number, charId: number, llm_model?: string) =>
+      request<Character>(
+        `/projects/${projectId}/characters/${charId}/expand`,
+        { method: "POST", body: JSON.stringify({ llm_model }) },
+      ),
+    regenerateCharacter: (projectId: number, charId: number, llm_model?: string) =>
+      request<Character>(
+        `/projects/${projectId}/characters/${charId}/regenerate`,
+        { method: "POST", body: JSON.stringify({ llm_model }) },
+      ),
+  },
+
+  // ---------------------------------------------------------------------------
+  // Songs
+  // ---------------------------------------------------------------------------
+  songs: {
+    get: (id: number) => request<Song>(`/songs/${id}`),
+    delete: (id: number) => request<void>(`/songs/${id}`, { method: "DELETE" }),
+    upload: async (projectId: number, title: string, artist: string, file: File): Promise<Song> => {
+      const form = new FormData();
+      form.append("file", file);
+      const params = new URLSearchParams({ project_id: String(projectId), title, artist });
+      const res = await fetch(`${BASE}/songs/upload?${params}`, { method: "POST", body: form });
+      if (!res.ok) throw new Error(await res.text());
+      return res.json();
+    },
+    generate: (data: {
+      project_id: number;
+      title?: string;
+      artist?: string;
+      description: string;
+      style_tags?: string;
+      lyrics?: string;
+      instrumental?: boolean;
+      source: "lyria" | "suno";
+    }) => request<Song>("/songs/generate", { method: "POST", body: JSON.stringify(data) }),
+  },
+
+  // ---------------------------------------------------------------------------
+  // Scenes
+  // ---------------------------------------------------------------------------
+  scenes: {
+    list: (projectId: number) => request<Scene[]>(`/scenes?project_id=${projectId}`),
+    get: (id: number) => request<Scene>(`/scenes/${id}`),
+    create: (data: Partial<Scene> & { project_id: number; order: number; audio_start: number; audio_end: number }) =>
+      request<Scene>("/scenes", { method: "POST", body: JSON.stringify(data) }),
+    update: (id: number, data: Partial<Scene>) =>
+      request<Scene>(`/scenes/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
+    delete: (id: number) => request<void>(`/scenes/${id}`, { method: "DELETE" }),
+    autoPlan: (data: {
+      project_id: number;
+      song_id: number;
+      target_scene_duration?: number;
+      replace_existing?: boolean;
+      llm_model?: string;
+      story_seed?: string;
+    }) => request<Scene[]>("/scenes/auto-plan", { method: "POST", body: JSON.stringify(data) }),
+    expandPrompts: (id: number, llm_model?: string) =>
+      request<Scene>(`/scenes/${id}/expand-prompts`, {
+        method: "POST",
+        body: JSON.stringify({ llm_model }),
+      }),
+    expandAll: (data: { project_id: number; llm_model?: string; only_empty?: boolean }) =>
+      request<{ expanded: number; skipped: number; total_cost_usd: number }>(
+        "/scenes/expand-all",
+        { method: "POST", body: JSON.stringify(data) },
+      ),
+    clear: (id: number) =>
+      request<{ scene_id: number; assets_removed: number; files_deleted: number }>(
+        `/scenes/${id}/clear`,
+        { method: "POST" },
+      ),
+    softenPrompt: (id: number, field: "video_prompt" | "image_prompt", llm_model?: string) =>
+      request<Scene>(`/scenes/${id}/soften-prompt`, {
+        method: "POST",
+        body: JSON.stringify({ field, llm_model }),
+      }),
+    listPrompts: (id: number, prompt_type?: "image" | "video") =>
+      request<import("./types").ScenePromptVersion[]>(
+        `/scenes/${id}/prompts${prompt_type ? `?prompt_type=${prompt_type}` : ""}`,
+      ),
+    activatePrompt: (id: number, version_id: number) =>
+      request<Scene>(`/scenes/${id}/prompts/${version_id}/activate`, { method: "POST" }),
+    deletePrompt: (id: number, version_id: number) =>
+      request<void>(`/scenes/${id}/prompts/${version_id}`, { method: "DELETE" }),
+    listAssets: (id: number) => request<SceneAsset[]>(`/scenes/${id}/assets`),
+    activateAsset: (sceneId: number, assetId: number) =>
+      request<Scene>(`/scenes/${sceneId}/assets/${assetId}/activate`, { method: "POST" }),
+    deleteAsset: (sceneId: number, assetId: number) =>
+      request<void>(`/scenes/${sceneId}/assets/${assetId}`, { method: "DELETE" }),
+  },
+
+  // ---------------------------------------------------------------------------
+  // Generation
+  // ---------------------------------------------------------------------------
+  generation: {
+    generateScene: (sceneId: number, force = false, phase: "image" | "video" | "lipsync" | "all" = "all") =>
+      request<{ message: string; scene_id: number; phase: string }>("/generation/scene", {
+        method: "POST",
+        body: JSON.stringify({ scene_id: sceneId, force, phase }),
+      }),
+    generateBatch: (projectId: number, sceneIds?: number[], force = false, phase: "image" | "video" | "all" = "all") =>
+      request<{ message: string; scene_ids: number[]; phase: string }>("/generation/batch", {
+        method: "POST",
+        body: JSON.stringify({ project_id: projectId, scene_ids: sceneIds, force, phase }),
+      }),
+    cancelScene: (sceneId: number) =>
+      request<{ message: string; scene_id: number }>(`/generation/scene/${sceneId}/cancel`, { method: "POST" }),
+    assemble: (projectId: number) =>
+      request<{ message: string; job_id: number }>(`/generation/assemble/${projectId}`, { method: "POST" }),
+    assembleStatus: (projectId: number) =>
+      request<{
+        status: "none" | "running" | "completed" | "failed";
+        url: string | null;
+        error?: string | null;
+        started_at?: string | null;
+        completed_at?: string | null;
+        job_id?: number;
+      }>(`/generation/assemble/${projectId}/status`),
+    getJobs: (projectId: number) => request<GenerationJob[]>(`/generation/jobs/${projectId}`),
+    getStatus: (projectId: number) =>
+      request<{ total: number; by_status: Record<string, number>; complete_pct: number }>(
+        `/generation/status/${projectId}`
+      ),
+    getCosts: (projectId: number) => request<ProjectCosts>(`/generation/costs/${projectId}`),
+  },
+
+  // ---------------------------------------------------------------------------
+  // Models config
+  // ---------------------------------------------------------------------------
+  models: {
+    list: () => request<ModelsConfig>("/models"),
+  },
+};

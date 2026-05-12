@@ -1,0 +1,13 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+sqlmodel==0.0.21
+httpx>=0.28.1
+python-multipart==0.0.9
+python-dotenv==1.0.1
+aiofiles==24.1.0
+librosa==0.10.2
+numpy==1.26.4
+scipy==1.14.1
+ffmpeg-python==0.2.0
+soundfile==0.12.1
+pydantic-settings==2.5.2

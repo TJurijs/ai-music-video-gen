@@ -1,0 +1,40 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+* { box-sizing: border-box; }
+
+body {
+  background: #0f0f13;
+  color: #e2e2f0;
+  font-family: Inter, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #16161d; }
+::-webkit-scrollbar-thumb { background: #333344; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #444460; }
+
+.studio-grid {
+  display: grid;
+  grid-template-rows: 56px 1fr 160px 48px;
+  grid-template-columns: 300px 1fr 360px;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* Status badge colours */
+.status-pending      { @apply bg-zinc-700 text-zinc-300; }
+.status-generating_image  { @apply bg-blue-900 text-blue-300; }
+.status-generating_video  { @apply bg-purple-900 text-purple-300; }
+.status-lipsync      { @apply bg-indigo-900 text-indigo-300; }
+.status-done         { @apply bg-green-900 text-green-300; }
+.status-error        { @apply bg-red-900 text-red-300; }
+
+/* Waveform container */
+#waveform wave {
+  overflow: hidden !important;
+}

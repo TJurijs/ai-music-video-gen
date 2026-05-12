@@ -1,0 +1,80 @@
+"use client";
+import { AlertCircle } from "lucide-react";
+import { Badge } from "./SceneStatus";
+
+export default function VideoModelCard({
+  modelKey, model, selected, duration, resolution, withAudio, onSelect,
+}: {
+  modelKey: string;
+  model: import("@/lib/types").VideoModel;
+  selected: boolean;
+  duration: number;
+  resolution: string;
+  withAudio: boolean;
+  onSelect: () => void;
+}) {
+  const tierColor = {
+    debug:   "bg-zinc-700/40 text-zinc-300 border-zinc-500/30",
+    cheap:   "bg-emerald-500/15 text-emerald-300 border-emerald-500/30",
+    mid:     "bg-accent/20 text-accent border-accent/30",
+    premium: "bg-amber-500/15 text-amber-300 border-amber-500/30",
+  }[model.tier];
+
+  // Show realistic per-second price for this scene's resolution + audio choice
+  const res = model.resolutions.includes(resolution) ? resolution : model.resolutions[0];
+  const rate = model.pricing[res]?.[withAudio ? "with_audio" : "without_audio"];
+  const minD = Math.min(...model.durations);
+  const maxD = Math.max(...model.durations);
+  const dRange = minD === maxD ? `${minD}s` : `${minD}–${maxD}s`;
+
+  // Duration conflict: scene's duration isn't in the model's natively-supported set.
+  // We auto-snap to the closest at render time, but flag it so the user knows.
+  const durationSupported = model.durations.includes(duration);
+  const snapped = !durationSupported
+    ? model.durations.reduce((a, b) => (Math.abs(b - duration) < Math.abs(a - duration) ? b : a))
+    : duration;
+  const conflict = !durationSupported;
+  const estCost = rate ? `$${(rate * snapped).toFixed(3)}` : "—";
+
+  return (
+    <button
+      onClick={onSelect}
+      className={`text-left p-2.5 rounded-lg border transition-colors relative ${
+        selected
+          ? "bg-accent/10 border-accent/50"
+          : conflict
+            ? "bg-surface-2 border-amber-500/40 hover:border-amber-500/60"
+            : "bg-surface-2 border-white/10 hover:border-white/20"
+      }`}
+      title={conflict
+        ? `This scene is ${duration}s but ${model.name} only renders at ${model.durations.join(", ")}s. It will snap to ${snapped}s.`
+        : undefined}
+    >
+      <div className="flex items-center gap-2 mb-1">
+        <span className="text-xs font-medium text-white">{model.name}</span>
+        <span className={`text-[9px] px-1.5 py-0.5 rounded border uppercase tracking-wide ${tierColor}`}>
+          {model.tier}
+        </span>
+        {conflict && (
+          <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 flex items-center gap-0.5" title={`Scene is ${duration}s; this model snaps to ${snapped}s`}>
+            <AlertCircle className="w-2.5 h-2.5" />
+            snaps {duration}s→{snapped}s
+          </span>
+        )}
+        <span className="ml-auto text-[10px] font-mono text-green-400">
+          {rate ? `$${rate}/s` : "—"} <span className="text-zinc-500">· ~{estCost}</span>
+        </span>
+      </div>
+      <p className="text-[10px] text-zinc-500 mb-1.5">{model.tagline}</p>
+      <div className="flex flex-wrap gap-1">
+        <Badge tone={conflict ? "warn" : "default"}>{dRange}</Badge>
+        <Badge>{model.resolutions.join(" / ")}</Badge>
+        {model.supports_reference_images && <Badge tone="accent">refs</Badge>}
+        {model.supports_first_frame && <Badge tone="accent">first frame</Badge>}
+        {model.supports_last_frame && <Badge tone="accent">last frame</Badge>}
+        {model.generates_audio && <Badge>native audio</Badge>}
+        {!model.supports_audio_input && <Badge tone="warn">needs lipsync</Badge>}
+      </div>
+    </button>
+  );
+}

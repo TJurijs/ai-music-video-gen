@@ -1,0 +1,98 @@
+# ============================================================
+# Music Video Studio — .gitignore
+# ============================================================
+
+# ─── Secrets ─────────────────────────────────────────────────
+# Anything containing real API keys MUST stay out of the repo.
+.env
+.env.local
+.env.*.local
+backend/.env
+frontend/.env
+frontend/.env.local
+
+# ─── User-generated content (gigabytes of media) ─────────────
+# Generated images, videos, extracted frames, lipsync clips,
+# uploaded songs, assembled outputs — all per-user, all huge.
+backend/storage/
+storage/
+.tmp_scrub_frames/
+
+# ─── Local SQLite databases ──────────────────────────────────
+# Database paths inside this file are absolute and OS-specific
+# (Windows paths won't resolve on macOS). Each developer's
+# database is generated fresh on first run.
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ─── Python ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ─── Node / Next.js ──────────────────────────────────────────
+node_modules/
+.next/
+out/
+dist/
+build/
+.turbo/
+*.log
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ─── IDE / Editor ────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Local agent / tool state ────────────────────────────────
+# `.claude/settings.json` and `launch.json` are SHARED config (project-
+# wide permissions + Claude Code Preview launch definitions). Keep them
+# in the repo so a fresh clone works. Only the local overrides and
+# session logs are per-machine.
+.claude/settings.local.json
+.claude/*.log
+.claude/projects/
+.claude/cache/
+
+# ─── OS / temp ───────────────────────────────────────────────
+*.tmp
+*.bak
+*.orig
+*.rej
+*.swp
+.directory
+$RECYCLE.BIN/
+
+# ─── Misc large reference files ──────────────────────────────
+# OpenRouter's docs YAML — contains example API key strings that trip
+# GitHub's secret scanner (false positive, but blocks pushes). Download
+# fresh from openrouter.ai if you need to reference the spec locally.
+openrouter-openapi.yaml

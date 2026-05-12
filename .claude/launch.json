@@ -1,0 +1,27 @@
+{
+  "version": "0.0.1",
+  "_comment": "Claude Code Preview launch definitions. The backend uses the venv-installed Python at backend/.venv/bin/python (created by start.sh on macOS/Linux) so the installed deps are visible. WINDOWS users: change the runtimeExecutable to `backend\\.venv\\Scripts\\python.exe`. If the venv doesn't exist yet, run ./start.sh (mac/linux) or start.bat (windows) ONCE to create it before launching Preview.",
+  "configurations": [
+    {
+      "name": "backend",
+      "runtimeExecutable": "backend/.venv/bin/python",
+      "runtimeArgs": [
+        "-m", "uvicorn", "app.main:app",
+        "--port", "8010",
+        "--reload",
+        "--timeout-graceful-shutdown", "300",
+        "--app-dir", "backend"
+      ],
+      "port": 8010,
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    {
+      "name": "frontend",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "frontend"],
+      "port": 3000
+    }
+  ]
+}
