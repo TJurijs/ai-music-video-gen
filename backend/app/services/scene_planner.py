@@ -163,7 +163,7 @@ async def auto_plan_scenes(
 
     characters_text = "\n".join(
         f"  - {c['name']}: {c['description']}" for c in characters
-    ) if characters else "  (none defined — invent ONE protagonist consistent with the song's mood and use the same character throughout)"
+    ) if characters else "  (none defined — invent ONE protagonist. Fit the song's visual world, but do NOT mirror the song's emotional tone in their physical appearance. Give them a specific real body type, skin tone, and wardrobe — not a gaunt/pale archetype just because the song is melancholic.)"
 
     artist_line = f"by {artist}" if artist else ""
 
@@ -236,6 +236,169 @@ async def auto_plan_scenes(
 
     scenes = _parse_json_scenes(raw)
     return scenes
+
+
+def compute_scene_windows(duration: float, target_scene_duration: float) -> list[tuple[int, int]]:
+    """Decide scene boundaries up-front so batches don't have to coordinate.
+
+    Returns a list of (start_sec, end_sec) integer pairs covering [0, duration]
+    with each scene as close to `target_scene_duration` seconds as possible
+    while staying a whole-second-boundary plan. Minimum 3 scenes; minimum 3s
+    per scene (matches the duration slider's lower bound).
+    """
+    if duration <= 0:
+        return [(0, max(3, int(target_scene_duration)))] * 3
+    n = max(3, round(duration / max(target_scene_duration, 3.0)))
+    raw_step = duration / n
+    windows: list[tuple[int, int]] = []
+    cursor = 0.0
+    for i in range(n):
+        end = duration if i == n - 1 else (i + 1) * raw_step
+        s = round(cursor)
+        e = max(s + 3, round(end))
+        windows.append((s, e))
+        cursor = end
+    return windows
+
+
+async def plan_scene_batch(
+    *,
+    title: str,
+    artist: str,
+    style: str,
+    aspect_ratio: str,
+    bpm: float,
+    key: str,
+    sections: list,
+    beats: list,
+    words: list,
+    characters: list,
+    target_scene_duration: float,
+    duration: float,
+    llm_model: str,
+    story_seed: str | None,
+    theme_analysis: dict | None,
+    full_lyrics: str | None,
+    previous_scenes: list[dict],
+    batch_windows: list[tuple[int, int]],
+    batch_start_index: int,
+    total_scenes: int,
+) -> list[dict]:
+    """Plan + expand a batch of scenes in a single LLM call.
+
+    Each batch is small (e.g. 3 scenes) so the HTTP call stays short — the
+    user sees scenes appear progressively as each batch lands, and a network
+    blip mid-flow only loses the in-flight batch, not the whole plan.
+
+    The LLM receives:
+      - Project context (theme / mood / style / song lyrics / characters / seed)
+      - The fixed audio windows the batch must fill
+      - ALL previously-generated scenes (their description + image_prompt +
+        video_prompt) so continuity holds across batches
+    Returns scene dicts with full image_prompt + video_prompt — no separate
+    expand pass needed.
+    """
+    sections_with_lyrics = _build_sections_text(sections, words, beats)
+    artist_line = f"by {artist}" if artist else ""
+    tempo_line = _format_tempo_line(bpm, key)
+
+    characters_text = "\n".join(
+        f"  - {c['name']}: {c['description']}" for c in characters
+    ) if characters else "  (none defined — invent ONE protagonist. Fit the song's visual world but DO NOT mirror the song's emotional tone in the character's physical appearance.)"
+
+    if story_seed and story_seed.strip():
+        seed_block = (
+            f"Story direction (the user's narrative seed — every scene anchors to this):\n"
+            f"  {story_seed.strip()}\n\n"
+        )
+    else:
+        seed_block = ""
+
+    if theme_analysis and isinstance(theme_analysis, dict):
+        theme_lines = []
+        for k_, label in [
+            ("theme", "Central theme"),
+            ("narrative", "Narrative summary"),
+            ("mood", "Emotional mood"),
+            ("visual_world", "Visual world"),
+            ("suggested_visual_style", "Suggested visual style"),
+        ]:
+            v = theme_analysis.get(k_)
+            if v and isinstance(v, str) and v.strip():
+                theme_lines.append(f"  {label}: {v.strip()}")
+        theme_block = ("Lyric / theme analysis (anchor the visual story to this):\n"
+                       + "\n".join(theme_lines) + "\n\n") if theme_lines else ""
+    else:
+        theme_block = ""
+
+    if full_lyrics and full_lyrics.strip():
+        capped = full_lyrics.strip()
+        if len(capped) > 4000:
+            capped = capped[:4000] + "\n[lyrics truncated]"
+        lyrics_block = f"Full lyrics (entire song, for narrative context):\n```\n{capped}\n```\n\n"
+    else:
+        lyrics_block = ""
+
+    # Render previously-generated scenes so the LLM keeps continuity. Include
+    # description + image_prompt + video_prompt (not just one) — the rich
+    # prompts carry the visual vocabulary the new scenes should match.
+    if previous_scenes:
+        prev_lines = ["SCENES ALREADY PLANNED (for continuity — match this visual vocabulary):"]
+        for s in previous_scenes:
+            prev_lines.append(
+                f"  Scene #{s.get('order')} ({s.get('audio_start')}-{s.get('audio_end')}s): "
+                f"{(s.get('description') or '').strip()}"
+            )
+            if (s.get("image_prompt") or "").strip():
+                prev_lines.append(f"    image_prompt: {s['image_prompt'][:400]}")
+            if (s.get("video_prompt") or "").strip():
+                prev_lines.append(f"    video_prompt: {s['video_prompt'][:400]}")
+        previous_block = "\n".join(prev_lines) + "\n\n"
+    else:
+        previous_block = ""
+
+    # Render the windows the LLM must fill IN THIS batch
+    batch_lines = []
+    for i, (s, e) in enumerate(batch_windows):
+        order = batch_start_index + i + 1
+        lyric_words = words_in_range(words, float(s), float(e)) if words else ""
+        batch_lines.append(
+            f"  Scene #{order} ({s}-{e}s, {e - s}s long)"
+            + (f" — lyrics this window: \"{lyric_words}\"" if lyric_words else "")
+        )
+    batch_block = "Scenes to plan in THIS batch (fixed audio windows — fill in the prompts):\n" + "\n".join(batch_lines)
+
+    user_msg = (
+        f"Song: \"{title}\" {artist_line}\n"
+        f"{tempo_line}\n"
+        f"Project visual style: {style or 'cinematic, modern music video'}\n"
+        f"Aspect ratio: {aspect_ratio}\n\n"
+        f"Cast (use these names VERBATIM when characters are on screen):\n"
+        f"{characters_text}\n\n"
+        f"{seed_block}{theme_block}{lyrics_block}"
+        f"Sectional structure (the LLM-side context for pacing):\n{sections_with_lyrics}\n\n"
+        f"{previous_block}"
+        f"{batch_block}\n\n"
+        f"Total plan size: {total_scenes} scenes. This batch is scenes "
+        f"#{batch_start_index + 1}–#{batch_start_index + len(batch_windows)}.\n\n"
+        f"Return a JSON array of exactly {len(batch_windows)} scene objects, in order. Each:\n"
+        f"  - order: integer (match the # shown above)\n"
+        f"  - audio_start, audio_end: integers (match the window shown — do NOT change)\n"
+        f"  - description: ONE sentence, observable\n"
+        f"  - image_prompt: [STYLE]\\n... \\n\\n[SCENE]\\n... (full opening-frame spec, photo-real, no motion)\n"
+        f"  - video_prompt: [STYLE]\\n... \\n\\n[SCENE]\\n... (the motion within this single shot)\n"
+        f"  - lyrics_segment: empty string — backend slices from word timestamps\n"
+    )
+
+    raw = await openrouter.chat(
+        messages=[
+            {"role": "system", "content": SCENE_PLAN_SYSTEM},
+            {"role": "user", "content": user_msg},
+        ],
+        model=llm_model,
+        json_mode=True,
+    )
+    return _parse_json_scenes(raw)
 
 
 def _parse_json_scenes(raw: str) -> list:
@@ -358,6 +521,8 @@ async def expand_character_description(
     style: str,
     theme_analysis: dict | None = None,
     llm_model: str = "google/gemini-3-flash-preview",
+    other_characters: list[dict] | None = None,
+    previous_description: str | None = None,
 ) -> dict:
     """Deepen a character description and align it with project style + song
     theme. Used to make characters feel like they belong in the music video.
@@ -377,14 +542,38 @@ async def expand_character_description(
             theme_lines.append(f"  {label}: {val.strip()}")
     theme_block = ("\n".join(theme_lines) + "\n") if theme_lines else "(no song theme available)\n"
 
+    other_chars_block = ""
+    if other_characters:
+        lines = [f"  - {c['name']}: {c['description']}" for c in other_characters if c.get("name") and c.get("description")]
+        if lines:
+            other_chars_block = (
+                "\nOther characters already in this cast (YOU MUST VISUALLY CONTRAST with all of them):\n"
+                + "\n".join(lines)
+                + "\n\nContrast rules — the new character MUST differ from every existing cast member on ALL of:\n"
+                "  • skin tone (pick a clearly different tone)\n"
+                "  • age bracket (at least 10 years apart from the closest)\n"
+                "  • hair (different color AND different length/texture)\n"
+                "  • build (different body type)\n"
+                "  • wardrobe dominant color (no two characters in the same hue family)\n"
+                "A casting director would never put two characters with the same look on screen together.\n"
+            )
+
+    prev_desc_block = ""
+    if previous_description and previous_description.strip():
+        prev_desc_block = (
+            f"\nPrevious description that was REJECTED (do NOT repeat these traits):\n"
+            f"  {previous_description.strip()}\n"
+            "Generate a visually distinct alternative — different skin tone, different hair, different build, different wardrobe palette.\n"
+        )
+
     prompt = f"""You are a casting director for a music video. Deepen the
 following character so they feel like a fully realized person in this song's world.
 
 Project style: {style or "cinematic, modern music video"}
 Song context:
-{theme_block}
+{theme_block}{other_chars_block}{prev_desc_block}
 Character name: {name}
-Current description: {current_description or "(empty — invent from scratch consistent with the song's mood)"}
+Current description: {current_description or "(empty — invent from scratch. Fit the song's visual world and era, but DO NOT mirror the song's emotional tone in the character's physical appearance. A melancholic song does not mean a gaunt face — give this person a specific, real body type, skin tone, and wardrobe that feels grounded and human.)"}
 
 CRITICAL — Describe the PERSON only, not the world around them.
 
@@ -436,7 +625,7 @@ Rewrite rules:
 - SCRUB any setting / atmospheric prose from the existing description. If it says "rim-lit by neon practicals in a rain-slick alley", remove that entirely — the scene supplies the world.
 
 Example of the right shape (~55 words, person-only, no setting):
-  "Late-30s lean and tall man, sharp angular jawline, pale skin, slicked-back peroxide-blonde hair, deep-set grey eyes with smudged charcoal kohl. Floor-length matte black sheepskin trench coat over a ribbed silk tank top, grime-streaked denim, polished leather boots. Heavy silver signet ring on his right hand, carries a cigarette. Stern, motionless default expression."
+  "Early-40s stocky woman, round face, warm olive skin, thick black hair pulled back in a low bun with loose strands, dark brown eyes with no makeup. Structured burgundy wool blazer over a plain white shirt, straight-cut navy trousers, flat leather loafers. A chunky ceramic ring on her left hand. Measured, upright default posture."
 
 Return JSON only:
 {{
@@ -587,8 +776,20 @@ Rules:
 - Descriptions: 40–80 words. Tight prose, no fluff. Cover age range, build, face, hair, eyes, skin, wardrobe (real fabric), one defining accessory, default posture. Style anchors via wardrobe + personal styling, not setting.
 - The character's mood lives in posture / expression / wardrobe choices — not in setting prose.
 
-Example of the right shape (~55 words, person-only, no setting):
-  "Late-30s lean and tall man, sharp angular jawline, pale skin, slicked-back peroxide-blonde hair, deep-set grey eyes with smudged charcoal kohl. Floor-length matte black sheepskin trench coat over a ribbed silk tank top, grime-streaked denim, polished leather boots. Heavy silver signet ring on his right hand, carries a cigarette. Stern, motionless default expression."
+CRITICAL — VISUAL CONTRAST BETWEEN CHARACTERS:
+Each character in the cast MUST be immediately distinguishable from the others. If you are proposing {count} characters, plan the contrast FIRST, then write the descriptions:
+- Vary skin tone across characters (don't make all of them pale / all of them dark / etc.)
+- Vary age range (not all 30s — spread across 20s, 40s, 50s if the narrative supports it)
+- Vary hair (color, length, texture — no two characters with the same hair color)
+- Vary build and height impression (lean vs solid vs tall vs compact)
+- Vary wardrobe palette (no two characters dressed in the same dominant color)
+- Vary posture archetype (one hunched/introspective, one upright/commanding, one restless/edgy)
+A casting director picks a cast that READS as distinct silhouettes at a glance — do the same.
+
+Examples of right shape (person-only, no setting) — note how these three contrast with each other:
+  Character A: "Early-20s slight woman, oval face, warm brown skin, cropped natural coils dyed copper at the tips, dark almond eyes with no makeup. Oversized cream wool turtleneck tucked into high-waisted rust-orange corduroy trousers, white canvas sneakers. Small gold hoop in her nose. Restless, forward-leaning default posture."
+  Character B: "Late-40s heavyset man, broad flat nose, deep brown skin, close-shaved grey temples, thick brows, dark eyes. Worn olive flight jacket over a faded white henley, straight-cut black denim, scuffed work boots. A battered silver lighter he turns in his fingers. Still, watchful default expression."
+  Character C: "Mid-30s lean and tall woman, sharp angular jaw, pale freckled skin, straight auburn hair to the collarbone, green eyes with smudged dark liner. Floor-length charcoal wool overcoat over a ribbed black turtleneck, slim black trousers, pointed leather boots. Stern, motionless default expression."
 
 Return ONLY a JSON array (no prose, no markdown):
 [
@@ -641,6 +842,7 @@ async def generate_scene_prompts(
     previous_image_prompt: Optional[str] = None,
     next_image_prompt: Optional[str] = None,
     duration_seconds: Optional[float] = None,
+    story_seed: Optional[str] = None,
     llm_model: str = "google/gemini-3-flash-preview",
 ) -> dict:
     """Expand a scene description into detailed image_prompt + video_prompt
@@ -679,7 +881,16 @@ async def generate_scene_prompts(
 
     dur = f"Scene duration: {duration_seconds:.1f}s — pace the action to fit\n\n" if duration_seconds else ""
 
-    prompt = f"""{prev_ctx}{next_ctx}{dur}Project style: {style or "cinematic music video"}
+    # The project's narrative seed (if any). Placed FIRST so the LLM treats
+    # it as the over-arching story anchor before the neighbor-context blocks.
+    seed_ctx = ""
+    if story_seed and story_seed.strip():
+        seed_ctx = (
+            f"PROJECT STORY DIRECTION (anchor this scene's mood and intent to this overall narrative):\n"
+            f"  {story_seed.strip()}\n\n"
+        )
+
+    prompt = f"""{seed_ctx}{prev_ctx}{next_ctx}{dur}Project style: {style or "cinematic music video"}
 
 Cast (use these names verbatim when characters are on screen):
 {char_text}
@@ -744,3 +955,216 @@ Return JSON:
     # Surface JSON failures so callers can SKIP this scene rather than
     # silently overwriting existing prompts with the bare description.
     return parse_llm_json(raw, context="AI Expand")
+
+
+# ---------------------------------------------------------------------------
+# Continuation prompt — vision-LLM call grounded on the previous scene's
+# actual last rendered frame
+# ---------------------------------------------------------------------------
+
+async def generate_continuation_prompts(
+    last_frame_path: str,
+    style: str,
+    characters: list,
+    lyrics: str,
+    duration_seconds: float,
+    story_seed: Optional[str] = None,
+    prev_description: Optional[str] = None,
+    prev_video_prompt: Optional[str] = None,
+    this_description: Optional[str] = None,
+    # New: song-level context, mirroring what plan_scene_batch sees.
+    # Without these, the continuation LLM has almost no information about
+    # WHERE in the arc this scene sits or what emotional beat it should hit,
+    # so every chained scene ends up looking like "more of the previous one."
+    theme_analysis: Optional[dict] = None,
+    full_lyrics: Optional[str] = None,
+    # List of every prior scene's description, in order. Lets the LLM see
+    # the arc-so-far and avoid repeating beats/verbs already used. Each
+    # entry: {"order": int, "description": str, "video_prompt": str|None}.
+    all_prev_scenes: Optional[list] = None,
+    # Where this scene sits in the song. 0.0 = first second, 1.0 = last
+    # second. Drives arc-position cues (early establishment / rising /
+    # climax / resolution).
+    audio_position_pct: Optional[float] = None,
+    total_scenes_estimate: Optional[int] = None,
+    llm_model: str = "google/gemini-3-flash-preview",
+) -> dict:
+    """Generate a video_prompt + image_prompt for a CHAINED scene, grounded
+    on the actual rendered last frame of the prior scene.
+
+    Use case: the user enabled `chain_from_prev` on scene N+1 and hasn't
+    written its prompts yet. We want motion that flows naturally from where
+    the previous video ended — no teleporting, no sudden direction change,
+    no character mysteriously jumping locations. The vision-capable LLM
+    inspects the actual last frame (subject pose, framing, lighting, scene
+    contents) and writes prompts that continue that exact composition into
+    the next beat of the story.
+
+    Differs from `generate_scene_prompts` in two ways:
+    1. The previous scene's LAST FRAME (image) is passed alongside the text
+       prompt, so the LLM literally sees the handoff point — not just a
+       description of it.
+    2. `image_prompt` is written to match the LAST FRAME — same framing,
+       same character pose. (In a chained scene the first_frame is the
+       extracted last frame, not a freshly-rendered still, but we still
+       emit an image_prompt so the user can opt out of chaining later.)
+
+    Requires a vision-capable LLM. Gemini 3 Flash, Gemini 2.5 Pro,
+    Claude 3.5/4 Sonnet, GPT-4o, etc. all work. The chat completions API
+    handles multimodal content arrays the same way for any of them.
+    """
+    from app.services.openrouter import _data_url_from_path
+
+    char_text = "\n".join(f"  - {c['name']}: {c['description']}" for c in characters) if characters else "  (none defined)"
+
+    seed_ctx = ""
+    if story_seed and story_seed.strip():
+        seed_ctx = (
+            f"PROJECT STORY DIRECTION (the overall narrative arc for the whole video — each scene must advance this):\n"
+            f"  {story_seed.strip()}\n\n"
+        )
+
+    # Song-level theme analysis — same shape plan_scene_batch consumes.
+    # Theme/mood/visual_world/narrative are what tell the LLM what FEELING
+    # to build toward. Without these, continuation scenes drift into "more
+    # of the same" because the only mood cue is the prev scene itself.
+    theme_block = ""
+    if theme_analysis and isinstance(theme_analysis, dict):
+        theme_lines = []
+        for k_, label in [
+            ("theme", "Central theme"),
+            ("narrative", "Narrative summary (whole song's arc)"),
+            ("mood", "Emotional mood"),
+            ("visual_world", "Visual world"),
+            ("suggested_visual_style", "Suggested visual style"),
+        ]:
+            v = theme_analysis.get(k_)
+            if v and isinstance(v, str) and v.strip():
+                theme_lines.append(f"  {label}: {v.strip()}")
+        if theme_lines:
+            theme_block = "SONG-LEVEL CONTEXT (drives mood and emotional progression):\n" + "\n".join(theme_lines) + "\n\n"
+
+    # Full lyrics — gives the LLM the whole song's flow so it can decide
+    # what beat this scene should hit relative to the song's structure.
+    lyrics_full_block = ""
+    if full_lyrics and full_lyrics.strip():
+        capped = full_lyrics.strip()
+        if len(capped) > 3000:
+            capped = capped[:3000] + "\n[truncated]"
+        lyrics_full_block = f"FULL SONG LYRICS (for whole-song narrative awareness):\n```\n{capped}\n```\n\n"
+
+    # Narrative position — where in the song this scene sits. Without this
+    # the LLM treats every chained scene as "the next moment" with no sense
+    # of arc, so they all feel mid-tempo and similar. Bucket into stages
+    # so the LLM has a concrete arc cue: early / rising / climax / resolution.
+    position_block = ""
+    if audio_position_pct is not None:
+        pct = max(0.0, min(1.0, audio_position_pct))
+        if pct < 0.20:
+            stage = "OPENING — set the world, introduce, low-key energy. Plant the seed of what's about to happen."
+        elif pct < 0.45:
+            stage = "RISING ACTION — tension builds, stakes raise, motion becomes more deliberate. New element enters."
+        elif pct < 0.70:
+            stage = "MID-ACT — develop the emotional core. The character / world reveals more. Could include a reversal or shift."
+        elif pct < 0.88:
+            stage = "CLIMAX — peak energy and emotion. Biggest gesture, boldest camera, environment at most extreme."
+        else:
+            stage = "RESOLUTION — release tension, land the emotional payoff. Calmer or quietly intense; tie back to the opening."
+        scene_num_hint = ""
+        if total_scenes_estimate:
+            scene_num_hint = f" (roughly scene {int(round(pct * total_scenes_estimate))} of ~{total_scenes_estimate})"
+        position_block = (
+            f"NARRATIVE POSITION: this clip is at ~{int(pct * 100)}% through the song{scene_num_hint}.\n"
+            f"  Stage: {stage}\n\n"
+        )
+
+    # Arc-so-far summary — descriptions of all prior scenes, terse. This
+    # is what stops the LLM from re-using verbs/beats it already used.
+    arc_block = ""
+    if all_prev_scenes:
+        arc_lines = ["ARC SO FAR (every prior scene, in order — do NOT repeat their action verbs or main beat):"]
+        for s in all_prev_scenes[-8:]:  # last 8 max; full arc would balloon context
+            o = s.get("order")
+            d = (s.get("description") or "").strip()
+            if not d:
+                continue
+            arc_lines.append(f"  #{o}: {d[:160]}")
+        if len(arc_lines) > 1:
+            arc_block = "\n".join(arc_lines) + "\n\n"
+
+    prev_ctx = ""
+    if prev_description or prev_video_prompt:
+        prev_ctx = "IMMEDIATELY PREVIOUS scene (the clip whose FINAL frame is the attached image — visual handoff source):\n"
+        if prev_description:
+            prev_ctx += f"  Description: {prev_description}\n"
+        if prev_video_prompt:
+            # Trim heavily — including the full prev video_prompt tempts the
+            # LLM to copy-paste its [SCENE] block. We want it as a hint for
+            # cinematic vocabulary, not a template to mirror.
+            prev_ctx += f"  Motion that just happened: {prev_video_prompt[:300]}\n"
+        prev_ctx += "\n"
+
+    this_ctx = ""
+    if this_description and this_description.strip():
+        this_ctx = (
+            f"DRAFT DESCRIPTION for this scene (the user wrote this — keep its intent):\n"
+            f"  {this_description.strip()}\n\n"
+        )
+
+    text_prompt = f"""{seed_ctx}{theme_block}{position_block}{lyrics_full_block}{arc_block}{prev_ctx}{this_ctx}Write the next clip in a chained sequence. The attached image is the previous clip's exact last frame — this clip opens on it, pixel-accurate.
+
+Project style: {style or "cinematic music video"}
+Cast: {char_text}
+Lyrics during this clip: "{lyrics}"
+Duration: {duration_seconds:.1f}s
+
+KEEP THE PROMPT SHORT. Video models (Seedance / Kling / Veo) do worse with long, detailed, multi-clause prompts. Aim for ~30-50 words total in [STYLE]+[SCENE]. One subject. One action. One camera intent. One environmental cue. No multi-beat scenes. No literary language.
+
+What MUST stay the same (handoff continuity):
+- Character position / facing / framing at the START matches the attached image.
+- Same setting, same lighting, same time of day.
+
+What MUST change (story evolution):
+- Use the lyrics literally — they drive the action.
+- Use the NARRATIVE POSITION cue above for emotional pitch (opening = quiet, climax = bold).
+- DON'T repeat the previous clip's verbs or camera move (anti-repetition: check ARC SO FAR).
+- Something visible changes between start and end: character moves OR camera moves OR environment shifts. Just ONE of those, not all three.
+
+Only render what a camera can see — observable verbs (walks, turns, looks, reaches, kneels, drops, opens, runs). No internal states, no micro-expressions, no narrative abstractions.
+
+OUTPUT FORMAT — strict.
+
+  [STYLE]
+  <≤15 words. Comma-separated visual cues only. Match the previous clip's style — same film stock, palette, lens, grain.>
+
+  [SCENE]
+  <ONE short sentence, ≤30 words. Subject (by cast name) + action verb + brief setting carry-over + ONE camera move. Nothing else.>
+
+Examples of well-sized [SCENE] lines:
+  "Elias turns from the rooftop ledge and walks toward camera as rain hardens."
+  "Lena kneels in the alley and lifts the fallen photograph, camera dollying in slowly."
+  "The neon sign flickers off behind Mara as she pushes through the smoke."
+
+Do NOT output an `image_prompt` — this scene is chained, the first frame is the attached image. Any image_prompt would be ignored.
+
+description — ONE sentence, plain English, ≤120 chars, describes the beat (what changes). Goes in the scene row header.
+
+Return JSON with EXACTLY two fields:
+{{
+  "video_prompt": "...",
+  "description": "..."
+}}"""
+
+    # Multimodal content array — text + image. OpenRouter forwards this
+    # straight to the underlying model's vision endpoint.
+    content = [
+        {"type": "text", "text": text_prompt},
+        {"type": "image_url", "image_url": {"url": _data_url_from_path(last_frame_path)}},
+    ]
+
+    raw = await openrouter.chat(
+        messages=[{"role": "user", "content": content}],
+        model=llm_model,
+        json_mode=True,
+    )
+    return parse_llm_json(raw, context="Continuation prompt")

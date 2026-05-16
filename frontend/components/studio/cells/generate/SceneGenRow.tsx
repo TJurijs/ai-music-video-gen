@@ -1,6 +1,6 @@
 "use client";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Image as ImageIcon, Video, Mic2, Settings, Square, Trash2, Link2 } from "lucide-react";
+import { Image as ImageIcon, Video, Mic2, Settings, Square, Trash2, Link2, Download, Wand2, Loader2, X } from "lucide-react";
 import { useState } from "react";
 import { api } from "@/lib/api";
 import { useConfirm } from "@/components/ConfirmDialog";
@@ -50,6 +50,17 @@ export default function SceneGenRow({
     mutationFn: () => api.scenes.clear(scene.id),
     onSuccess: onRefresh,
   });
+  // Full scene delete (different from clear-assets above). Cascades to all
+  // assets + prompt versions. Backend also auto-unlinks the NEXT scene's
+  // chain_from_prev if it pointed here, so we don't leave a dangling chain.
+  const deleteScene = useMutation({
+    mutationFn: () => api.scenes.delete(scene.id),
+    onSuccess: onRefresh,
+  });
+  const uploadVideo = useMutation({
+    mutationFn: (file: File) => api.scenes.uploadVideo(scene.id, file),
+    onSuccess: onRefresh,
+  });
   const activatePrompt = useMutation({
     mutationFn: (versionId: number) => api.scenes.activatePrompt(scene.id, versionId),
     onSuccess: onRefresh,
@@ -62,10 +73,42 @@ export default function SceneGenRow({
   const [showImage, setShowImage] = useState(false);
 
   const updateModel = useMutation({
-    mutationFn: (data: { video_model?: string; image_model?: string; lipsync_model?: string; resolution?: string; generate_audio?: boolean; lipsync_enabled?: boolean; chain_from_prev?: boolean }) =>
+    mutationFn: (data: { video_model?: string; image_model?: string; lipsync_model?: string; resolution?: string; generate_audio?: boolean; lipsync_enabled?: boolean; chain_from_prev?: boolean; audio_sync_enabled?: boolean }) =>
       api.scenes.update(scene.id, data),
     onSuccess: onRefresh,
   });
+
+  // Vision-grounded continuation prompt. Generates video + image prompts for
+  // this chained scene by feeding the LLM the PREV scene's actual last frame
+  // as visual context, so the motion flows naturally from where the previous
+  // clip ended (no teleporting characters, no jump cuts).
+  const continuationPrompt = useMutation({
+    mutationFn: () => api.scenes.generateContinuationPrompt(scene.id),
+    onSuccess: onRefresh,
+  });
+  const continuationErr = continuationPrompt.error instanceof Error
+    ? continuationPrompt.error.message
+    : null;
+
+  // "Chain to next" — creates scene N+1 (or enables chain on existing N+1).
+  // The icon on THIS row reflects the state of the NEXT scene's chain,
+  // because that's the relationship the user is controlling. See backend
+  // `/scenes/{id}/chain-next` for the three cases (create / enable / no-op).
+  const chainNext = useMutation({
+    mutationFn: () => api.scenes.chainToNext(scene.id),
+    onSuccess: onRefresh,
+  });
+  // Disconnect path: flip chain_from_prev=false on the NEXT scene (not this
+  // one). Doesn't delete the next scene — the user can still keep it as a
+  // free-standing scene with its own first_frame.
+  const unchainNext = useMutation({
+    mutationFn: (nextSceneId: number) =>
+      api.scenes.update(nextSceneId, { chain_from_prev: false } as any),
+    onSuccess: onRefresh,
+  });
+  const chainNextErr =
+    (chainNext.error instanceof Error ? chainNext.error.message : null) ||
+    (unchainNext.error instanceof Error ? unchainNext.error.message : null);
 
   const isRunning = ["generating_image", "generating_video", "lipsync"].includes(scene.status);
   const hasImage = !!scene.reference_image_url;
@@ -74,20 +117,58 @@ export default function SceneGenRow({
   const videoAssets = scene.assets?.filter((a) => a.asset_type === "video") || [];
   const lipsyncAssets = scene.assets?.filter((a) => a.asset_type === "lipsync") || [];
 
-  // Pull the previous scene from the cached project query so the chained
-  // first-frame can be displayed (we need its `extracted_last_frame_url`).
-  // Falls back gracefully if the project isn't in cache yet.
+  // Pull adjacent scenes from the cached project query.
+  //  - prevScene: the one before this one. Used to display the chained
+  //    first-frame on THIS scene's left slot (when this scene is chained).
+  //  - nextScene: the one after this one. Drives the NEW "chain to next"
+  //    icon — it represents whether the NEXT clip picks up exactly where
+  //    THIS one ends, not whether this one picks up from the prev.
   const project = qc.getQueryData<any>(["project", scene.project_id]);
   const allScenes: Scene[] = project?.scenes || [];
   const prevScene = allScenes.find((s) => s.order === scene.order - 1);
+  const nextScene = allScenes.find((s) => s.order === scene.order + 1);
+  // True if this scene's video acts as the visual anchor for scene N+1.
+  // = next scene exists AND has chain_from_prev=true.
+  const nextChainedFromHere = !!nextScene && !!nextScene.chain_from_prev;
+  // chainActive (kept for the existing first-frame display logic): is THIS
+  // scene chained from prev? That's still the field driving rendering — the
+  // icon's semantics just point the other direction now.
   const canChain = scene.order >= 1;
   const chainActive = !!scene.chain_from_prev && canChain;
+  const hasChainFrame = chainActive && !!prevScene?.extracted_last_frame_url;
+  const canGenerateVideo = hasImage || hasChainFrame;
+
+  // All video gen routes through OpenRouter — fal/audio-sync paths retired.
+  const videoModelCfg = models?.video?.[scene.video_model];
+  const nextVideoProvider = "openrouter";
 
   // Detect whether the active video is lipsynced (for the badge on the video frame)
   const activeVideoAsset = videoAssets.find((a) => a.is_active);
   const activeVideoIsLipsynced = (() => {
     if (!activeVideoAsset?.metadata_json) return false;
     try { return !!JSON.parse(activeVideoAsset.metadata_json).lipsynced; } catch { return false; }
+  })();
+  // Pull the recorded provider from the active video asset's metadata_json.
+  // _generate_video_fal_seedance_audio writes provider="fal"; the OpenRouter
+  // path doesn't currently set this field explicitly, so for legacy assets we
+  // default to "openrouter". When metadata is missing/unparseable the chip
+  // just doesn't render.
+  const renderedVideoProvider = (() => {
+    if (!activeVideoAsset?.metadata_json) return null;
+    try {
+      const meta = JSON.parse(activeVideoAsset.metadata_json);
+      return meta.provider || "openrouter";
+    } catch {
+      return null;
+    }
+  })();
+  const renderedVideoResolution = (() => {
+    if (!activeVideoAsset?.metadata_json) return null;
+    try {
+      return JSON.parse(activeVideoAsset.metadata_json).resolution || null;
+    } catch {
+      return null;
+    }
   })();
 
   return (
@@ -114,25 +195,86 @@ export default function SceneGenRow({
             {fmtCost(sceneCost)}
           </span>
         )}
-        <DescriptionWithPromptTooltip scene={scene} />
-        {canChain && (
+        <DescriptionWithPromptTooltip
+          scene={scene}
+          characters={project?.characters}
+          videoModelLabel={models?.video?.[scene.video_model]?.name || scene.video_model}
+          videoModelUsesRefs={!!models?.video?.[scene.video_model]?.supports_reference_images}
+        />
+        {/* "Chain to next" icon. Click meanings:
+              - No next scene exists → creates scene N+1 (empty prompts,
+                chained, inheriting model settings). The user then fills its
+                prompts via the wand button on that new row.
+              - Next scene exists, NOT chained → flips chain on.
+              - Next scene exists, chained → flips chain off (does NOT
+                delete the next scene — to delete it, use its row's trash).
+            Active styling indicates "next clip continues from this one".
+            Always visible (including on scene 1 — that's how you build the
+            chain in the first place). */}
+        <button
+          onClick={() => {
+            if (nextChainedFromHere && nextScene) {
+              unchainNext.mutate(nextScene.id);
+            } else {
+              chainNext.mutate();
+            }
+          }}
+          disabled={chainNext.isPending || unchainNext.isPending}
+          className={`shrink-0 p-1 rounded transition-colors ${
+            nextChainedFromHere
+              ? "bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 ring-1 ring-emerald-500/40"
+              : "text-zinc-500 hover:text-emerald-300"
+          } disabled:opacity-50`}
+          title={
+            nextChainedFromHere
+              ? `Scene #${(nextScene?.order ?? scene.order + 1)} continues from this scene's last frame — click to disconnect (leaves scene #${nextScene?.order} in place but it stops using your last frame).`
+              : nextScene
+                ? `Connect this scene to scene #${nextScene.order}: its first frame will become this scene's actual last rendered frame (seamless handoff). Click to enable.`
+                : `Add scene #${scene.order + 1} chained to this one. Creates an empty next scene that picks up exactly where this one ends. You'll fill its prompts with the wand button on that new row.`
+          }
+        >
+          {chainNext.isPending
+            ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            : <Link2 className="w-3.5 h-3.5" />}
+        </button>
+        {/* Vision-grounded continuation prompt — populates THIS scene's
+            prompts using the PREV scene's actual rendered last frame. Only
+            meaningful when this scene is chained from prev AND prev's video
+            has been rendered (so the extracted last frame is on disk).
+            Hidden otherwise (the backend would 400 with "generate prev
+            scene first" — better to just not show the button). */}
+        {chainActive && hasChainFrame && (
           <button
-            onClick={() => updateModel.mutate({ chain_from_prev: !chainActive })}
-            disabled={updateModel.isPending}
-            className={`shrink-0 p-1 rounded transition-colors ${
-              chainActive
-                ? "bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 ring-1 ring-emerald-500/40"
-                : "text-zinc-500 hover:text-emerald-300"
-            } disabled:opacity-50`}
+            onClick={() => continuationPrompt.mutate()}
+            disabled={continuationPrompt.isPending || isRunning}
+            className="shrink-0 p-1 rounded transition-colors text-zinc-500 hover:text-violet-300 disabled:opacity-50"
             title={
-              chainActive
-                ? `Chained from scene #${scene.order} — click to disconnect. Video will start on this scene's planned still instead.`
-                : `Chain from scene #${scene.order}: this clip's first frame becomes the previous scene's actual last rendered frame (seamless seam). Click to enable.`
+              `Generate this scene's video & image prompts from the actual last frame of scene #${prevScene?.order ?? scene.order - 1}'s video. ` +
+              `The LLM sees that frame and writes motion that flows from it — so the character won't teleport or change direction. ` +
+              (scene.video_prompt
+                ? "OVERWRITES the current prompts (saved to version history)."
+                : "Fills in the empty prompts so you can generate video next.")
             }
           >
-            <Link2 className="w-3.5 h-3.5" />
+            {continuationPrompt.isPending
+              ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              : <Wand2 className="w-3.5 h-3.5" />}
           </button>
         )}
+        {song && (
+          <a
+            href={api.scenes.audioChunkUrl(scene.id)}
+            download
+            className="shrink-0 p-1 rounded text-zinc-500 hover:text-fuchsia-300 transition-colors"
+            title={`Download this scene's audio segment (${fmt(scene.audio_start)}–${fmt(scene.audio_end)}, sliced from the song). Use it to test models in their web UI with the exact audio our backend would send.`}
+          >
+            <Download className="w-3.5 h-3.5" />
+          </a>
+        )}
+        {/* Mic / audio sync toggle removed — audio-sync / lipsync features
+            were retired (Seedance ref-to-video's lipsync was weak on music,
+            OmniHuman had no separate character ref). Pipeline now produces
+            purely visual scenes. */}
         <button
           onClick={() => setShowModels(!showModels)}
           className="text-zinc-500 hover:text-white p-1 rounded transition-colors shrink-0"
@@ -165,9 +307,48 @@ export default function SceneGenRow({
             }}
             disabled={clearScene.isPending}
             className="text-zinc-600 hover:text-red-400 p-1 rounded transition-colors disabled:opacity-50 shrink-0"
-            title="Clear all generated assets for this scene (keeps description and prompts)"
+            title="Clear all generated assets for this scene (keeps description and prompts so you can regenerate)"
           >
             <Trash2 className="w-3.5 h-3.5" />
+          </button>
+        )}
+        {/* Full scene delete — removes the row itself, all its assets, all
+            its prompt versions, and unlinks the next scene's chain_from_prev
+            if it pointed here. Distinct from the clear-assets trash above:
+            this is a "remove this scene from the plan" action. Always visible
+            (you may want to delete a scene that hasn't been generated yet). */}
+        {!isRunning && (
+          <button
+            onClick={async () => {
+              const willUnlinkNext = !!nextChainedFromHere;
+              const assetCount = scene.assets?.length || 0;
+              const msg = [
+                `Permanently remove scene #${scene.order} from this project.`,
+                assetCount > 0
+                  ? `${assetCount} asset${assetCount === 1 ? "" : "s"} (images / videos / prompt versions) will be deleted too.`
+                  : "No assets to delete.",
+                willUnlinkNext
+                  ? `Scene #${nextScene?.order} was chained from here — its chain will be cleared (the scene itself stays in place; you can re-chain or generate it standalone).`
+                  : null,
+              ].filter(Boolean).join("\n");
+              if (await confirm({
+                title: `Delete scene #${scene.order}?`,
+                message: msg,
+                confirmLabel: "Delete scene",
+                destructive: true,
+              })) {
+                deleteScene.mutate();
+              }
+            }}
+            disabled={deleteScene.isPending}
+            className="text-zinc-600 hover:text-red-400 p-1 rounded transition-colors disabled:opacity-50 shrink-0"
+            title={
+              nextChainedFromHere
+                ? `Delete scene #${scene.order} entirely. Also unlinks scene #${nextScene?.order} (its chain to this scene will clear).`
+                : `Delete scene #${scene.order} entirely (removes from the plan + all its assets + prompt history).`
+            }
+          >
+            <X className="w-3.5 h-3.5" />
           </button>
         )}
       </div>
@@ -178,7 +359,32 @@ export default function SceneGenRow({
           onSoftened={onRefresh}
         />
       )}
-
+      {continuationErr && (
+        <div className="mx-3 mt-1 mb-1 bg-amber-900/20 border border-amber-800/40 rounded-md px-2.5 py-1.5 text-[11px] text-amber-300 flex items-start justify-between gap-2">
+          <div>
+            <span className="font-medium">Couldn't generate continuation prompt: </span>
+            {continuationErr.length > 300 ? continuationErr.slice(0, 300) + "…" : continuationErr}
+          </div>
+          <button
+            onClick={() => continuationPrompt.reset()}
+            className="text-amber-400/60 hover:text-amber-200 shrink-0"
+            title="Dismiss"
+          >✕</button>
+        </div>
+      )}
+      {chainNextErr && (
+        <div className="mx-3 mt-1 mb-1 bg-amber-900/20 border border-amber-800/40 rounded-md px-2.5 py-1.5 text-[11px] text-amber-300 flex items-start justify-between gap-2">
+          <div>
+            <span className="font-medium">Couldn't chain to next: </span>
+            {chainNextErr.length > 300 ? chainNextErr.slice(0, 300) + "…" : chainNextErr}
+          </div>
+          <button
+            onClick={() => { chainNext.reset(); unchainNext.reset(); }}
+            className="text-amber-400/60 hover:text-amber-200 shrink-0"
+            title="Dismiss"
+          >✕</button>
+        </div>
+      )}
       {/* Frame slots — reference still | video clip. Scenes are independent
           shots joined by hard cuts at assembly, so there's no last-frame anchor. */}
       <div className="grid grid-cols-2 gap-2 p-2">
@@ -187,8 +393,28 @@ export default function SceneGenRow({
           assetType="image"
           assets={imageAssets}
           activeUrl={scene.reference_image_url}
-          modelLabel={models?.image?.[scene.image_model]?.name || scene.image_model}
-          onOpenLightbox={() => scene.reference_image_url && setShowImage(true)}
+          renderedWithLabel={(() => {
+            const activeImg = imageAssets.find((a) => a.is_active);
+            if (!activeImg) return null;
+            return models?.image?.[activeImg.model_used || ""]?.name
+              || activeImg.model_used
+              || null;
+          })()}
+          renderedProvider="openrouter"
+          nextModelLabel={models?.image?.[scene.image_model]?.name || scene.image_model}
+          nextProvider="openrouter"
+          renderedResolution={null}
+          nextResolution={null}
+          onOpenLightbox={() => {
+            // The slot shows either the scene's own rendered still OR the
+            // chained prev-scene's extracted last frame. Use whichever is
+            // currently being displayed so the lightbox opens the same image
+            // the user clicked, not a stale `reference_image_url` of null.
+            const displayed = chainActive
+              ? prevScene?.extracted_last_frame_url
+              : scene.reference_image_url;
+            if (displayed) setShowImage(true);
+          }}
           onActivate={(id) => activate.mutate(id)}
           onDelete={(id) => deleteAsset.mutate(id)}
           modelLookup={models?.image}
@@ -197,6 +423,16 @@ export default function SceneGenRow({
           onPromptDelete={(id) => deletePrompt.mutate(id)}
           chainedFromUrl={chainActive ? (prevScene?.extracted_last_frame_url ?? null) : null}
           chainedFromOrder={chainActive ? prevScene?.order ?? null : null}
+          onDownloadUrl={
+            (chainActive && prevScene?.extracted_last_frame_url) || hasImage
+              ? api.scenes.firstFrameUrl(scene.id)
+              : null
+          }
+          onDownloadLabel={
+            chainActive
+              ? `Download the chained first frame (scene #${prevScene?.order ?? scene.order - 1}'s extracted last frame)`
+              : "Download this scene's reference still"
+          }
           actionButton={
             <SplitGenerateButton
               label={imageAssets.length > 0 ? "+ Img" : "Img"}
@@ -206,10 +442,7 @@ export default function SceneGenRow({
               currentModel={scene.image_model}
               options={models?.image ? Object.entries(models.image).map(([k, m]) => ({ key: k, label: m.name })) : []}
               onClickMain={() => generate.mutate({ phase: "image", force: hasImage })}
-              onPickModel={(key) => {
-                updateModel.mutate({ image_model: key });
-                setTimeout(() => generate.mutate({ phase: "image", force: hasImage }), 200);
-              }}
+              onPickModel={(key) => updateModel.mutate({ image_model: key })}
               colorClasses="bg-blue-500/15 hover:bg-blue-500/30 text-blue-300 border-blue-500/30"
               title={imageAssets.length > 0
                 ? "Generate another image variant — keeps prior versions"
@@ -223,13 +456,23 @@ export default function SceneGenRow({
           assetType="video"
           assets={videoAssets}
           activeUrl={scene.video_url}
-          modelLabel={
+          renderedWithLabel={
             activeVideoAsset
               ? (activeVideoAsset.model_used?.includes(" + ")
                   ? activeVideoAsset.model_used
-                  : (models?.video?.[activeVideoAsset.model_used || ""]?.name || activeVideoAsset.model_used || "—"))
-              : (models?.video?.[scene.video_model]?.name || scene.video_model)
+                  : (models?.video?.[activeVideoAsset.model_used || ""]?.name || activeVideoAsset.model_used || null))
+              : null
           }
+          renderedProvider={renderedVideoProvider}
+          renderedResolution={renderedVideoResolution}
+          nextModelLabel={models?.video?.[scene.video_model]?.name || scene.video_model}
+          nextProvider={nextVideoProvider}
+          nextResolution={scene.resolution}
+          onDownloadUrl={hasVideo ? scene.video_url : null}
+          onDownloadLabel="Download the active video"
+          onUpload={(f) => uploadVideo.mutate(f)}
+          uploadLabel="Upload an MP4 as this scene's video — skips generation, saves as a new variant. Useful for plugging in a clip you rendered elsewhere (e.g. fal Seedance web UI)."
+          uploading={uploadVideo.isPending}
           isLipsynced={activeVideoIsLipsynced}
           onOpenLightbox={() => scene.video_url && setShowPreview(true)}
           onActivate={(id) => activate.mutate(id)}
@@ -244,36 +487,18 @@ export default function SceneGenRow({
                 label={videoAssets.length > 0 ? "+ Vid" : "Vid"}
                 icon={<Video className="w-3 h-3" />}
                 running={scene.status === "generating_video"}
-                disabled={generate.isPending || isRunning || !hasImage}
+                disabled={generate.isPending || isRunning || !canGenerateVideo}
                 currentModel={scene.video_model}
                 options={models?.video ? Object.entries(models.video).map(([k, m]) => ({ key: k, label: m.name })) : []}
                 onClickMain={() => generate.mutate({ phase: "video", force: scene.status === "done" })}
-                onPickModel={(key) => {
-                  updateModel.mutate({ video_model: key });
-                  setTimeout(() => generate.mutate({ phase: "video", force: scene.status === "done" }), 200);
-                }}
+                onPickModel={(key) => updateModel.mutate({ video_model: key })}
                 colorClasses="bg-accent/20 hover:bg-accent/40 text-accent border-accent/30"
-                title={!hasImage ? "Generate image first" : videoAssets.length > 0
+                title={!canGenerateVideo ? (chainActive ? "Previous scene needs a video first (chain frame not extracted yet)" : "Generate image first") : videoAssets.length > 0
                   ? "Generate another video variant — keeps prior versions"
                   : "Generate video from reference image"}
               />
-              <SplitGenerateButton
-                label={lipsyncAssets.length > 0 ? "+ Sync" : "Sync"}
-                icon={<Mic2 className="w-3 h-3" />}
-                running={scene.status === "lipsync"}
-                disabled={generate.isPending || isRunning || !hasVideo}
-                currentModel={scene.lipsync_model}
-                options={models?.lipsync ? Object.entries(models.lipsync).map(([k, m]) => ({ key: k, label: m.name })) : []}
-                onClickMain={() => generate.mutate({ phase: "lipsync", force: false })}
-                onPickModel={(key) => {
-                  updateModel.mutate({ lipsync_model: key });
-                  setTimeout(() => generate.mutate({ phase: "lipsync", force: false }), 200);
-                }}
-                colorClasses="bg-indigo-500/15 hover:bg-indigo-500/30 text-indigo-300 border-indigo-500/30"
-                title={!hasVideo ? "Generate video first" : lipsyncAssets.length > 0
-                  ? "Run lipsync again — saved as another video variant"
-                  : "Run lipsync on existing video"}
-              />
+              {/* +Sync (post-process lipsync via fal) removed — see comment at the
+                  audio-sync toggle for context. Generate purely visual scenes. */}
             </div>
           }
         />
@@ -324,28 +549,7 @@ export default function SceneGenRow({
             </div>
           </div>
 
-          {/* Lipsync model picker */}
-          {models.lipsync && (
-            <div>
-              <label className="text-[10px] text-zinc-500 mb-1.5 flex items-center gap-1 uppercase tracking-wide">
-                <Mic2 className="w-2.5 h-2.5" /> Lipsync Model
-              </label>
-              <select
-                value={scene.lipsync_model}
-                onChange={(e) => updateModel.mutate({ lipsync_model: e.target.value })}
-                className="w-full bg-surface-2 border border-white/10 rounded-md px-2 py-1.5 text-xs text-white focus:outline-none focus:border-accent"
-              >
-                {Object.entries(models.lipsync).map(([key, m]) => (
-                  <option key={key} value={key}>
-                    {m.name} — ${m.price_per_clip}/clip
-                  </option>
-                ))}
-              </select>
-              {models.lipsync[scene.lipsync_model]?.note && (
-                <p className="text-[10px] text-zinc-600 mt-1">{models.lipsync[scene.lipsync_model].note}</p>
-              )}
-            </div>
-          )}
+          {/* Lipsync model picker removed — lipsync features were retired. */}
 
           {/* Resolution / quality selector — constrained to current model's options */}
           {(() => {
@@ -381,13 +585,25 @@ export default function SceneGenRow({
       {showPreview && hasVideo && (
         <ScenePreview scene={scene} song={song} onClose={() => setShowPreview(false)} />
       )}
-      {showImage && scene.reference_image_url && (
-        <Lightbox
-          src={scene.reference_image_url}
-          caption={`Scene #${scene.order} reference still — ${scene.description?.slice(0, 80) || ""}`}
-          onClose={() => setShowImage(false)}
-        />
-      )}
+      {showImage && (() => {
+        // Open whichever image is currently shown in the slot. For chained
+        // scenes that's the prev-scene's extracted last frame; otherwise
+        // this scene's own reference still.
+        const displayed = chainActive
+          ? prevScene?.extracted_last_frame_url
+          : scene.reference_image_url;
+        if (!displayed) return null;
+        const caption = chainActive
+          ? `Scene #${scene.order} first frame — chained from scene #${prevScene?.order ?? scene.order - 1}'s extracted last frame`
+          : `Scene #${scene.order} reference still — ${scene.description?.slice(0, 80) || ""}`;
+        return (
+          <Lightbox
+            src={displayed}
+            caption={caption}
+            onClose={() => setShowImage(false)}
+          />
+        );
+      })()}
     </div>
   );
 }

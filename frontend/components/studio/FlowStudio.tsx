@@ -59,7 +59,12 @@ export default function FlowStudio({ project, song, scenes, characters, jobs, co
         return "ready";
       })();
 
-  const assembleStatus: CellStatus = generateStatus !== "complete" ? "locked" : "ready";
+  // Assembly unlocks as soon as at least one scene has a finished video —
+  // partial assemblies are useful for previewing the cut so far. The
+  // backend filters to status="done" scenes and -shortest-trims the
+  // muxed audio to match.
+  const anySceneDone = scenes.some((s) => s.status === "done");
+  const assembleStatus: CellStatus = anySceneDone ? "ready" : "locked";
 
   // Auto-expand the first non-complete step on mount
   const initialExpand = useMemo(() => {
@@ -197,7 +202,7 @@ export default function FlowStudio({ project, song, scenes, characters, jobs, co
           title="Generate Scenes"
           subtitle={scenes.length
             ? `${scenes.filter(s => s.status === "done").length} of ${scenes.length} complete`
-            : "Generate images, videos, and lipsync per scene"}
+            : "Generate images and videos per scene"}
           status={generateStatus}
           expanded={expanded.has(4)}
           onToggle={() => toggle(4)}

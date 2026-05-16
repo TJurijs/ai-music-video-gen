@@ -1,6 +1,6 @@
 "use client";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Loader2, Image as ImageIcon, Video, Mic2, RefreshCw, Settings, DollarSign } from "lucide-react";
+import { Loader2, Image as ImageIcon, Video, RefreshCw, Settings, DollarSign } from "lucide-react";
 import { api } from "@/lib/api";
 import { useConfirm } from "@/components/ConfirmDialog";
 import type { Project, Scene, GenerationJob, ProjectCosts } from "@/lib/types";
@@ -43,7 +43,7 @@ export default function StepGenerateCell({
 
   // Global default model setter — patches every scene at once
   const setGlobalModel = useMutation({
-    mutationFn: async (data: { image_model?: string; video_model?: string; lipsync_model?: string }) => {
+    mutationFn: async (data: { image_model?: string; video_model?: string; lipsync_model?: string; resolution?: string }) => {
       await Promise.all(scenes.map((s) => api.scenes.update(s.id, data)));
     },
     onSuccess: refresh,
@@ -90,7 +90,7 @@ export default function StepGenerateCell({
             <Settings className="w-2.5 h-2.5" /> Default models for all {scenes.length} scenes
             <span className="text-zinc-700 normal-case ml-1">(can be overridden per scene in Settings)</span>
           </div>
-          <div className="grid grid-cols-3 gap-2">
+          <div className="grid grid-cols-2 gap-2">
             <GlobalModelPicker
               icon={<ImageIcon className="w-2.5 h-2.5" />}
               label="Image"
@@ -104,17 +104,36 @@ export default function StepGenerateCell({
               label="Video"
               value={mostCommon(scenes.map((s) => s.video_model))}
               options={Object.entries(models.video).map(([k, m]) => ({ key: k, label: m.name }))}
-              onChange={(v) => setGlobalModel.mutate({ video_model: v })}
+              onChange={(v) => {
+                // When changing the global video model, also reset everyone's
+                // resolution to the new model's first supported option — the
+                // old resolution might not be valid for the new model.
+                const newModelCfg = models.video[v];
+                const fallbackRes = newModelCfg?.resolutions?.[0];
+                setGlobalModel.mutate(
+                  fallbackRes ? { video_model: v, resolution: fallbackRes } : { video_model: v }
+                );
+              }}
               disabled={setGlobalModel.isPending}
             />
-            <GlobalModelPicker
-              icon={<Mic2 className="w-2.5 h-2.5" />}
-              label="Lipsync"
-              value={mostCommon(scenes.map((s) => s.lipsync_model))}
-              options={models.lipsync ? Object.entries(models.lipsync).map(([k, m]) => ({ key: k, label: m.name })) : []}
-              onChange={(v) => setGlobalModel.mutate({ lipsync_model: v })}
-              disabled={setGlobalModel.isPending}
-            />
+            {/* Lipsync default-model picker removed — lipsync features retired. */}
+            {/* Resolution picker — options derive from the currently-selected
+                video model. Mass-applies to every scene. */}
+            {(() => {
+              const currentVideoKey = mostCommon(scenes.map((s) => s.video_model)) || "";
+              const cfg = currentVideoKey ? models.video[currentVideoKey] : undefined;
+              if (!cfg?.resolutions?.length) return null;
+              return (
+                <GlobalModelPicker
+                  icon={<Settings className="w-2.5 h-2.5" />}
+                  label="Resolution"
+                  value={mostCommon(scenes.map((s) => s.resolution)) || cfg.resolutions[0]}
+                  options={cfg.resolutions.map((r: string) => ({ key: r, label: r }))}
+                  onChange={(v) => setGlobalModel.mutate({ resolution: v })}
+                  disabled={setGlobalModel.isPending}
+                />
+              );
+            })()}
           </div>
         </div>
       )}

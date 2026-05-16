@@ -77,7 +77,11 @@ VIDEO_MODELS = {
         "aspects": ["16:9", "9:16"],
         "supports_first_frame": True,
         "supports_last_frame": True,
-        "supports_reference_images": True,
+        # Veo enforces a hard choice: `first_frame` OR `input_references`,
+        # not both. Our pipeline always sends `first_frame` (the scene's
+        # planned still or chained last frame), so refs get silently
+        # dropped. Identity must come from `first_frame` alone.
+        "supports_reference_images": False,
         "supports_audio_input": False,
         "generates_audio": True,
         # Resolution × audio price matrix ($/s)
@@ -99,8 +103,6 @@ VIDEO_MODELS = {
         "supports_first_frame": True,
         "supports_last_frame": True,
         "supports_reference_images": True,
-        # OpenRouter's variant is text/image-to-video; the audio-input variant
-        # lives on fal (fal-ai/bytedance/seedance/v2/audio-to-video).
         "supports_audio_input": False,
         "generates_audio": True,
         # Token-priced; approximate per-second rates based on typical 24fps render.
@@ -111,7 +113,27 @@ VIDEO_MODELS = {
             "1080p": {"with_audio": 0.10,  "without_audio": 0.10},
         },
         "max_duration": 15,
-        "note": "ByteDance's character-consistency specialist. Cheap, flexible, supports all 7 aspect ratios. NOTE: stricter image-input filter than Veo/Kling — refuses photoreal portraits via input_references. Use Veo/Kling for scenes that need photoreal character anchors.",
+        "note": "ByteDance's character-consistency specialist. NOTE: stricter image-input filter than Veo/Kling — refuses photoreal portraits via input_references. Use Veo/Kling for scenes that need photoreal character anchors.",
+    },
+    "seedance-2.0-fast": {
+        "name": "Seedance 2.0 Fast",
+        "model_id": "bytedance/seedance-2.0-fast",
+        "tier": "cheap",
+        "tagline": "Same lipsync, half the price — for drafting",
+        "durations": list(range(4, 11)),  # 4 through 10
+        "resolutions": ["480p", "720p"],
+        "aspects": ["1:1", "3:4", "9:16", "4:3", "16:9", "21:9", "9:21"],
+        "supports_first_frame": True,
+        "supports_last_frame": True,
+        "supports_reference_images": True,
+        "supports_audio_input": False,
+        "generates_audio": True,
+        "pricing": {
+            "480p": {"with_audio": 0.012, "without_audio": 0.012},
+            "720p": {"with_audio": 0.025, "without_audio": 0.025},
+        },
+        "max_duration": 10,
+        "note": "Faster, cheaper Seedance 2.0 variant. Capped at 720p / 10s. Use for iteration; promote to full Seedance 2.0 for finals.",
     },
     "kling-v3.0-pro": {
         "name": "Kling 3.0 Pro",
@@ -123,7 +145,12 @@ VIDEO_MODELS = {
         "aspects": ["16:9", "9:16", "1:1"],
         "supports_first_frame": True,
         "supports_last_frame": True,
-        "supports_reference_images": True,
+        # Kling has a "Bind Subject" feature in its native UI, but OpenRouter
+        # does NOT forward `input_references` to Kling — they're silently
+        # dropped. So on the OpenRouter route, character identity must come
+        # ENTIRELY from `first_frame`. If face isn't visible there, Kling
+        # improvises.
+        "supports_reference_images": False,
         "supports_audio_input": False,
         "generates_audio": True,
         "pricing": {
@@ -142,7 +169,10 @@ VIDEO_MODELS = {
         "aspects": ["16:9", "9:16"],
         "supports_first_frame": True,
         "supports_last_frame": True,
-        "supports_reference_images": True,
+        # Same Veo constraint as the Lite variant: `first_frame` xor
+        # `input_references`. We always send first_frame so refs get
+        # dropped on this route. Identity = first_frame alone.
+        "supports_reference_images": False,
         "supports_audio_input": False,
         "generates_audio": True,
         "pricing": {
@@ -163,7 +193,9 @@ VIDEO_MODELS = {
         "aspects": ["16:9", "9:16", "1:1"],
         "supports_first_frame": True,
         "supports_last_frame": True,
-        "supports_reference_images": True,
+        # Same as Kling Pro: OpenRouter doesn't forward `input_references`
+        # to the Kling API. Identity comes from `first_frame` only.
+        "supports_reference_images": False,
         "supports_audio_input": False,
         "generates_audio": False,
         # Standard is roughly 2/3 the price of Pro for comparable behaviour.
@@ -172,46 +204,6 @@ VIDEO_MODELS = {
         },
         "max_duration": 15,
         "note": "Cheaper Kling — same lenient face filter as the Pro variant. Reliable identity anchor for photoreal portraits.",
-    },
-    "hailuo-2.3": {
-        "name": "MiniMax Hailuo 2.3",
-        "model_id": "minimax/hailuo-2.3",
-        "tier": "mid",
-        "tagline": "Built for character animation — accepts photoreal refs",
-        "durations": [6, 10],
-        "resolutions": ["720p", "1080p"],
-        "aspects": ["16:9", "9:16", "1:1"],
-        "supports_first_frame": True,
-        "supports_last_frame": False,
-        "supports_reference_images": True,
-        "supports_audio_input": False,
-        "generates_audio": False,
-        "pricing": {
-            "720p":  {"with_audio": 0.045, "without_audio": 0.045},
-            "1080p": {"with_audio": 0.08,  "without_audio": 0.08},
-        },
-        "max_duration": 10,
-        "note": "MiniMax's character-animation specialist. Reportedly the most permissive on photoreal character references — strong choice when Seedance refuses your portraits.",
-    },
-    "wan-2.6": {
-        "name": "Alibaba Wan 2.6",
-        "model_id": "alibaba/wan-2.6",
-        "tier": "mid",
-        "tagline": "15s clips + audio + lipsync built-in",
-        "durations": [5, 10, 15],
-        "resolutions": ["720p", "1080p"],
-        "aspects": ["16:9", "9:16", "1:1"],
-        "supports_first_frame": True,
-        "supports_last_frame": True,
-        "supports_reference_images": True,
-        "supports_audio_input": True,  # native audio-to-video for lipsync
-        "generates_audio": True,
-        "pricing": {
-            "720p":  {"with_audio": 0.08,  "without_audio": 0.05},
-            "1080p": {"with_audio": 0.12,  "without_audio": 0.08},
-        },
-        "max_duration": 15,
-        "note": "Alibaba Wan — moderate filter, accepts photoreal portraits. Native lipsync (no separate step). Longest single-clip duration in our config at 15s.",
     },
 }
 
@@ -255,41 +247,9 @@ IMAGE_MODELS = {
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
 
-# ---------------------------------------------------------------------------
-# Lipsync models — fal-hosted post-hoc lipsync. None of our video models
-# accept audio input on OpenRouter, so this is the path to lyrics-matched
-# mouth movement. Run after video generation.
-# ---------------------------------------------------------------------------
-LIPSYNC_MODELS = {
-    "fal-latentsync": {
-        "name": "LatentSync",
-        "model_id": "fal-ai/latentsync",
-        "tier": "cheap",
-        "price_per_clip": 0.20,
-        "note": "Default. Fast, decent quality. Best general-purpose choice.",
-    },
-    "fal-sync-lipsync": {
-        "name": "Sync.so v1.6",
-        "model_id": "fal-ai/sync-lipsync",
-        "tier": "premium",
-        "price_per_clip": 0.50,
-        "note": "Highest quality lipsync. Slower and more expensive.",
-    },
-    "fal-musetalk": {
-        "name": "MuseTalk",
-        "model_id": "fal-ai/musetalk",
-        "tier": "mid",
-        "price_per_clip": 0.30,
-        "note": "Real-time lipsync. Good for talking-head shots.",
-    },
-    "fal-wav2lip": {
-        "name": "Wav2Lip",
-        "model_id": "fal-ai/wav2lip",
-        "tier": "debug",
-        "price_per_clip": 0.05,
-        "note": "Cheapest. Older model, lower quality, good for quick tests.",
-    },
-}
+# Lipsync models were removed when the audio-sync / post-hoc lipsync paths
+# were retired. The pipeline produces purely visual scenes; the song is
+# muxed in verbatim at assembly time.
 
 
 # ---------------------------------------------------------------------------

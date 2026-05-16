@@ -9,7 +9,6 @@ from app.config import VIDEO_MODELS, IMAGE_MODELS
 
 
 # Flat-rate operations
-LIPSYNC_PRICE_USD = 0.20            # fal LatentSync per clip
 MUSIC_LYRIA_USD = 0.08              # Lyria 3 Pro per song
 MUSIC_SUNO_USD = 0.118              # Suno V4 per clip
 WHISPER_USD_PER_MIN = 0.006         # fal-ai/whisper word-level (preferred), or OpenRouter chat fallback
@@ -38,14 +37,6 @@ def video_cost(
     name = cfg.get("name", model_key)
     suffix = " +audio" if with_audio else ""
     return total, f"{name} · {duration_seconds}s × ${rate}/s @ {resolution}{suffix}"
-
-
-def lipsync_cost(model_key: str = "fal-latentsync") -> tuple[float, str]:
-    from app.config import LIPSYNC_MODELS
-    cfg = LIPSYNC_MODELS.get(model_key, {})
-    price = cfg.get("price_per_clip", LIPSYNC_PRICE_USD)
-    name = cfg.get("name", model_key)
-    return price, f"{name} · per clip"
 
 
 def music_cost(source: str) -> tuple[float, str]:

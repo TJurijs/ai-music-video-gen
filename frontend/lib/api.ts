@@ -5,10 +5,20 @@ import type {
 const BASE = "/api";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    headers: { "Content-Type": "application/json", ...init?.headers },
-    ...init,
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}`, {
+      headers: { "Content-Type": "application/json", ...init?.headers },
+      ...init,
+    });
+  } catch (networkErr) {
+    // Browser fetch threw — usually means network is gone or the page was
+    // closed mid-request. Rare; surface as-is for the toast.
+    throw new Error(
+      `Network error: ${(networkErr as Error).message || "request did not complete"}. ` +
+      `The backend may be restarting — retry in a moment.`
+    );
+  }
   if (!res.ok) {
     // FastAPI returns errors as `{"detail": "..."}` — extract that so toasts
     // show the actionable message instead of the raw JSON wrapper. Falls
@@ -25,6 +35,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       }
     } catch {
       // raw wasn't JSON — leave msg as the raw text
+    }
+    // The Next.js dev proxy returns a generic "Internal Server Error" body
+    // when upstream (FastAPI on :8010) is unreachable — typically during a
+    // backend restart. The opaque "500: Internal Server Error" toast that
+    // surfaces from that case is the most-confused-about UX in the studio,
+    // so translate it into something actionable.
+    if (res.status === 500 && /^internal server error$/i.test(msg.trim())) {
+      throw new Error(
+        "Backend unreachable (likely restarting). Your request didn't reach the server, so nothing changed. Try again in a moment."
+      );
     }
     throw new Error(`${res.status}: ${msg}`);
   }
@@ -86,6 +106,11 @@ export const api = {
         `/projects/${projectId}/characters/${charId}/portraits/${assetId}`,
         { method: "DELETE" },
       ),
+    updatePortraitDescription: (projectId: number, charId: number, assetId: number, description: string) =>
+      request<import("./types").CharacterPortrait>(
+        `/projects/${projectId}/characters/${charId}/portraits/${assetId}`,
+        { method: "PATCH", body: JSON.stringify({ description }) },
+      ),
     expandCharacter: (projectId: number, charId: number, llm_model?: string) =>
       request<Character>(
         `/projects/${projectId}/characters/${charId}/expand`,
@@ -135,6 +160,8 @@ export const api = {
     update: (id: number, data: Partial<Scene>) =>
       request<Scene>(`/scenes/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
     delete: (id: number) => request<void>(`/scenes/${id}`, { method: "DELETE" }),
+    deleteAll: (projectId: number) =>
+      request<{ deleted: number }>(`/scenes?project_id=${projectId}`, { method: "DELETE" }),
     autoPlan: (data: {
       project_id: number;
       song_id: number;
@@ -148,11 +175,53 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ llm_model }),
       }),
+    // Vision-grounded continuation prompt for a chained scene. Uses the
+    // PREV scene's actual rendered last frame as visual context, so the
+    // generated video_prompt describes motion that picks up from exactly
+    // where the previous clip ended. Requires: chain_from_prev=true on this
+    // scene, AND the prev scene's video has been rendered (so the extracted
+    // last frame exists on disk). Otherwise returns 400 with an actionable
+    // message — surface it to the user verbatim.
+    generateContinuationPrompt: (id: number, llm_model?: string) =>
+      request<Scene>(`/scenes/${id}/continuation-prompt`, {
+        method: "POST",
+        body: JSON.stringify({ llm_model }),
+      }),
+    // Ensure scene N+1 exists AND is chained from scene N. Creates the next
+    // scene if missing (with empty prompts, inherited model settings), or
+    // flips `chain_from_prev` on if it already exists. Returns the next
+    // scene's full data so callers can navigate to it / focus its row.
+    chainToNext: (sceneId: number) =>
+      request<Scene>(`/scenes/${sceneId}/chain-next`, { method: "POST" }),
     expandAll: (data: { project_id: number; llm_model?: string; only_empty?: boolean }) =>
-      request<{ expanded: number; skipped: number; total_cost_usd: number }>(
+      request<{
+        expanded: number;
+        skipped: number;
+        total_cost_usd: number;
+        // Per-scene failures — present on every response, may be empty.
+        // Each entry: { scene_id, reason }. Surfaced in the Plan cell so
+        // the user can see WHY a scene didn't expand instead of just a count.
+        failed?: { scene_id: number; reason: string }[];
+      }>(
         "/scenes/expand-all",
         { method: "POST", body: JSON.stringify(data) },
       ),
+    generateBatch: (data: {
+      project_id: number;
+      song_id: number;
+      target_scene_duration?: number;
+      llm_model?: string;
+      story_seed?: string;
+      start_index?: number;
+      batch_size?: number;
+    }) =>
+      request<{
+        batch_scenes: Scene[];
+        scenes_so_far: number;
+        total_planned: number;
+        has_more: boolean;
+        next_start_index: number | null;
+      }>("/scenes/generate-batch", { method: "POST", body: JSON.stringify(data) }),
     clear: (id: number) =>
       request<{ scene_id: number; assets_removed: number; files_deleted: number }>(
         `/scenes/${id}/clear`,
@@ -176,6 +245,28 @@ export const api = {
       request<Scene>(`/scenes/${sceneId}/assets/${assetId}/activate`, { method: "POST" }),
     deleteAsset: (sceneId: number, assetId: number) =>
       request<void>(`/scenes/${sceneId}/assets/${assetId}`, { method: "DELETE" }),
+    // Download URLs — straight static endpoints, set window.location.href to trigger
+    // the browser's save dialog. Returning the URL keeps the call site simple.
+    firstFrameUrl: (sceneId: number) => `/api${`/scenes/${sceneId}/first-frame`}`,
+    audioChunkUrl: (sceneId: number) => `/api${`/scenes/${sceneId}/audio-chunk`}`,
+    uploadVideo: async (sceneId: number, file: File) => {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await fetch(`/api/scenes/${sceneId}/upload-video`, {
+        method: "POST",
+        body: fd,
+      });
+      if (!res.ok) {
+        const raw = await res.text();
+        let msg = raw;
+        try {
+          const parsed = JSON.parse(raw);
+          if (parsed?.detail) msg = parsed.detail;
+        } catch {}
+        throw new Error(`${res.status}: ${msg}`);
+      }
+      return res.json() as Promise<{ scene_id: number; asset_id: number; file_path: string }>;
+    },
   },
 
   // ---------------------------------------------------------------------------

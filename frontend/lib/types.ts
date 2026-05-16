@@ -4,6 +4,9 @@ export interface Project {
   description?: string;
   style?: string;
   aspect_ratio: string;
+  // Persistent narrative seed — set by auto-plan, reused by AI Expand to
+  // keep per-scene prompts anchored to the same story direction.
+  story_seed?: string;
   created_at: string;
   updated_at: string;
   song_count?: number;
@@ -64,6 +67,10 @@ export interface CharacterPortrait {
   is_active: boolean;
   created_at: string;
   url: string;
+  // Snapshot of the character description that was current when this
+  // portrait variant was created. Activating the variant restores this
+  // onto the parent Character.description so AI Expand stays in sync.
+  description?: string | null;
 }
 
 export interface Character {
@@ -138,6 +145,10 @@ export interface Scene {
   resolution: string;
   generate_audio: boolean;
   lipsync_enabled: boolean;
+  // Native audio reference for lipsync — slices this scene's audio window
+  // from the song and passes it as reference_audios to the video model.
+  // Only effective on models with supports_audio_input (Seedance family).
+  audio_sync_enabled?: boolean;
   align_to_beats: boolean;
   prompts_expanded: boolean;
   // Scene chaining: when on, video gen uses the PREVIOUS scene's extracted

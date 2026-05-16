@@ -93,7 +93,7 @@ export default function StepSongCell({ project, song }: { project: Project; song
               placeholder="Describe the song: mood, genre, vibe, energy..."
               value={genForm.description}
               onChange={(e) => setGenForm({ ...genForm, description: e.target.value })}
-              className={inputCls + " resize-none"}
+              className={inputCls + " resize-y"}
             />
             <input
               placeholder="Style tags: e.g. electronic, dark pop, 120bpm"
@@ -106,7 +106,7 @@ export default function StepSongCell({ project, song }: { project: Project; song
               placeholder="Lyrics (optional — leave blank for AI to write them)"
               value={genForm.lyrics}
               onChange={(e) => setGenForm({ ...genForm, lyrics: e.target.value })}
-              className={inputCls + " resize-none"}
+              className={inputCls + " resize-y"}
             />
             <label className="flex items-center gap-2 text-sm cursor-pointer text-zinc-300">
               <input type="checkbox" className="accent-accent"

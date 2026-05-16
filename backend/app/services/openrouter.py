@@ -36,7 +36,14 @@ async def chat(messages: list, model: Optional[str] = None, json_mode: bool = Fa
         )
         if r.status_code >= 400:
             raise RuntimeError(f"OpenRouter chat {r.status_code}: {r.text[:600]}")
-        return r.json()["choices"][0]["message"]["content"]
+        data = r.json()
+        msg = data["choices"][0]["message"]
+        content = msg.get("content")
+        if content is None:
+            # Gemini returns null content on safety refusals; surface the reason.
+            refusal = msg.get("refusal") or data.get("error", {}).get("message") or ""
+            raise RuntimeError(f"OpenRouter chat returned null content. Refusal: {refusal[:300] or '(no reason given)'}")
+        return content
 
 
 # ---------------------------------------------------------------------------
@@ -155,16 +162,24 @@ async def generate_image(
 
     preview = str(content)[:200] if content else str(msg)[:300]
     if is_text_only:
-        # Make the error actionable: tell the user what likely went wrong
-        # so they can fix the character description.
+        # Likeness filter most often. Keep the message short — the frontend
+        # banner shows the "Soften" buttons inline so the user already has
+        # the recovery actions one click away.
         raise ValueError(
-            "Image model returned text instead of an image — this usually "
-            "means the prompt mentions a real person's name (actor, "
-            "musician, public figure) and the model's likeness filter "
-            "refused to render. Edit the character description to use "
-            "feature shapes ('sharp angular jaw') instead of names "
-            f"('Cillian Murphy'). Model response: {preview}"
+            f"Image model content filter refused: returned text instead of an image. "
+            f"Model={model}. Likely a real-person name in the prompt. "
+            f"Try Soften image prompt, or pick a less strict image model."
         )
+
+    if content is None and not images:
+        # Gemini's empty-response refusal — no explanation, just silence.
+        # Same recovery options as the text-only case.
+        raise ValueError(
+            f"Image model content filter refused: empty response (content=None). "
+            f"Model={model}. Try Soften image prompt, swap to a different image model, "
+            f"or remove 'photoreal' wording from the prompt."
+        )
+
     raise ValueError(f"Unexpected image response format: {preview}")
 
 
@@ -197,6 +212,18 @@ def _data_url_from_path(path: str) -> str:
     with open(path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode()
     return f"data:image/{mime};base64,{b64}"
+
+
+def _audio_data_url_from_path(path: str) -> str:
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else "mp3"
+    mime = {
+        "mp3": "mpeg", "mpeg": "mpeg",
+        "wav": "wav", "ogg": "ogg",
+        "m4a": "mp4", "aac": "aac", "flac": "flac",
+    }.get(ext, "mpeg")
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    return f"data:audio/{mime};base64,{b64}"
 
 
 def _is_image_filter_error(error_text: str) -> bool:
@@ -238,18 +265,17 @@ async def submit_video_job(
     first_frame_path: Optional[str] = None,
     last_frame_path: Optional[str] = None,
     reference_image_paths: Optional[list[str]] = None,
-    _retry_count: int = 0,
+    reference_audio_path: Optional[str] = None,
 ) -> str:
     """Submit a video generation job. Returns the job ID for polling.
 
-    Auto-degrade on image-content filter rejection:
-      Attempt 1 — first_frame + last_frame + character refs (full identity)
-      Attempt 2 — drop character refs (keeps scene composition, loses
-                  identity anchor — model improvises character looks)
-      Attempt 3 — also drop frame images (pure text-to-video — last resort,
-                  loses BOTH composition and identity)
-    Final error surfaces the actual filter signal + suggests a model switch
-    (Veo and Kling accept photoreal portraits where Seedance refuses).
+    On image-content-filter rejection, raises RuntimeError with actionable
+    recovery instructions. We DELIBERATELY do not auto-degrade the payload —
+    silently stripping the first_frame to get a render to succeed produces
+    text-to-video output that breaks downstream chaining and confuses the
+    user (the clip appears, but doesn't start on the expected pixel). The
+    user picks the recovery path explicitly: switch to a permissive model
+    (Kling / Veo) or activate a less-recognizable portrait variant.
     """
     payload: dict = {
         "model": model_id,
@@ -295,6 +321,28 @@ async def submit_video_job(
     if refs:
         payload["input_references"] = refs
 
+    # Log payload shape so we can confirm WHAT was actually sent. Doesn't
+    # log the base64 image bytes — just the count + dimensions so it's
+    # readable. Useful for "did the character ref actually go through?"
+    print(
+        f"[openrouter video] submit model={model_id} duration={duration}s "
+        f"resolution={resolution} aspect={aspect_ratio} "
+        f"first_frame={'yes' if first_frame_path else 'no'} "
+        f"last_frame={'yes' if last_frame_path else 'no'} "
+        f"input_references={len(refs)} ref(s) "
+        f"prompt[:120]={prompt[:120]!r}"
+    )
+
+    # NOTE: OpenRouter's /api/v1/videos schema does NOT currently expose any
+    # audio-reference field. ByteDance's Seedance 2.0 supports `reference_audios`
+    # natively, but that path is only reachable via Replicate or Volcengine —
+    # OpenRouter silently drops unknown top-level keys. So we deliberately do
+    # not include a `reference_audios` field here, even when the scene's
+    # audio_sync_enabled toggle is on; doing so would just inflate the request
+    # body with a base64-encoded MP3 that the API ignores. The toggle exists
+    # as a forward-compatible scene flag for the day the user wires up a
+    # direct Replicate path or OpenRouter adds the field.
+
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
             f"{OPENROUTER_BASE}/videos",
@@ -304,53 +352,36 @@ async def submit_video_job(
         if r.status_code >= 400:
             error_text = r.text or ""
 
-            # Image-content filter: degrade payload and retry.
-            if _is_image_filter_error(error_text) and _retry_count < 2:
-                # Attempt 2: drop character refs but keep first_frame.
-                if _retry_count == 0 and (reference_image_paths or []):
-                    print(
-                        f"[video] {model_id} image filter triggered with "
-                        f"{len(refs)} char refs + {len(frame_images)} frames — "
-                        f"retrying without character refs (scene composition preserved, "
-                        f"identity will be model's guess)"
-                    )
-                    return await submit_video_job(
-                        prompt=prompt, model_id=model_id, duration=duration,
-                        aspect_ratio=aspect_ratio, resolution=resolution,
-                        generate_audio=generate_audio,
-                        first_frame_path=first_frame_path,
-                        last_frame_path=last_frame_path,
-                        reference_image_paths=None,
-                        _retry_count=_retry_count + 1,
-                    )
-                # Attempt 3: also drop frame images (pure text-to-video).
-                if _retry_count == 1 and (first_frame_path or last_frame_path):
-                    print(
-                        f"[video] {model_id} still rejecting images — "
-                        f"retrying as text-to-video (no first_frame, no refs)"
-                    )
-                    return await submit_video_job(
-                        prompt=prompt, model_id=model_id, duration=duration,
-                        aspect_ratio=aspect_ratio, resolution=resolution,
-                        generate_audio=generate_audio,
-                        first_frame_path=None, last_frame_path=None,
-                        reference_image_paths=None,
-                        _retry_count=_retry_count + 1,
-                    )
-
-            # Make filter errors actionable.
+            # Image-content filter: previously this auto-degraded — dropping
+            # character refs, then dropping first_frame, then falling back to
+            # pure text-to-video. The user couldn't tell from the rendered
+            # clip that the chain anchor had been dropped, so chained scenes
+            # silently broke. Now we surface the rejection with actionable
+            # text instead of silently degrading. The user picks the recovery
+            # path: swap to a permissive model, activate a less-recognizable
+            # portrait variant, etc.
             if _is_image_filter_error(error_text):
+                what_was_rejected = []
+                if reference_image_paths:
+                    what_was_rejected.append(f"{len(refs)} character portrait(s)")
+                if first_frame_path:
+                    what_was_rejected.append("first_frame")
+                if last_frame_path:
+                    what_was_rejected.append("last_frame")
+                payload_summary = " + ".join(what_was_rejected) or "image input(s)"
+
                 suggestion = (
-                    "Try a different video model — "
-                    "Veo 3.1 Lite or Kling 3.0 Pro accept photoreal portraits "
-                    "where Seedance refuses them. (Seedance has stricter image-input "
-                    "filters than text-prompt filters — different from Gemini's behaviour.)"
+                    "Seedance has a stricter image-content filter than other models. "
+                    "Options: (a) switch this scene to Kling 3.0 Pro/Std or Veo 3.1 — "
+                    "both accept photoreal portraits where Seedance refuses; "
+                    "(b) activate a less-recognizable portrait variant for this character "
+                    "(blindfold / mask / heavy shadow / profile shot); "
+                    "(c) regenerate the first_frame with the same obscuring treatment."
                 )
                 raise RuntimeError(
-                    f"OpenRouter video submit {r.status_code}: image content filter "
-                    f"refused after {_retry_count + 1} attempt(s) (degrading the payload "
-                    f"didn't help). Model: {model_id}. {suggestion} "
-                    f"Raw provider error: {error_text[:400]}"
+                    f"Image content filter refused: {payload_summary}. "
+                    f"Model: {model_id}. {suggestion} "
+                    f"Raw provider error: {error_text[:300]}"
                 )
             # Other 4xx/5xx — surface as before.
             raise RuntimeError(
@@ -358,7 +389,30 @@ async def submit_video_job(
                 f"(model={model_id}, duration={duration}, resolution={resolution}, "
                 f"aspect={aspect_ratio}, refs={len(refs)}, frames={len(frame_images)})"
             )
-        return r.json()["id"]
+        # 2xx response — expect {"id": "..."} per OpenRouter docs. If the
+        # shape changed (e.g., they renamed the field, or the body is empty,
+        # or they return a list), the previous code raised bare KeyError('id')
+        # which surfaced in the UI as just "'id'" — useless. Surface the
+        # actual body so we can diagnose the schema drift.
+        try:
+            body = r.json()
+        except Exception as e:
+            raise RuntimeError(
+                f"OpenRouter video submit returned 2xx but body wasn't JSON "
+                f"({type(e).__name__}: {str(e)[:200]}). Raw: {r.text[:400]}"
+            )
+        # Try common shapes: {"id": ...}, {"data": {"id": ...}}, {"job_id": ...}
+        if isinstance(body, dict):
+            job_id = body.get("id") or body.get("job_id") or (
+                body.get("data", {}).get("id") if isinstance(body.get("data"), dict) else None
+            )
+            if job_id:
+                return job_id
+        raise RuntimeError(
+            f"OpenRouter video submit returned 2xx but no job id in the response. "
+            f"Tried keys: 'id', 'job_id', 'data.id'. "
+            f"Model: {model_id}. Response body: {str(body)[:600]}"
+        )
 
 
 async def get_video_status(job_id: str) -> dict:
@@ -383,12 +437,42 @@ async def poll_video_job(
     is_cancelled is an optional sync callable returning True to abort polling
     (e.g. user pressed Stop). When triggered we raise asyncio.CancelledError so
     the surrounding pipeline can mark the scene cancelled.
+
+    Transient network failures during polling (DNS blip, OpenRouter edge
+    briefly unreachable, local Wi-Fi reconnect) used to kill the whole
+    video gen — even though the job was still running on OpenRouter's side.
+    We now absorb up to MAX_CONSECUTIVE_NETWORK_FAILS in a row before giving
+    up. Real terminal errors (job failed, malformed response) still surface
+    immediately.
     """
+    MAX_CONSECUTIVE_NETWORK_FAILS = 4   # ~1 minute of failures at 15s interval
+    consecutive_network_fails = 0
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         if is_cancelled is not None and is_cancelled():
             raise asyncio.CancelledError(f"Video job {job_id} cancelled by user")
-        data = await get_video_status(job_id)
+        try:
+            data = await get_video_status(job_id)
+            consecutive_network_fails = 0  # any success resets the counter
+        except (httpx.ConnectError, httpx.ReadError, httpx.WriteError,
+                httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectTimeout,
+                httpx.PoolTimeout) as net_err:
+            consecutive_network_fails += 1
+            print(
+                f"[poll {job_id}] transient network error "
+                f"({type(net_err).__name__}: {str(net_err)[:120]}) — "
+                f"attempt {consecutive_network_fails}/{MAX_CONSECUTIVE_NETWORK_FAILS}, "
+                f"sleeping {interval}s and retrying"
+            )
+            if consecutive_network_fails >= MAX_CONSECUTIVE_NETWORK_FAILS:
+                raise RuntimeError(
+                    f"OpenRouter polling failed: {MAX_CONSECUTIVE_NETWORK_FAILS} consecutive "
+                    f"network errors. Job {job_id} may still be running — refresh "
+                    f"in a few minutes; the BackgroundTask's self-heal pass will "
+                    f"mark it done if a video URL became available."
+                ) from net_err
+            await asyncio.sleep(interval)
+            continue
         status = data.get("status")
         if status == "completed":
             urls = data.get("unsigned_urls") or data.get("urls") or []

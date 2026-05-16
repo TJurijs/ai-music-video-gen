@@ -167,13 +167,7 @@ export default function StepCharactersCell({
             rows={3}
             value={form.description}
             onChange={(e) => setForm({ ...form, description: e.target.value })}
-            className={inputCls + " resize-none"}
-          />
-          <input
-            placeholder="Trigger word (optional, for LoRA later)"
-            value={form.trigger_word}
-            onChange={(e) => setForm({ ...form, trigger_word: e.target.value })}
-            className={inputCls}
+            className={inputCls + " resize-y"}
           />
           <div className="flex gap-2 pt-1">
             <button onClick={() => setShowForm(false)} className="flex-1 text-xs py-2 bg-surface-3 hover:bg-surface text-zinc-400 rounded-lg transition-colors">
@@ -253,7 +247,29 @@ function CharacterRow({
     mutationFn: (assetId: number) => api.projects.deletePortrait(projectId, character.id, assetId),
     onSuccess: onRefresh,
   });
+  const updatePortraitDesc = useMutation({
+    mutationFn: ({ assetId, description }: { assetId: number; description: string }) =>
+      api.projects.updatePortraitDescription(projectId, character.id, assetId, description),
+    onSuccess: onRefresh,
+  });
   const [showPortraits, setShowPortraits] = useState(false);
+
+  // Esc closes the portrait gallery — small but standard affordance that
+  // was missing. Especially helpful when there's only 1 variant and the
+  // "Pick portrait" toggle button feels weird to re-click.
+  useEffect(() => {
+    if (!showPortraits) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setShowPortraits(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [showPortraits]);
+  // When non-null: id of the portrait variant whose description is being edited.
+  // The textarea takes over the variant's tile so the rest of the gallery stays
+  // navigable.
+  const [editingDescId, setEditingDescId] = useState<number | null>(null);
+  const [draftDesc, setDraftDesc] = useState("");
   const portraits = character.portraits || [];
 
   const hasImage = !!character.reference_image_url;
@@ -308,7 +324,7 @@ function CharacterRow({
               onChange={(e) => setEditForm({ ...editForm, description: e.target.value })}
               placeholder="Detailed description..."
               rows={2}
-              className="w-full bg-surface-3 border border-white/10 rounded px-2 py-1 text-xs text-white focus:outline-none focus:border-accent resize-none"
+              className="w-full bg-surface-3 border border-white/10 rounded px-2 py-1 text-xs text-white focus:outline-none focus:border-accent resize-y"
             />
             <div className="flex items-center gap-2">
               <button
@@ -457,47 +473,118 @@ function CharacterRow({
         {/* Portrait version history — pick the active one or delete unwanted ones */}
         {showPortraits && portraits.length > 0 && (
           <div className="mt-2 bg-surface-3 rounded-md p-2 border border-white/5">
-            <div className="flex items-center justify-between mb-1.5">
-              <span className="text-[10px] text-zinc-500 uppercase tracking-wide">
-                {portraits.length} portrait versions — click to activate
+            <div className="flex items-center justify-between mb-1.5 gap-2">
+              <span className="text-[10px] text-zinc-500 uppercase tracking-wide flex-1 truncate">
+                {portraits.length} portrait variant{portraits.length === 1 ? "" : "s"} — click image to activate
               </span>
-              <button onClick={() => setShowPortraits(false)} className="text-zinc-500 hover:text-white text-xs">×</button>
+              <button
+                onClick={() => setShowPortraits(false)}
+                className="shrink-0 inline-flex items-center gap-1 text-[10px] text-zinc-400 hover:text-white px-2 py-0.5 rounded border border-white/10 hover:border-white/30 transition-colors"
+                title="Close gallery (Esc)"
+              >
+                <X className="w-3 h-3" /> Close
+              </button>
             </div>
-            <div className="grid grid-cols-4 gap-1.5">
+            <p className="text-[10px] text-zinc-500 mb-2 leading-snug">
+              Each variant carries its own description. Activating swaps both the
+              portrait and the description — so a "blindfolded" variant and a
+              "clean" variant can co-exist without dragging the blindfold into
+              every scene.
+            </p>
+            <div className="grid grid-cols-2 gap-2">
               {portraits.map((p) => (
                 <div
                   key={p.id}
-                  className={`relative rounded-md overflow-hidden border-2 cursor-pointer aspect-square ${
+                  className={`relative rounded-md overflow-hidden border-2 ${
                     p.is_active ? "border-accent" : "border-transparent hover:border-white/20"
                   }`}
-                  onClick={() => activatePortrait.mutate(p.id)}
                   title={`${p.model_used || "—"} · $${p.cost_usd?.toFixed(3) || "0"} · ${new Date(p.created_at).toLocaleString()}`}
                 >
-                  <img src={p.url} className="w-full h-full object-cover" alt="" />
-                  {p.is_active && (
-                    <span className="absolute top-0.5 right-0.5 text-[8px] bg-accent text-white px-1 rounded font-medium">
-                      ACTIVE
-                    </span>
-                  )}
-                  <button
-                    onClick={async (e) => {
-                      e.stopPropagation();
-                      if (await confirm({
-                        title: "Delete portrait version",
-                        message: "Delete this portrait version permanently?",
-                        confirmLabel: "Delete",
-                        destructive: true,
-                      })) {
-                        deletePortrait.mutate(p.id);
-                      }
-                    }}
-                    className="absolute top-0.5 left-0.5 text-zinc-300 hover:text-red-400 bg-black/60 rounded p-0.5"
-                    title="Delete this version"
+                  <div
+                    className="relative aspect-square cursor-pointer"
+                    onClick={() => activatePortrait.mutate(p.id)}
                   >
-                    <X className="w-2 h-2" />
-                  </button>
-                  <div className="absolute bottom-0 inset-x-0 bg-gradient-to-t from-black/80 to-transparent px-1 py-0.5">
-                    <div className="text-[8px] text-white truncate">{p.model_used || "—"}</div>
+                    <img src={p.url} className="w-full h-full object-cover" alt="" />
+                    {p.is_active && (
+                      <span className="absolute top-0.5 right-0.5 text-[8px] bg-accent text-white px-1 rounded font-medium">
+                        ACTIVE
+                      </span>
+                    )}
+                    <button
+                      onClick={async (e) => {
+                        e.stopPropagation();
+                        if (await confirm({
+                          title: "Delete portrait version",
+                          message: "Delete this portrait variant permanently? Its bundled description goes with it.",
+                          confirmLabel: "Delete",
+                          destructive: true,
+                        })) {
+                          deletePortrait.mutate(p.id);
+                        }
+                      }}
+                      className="absolute top-0.5 left-0.5 text-zinc-300 hover:text-red-400 bg-black/60 rounded p-0.5"
+                      title="Delete this variant (and its description)"
+                    >
+                      <X className="w-2 h-2" />
+                    </button>
+                    <div className="absolute bottom-0 inset-x-0 bg-gradient-to-t from-black/80 to-transparent px-1 py-0.5">
+                      <div className="text-[8px] text-white truncate">{p.model_used || "—"}</div>
+                    </div>
+                  </div>
+                  {/* Bundled description — viewable / editable per variant.
+                      Activating the variant also restores this onto the
+                      character so scenes pick it up via AI Expand. */}
+                  <div className="bg-surface-3 border-t border-white/5 p-1.5">
+                    {editingDescId === p.id ? (
+                      <div className="space-y-1">
+                        <textarea
+                          value={draftDesc}
+                          onChange={(e) => setDraftDesc(e.target.value)}
+                          className="w-full bg-surface-2 border border-white/10 rounded px-1.5 py-1 text-[10px] text-zinc-200 leading-snug resize-y min-h-[64px] focus:outline-none focus:border-accent"
+                          placeholder="Description bundled with this portrait variant…"
+                        />
+                        <div className="flex gap-1 justify-end">
+                          <button
+                            onClick={() => setEditingDescId(null)}
+                            className="text-[10px] text-zinc-500 hover:text-zinc-200 px-1.5 py-0.5 rounded"
+                          >Cancel</button>
+                          <button
+                            onClick={() => {
+                              updatePortraitDesc.mutate(
+                                { assetId: p.id, description: draftDesc },
+                                { onSuccess: () => setEditingDescId(null) },
+                              );
+                            }}
+                            disabled={updatePortraitDesc.isPending}
+                            className="text-[10px] text-accent hover:text-accent-hover px-1.5 py-0.5 rounded flex items-center gap-0.5 disabled:opacity-50"
+                          >
+                            <Check className="w-2.5 h-2.5" /> Save
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex items-start gap-1.5">
+                        <div
+                          className="text-[10px] text-zinc-400 leading-snug line-clamp-4 flex-1"
+                          title={p.description || "No description set on this variant"}
+                        >
+                          {p.description
+                            ? p.description
+                            : <span className="italic text-zinc-600">no bundled description</span>}
+                        </div>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setDraftDesc(p.description || "");
+                            setEditingDescId(p.id);
+                          }}
+                          className="text-zinc-500 hover:text-accent shrink-0 mt-0.5"
+                          title="Edit this variant's bundled description"
+                        >
+                          <Pencil className="w-2.5 h-2.5" />
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </div>
               ))}

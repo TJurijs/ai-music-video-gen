@@ -20,6 +20,7 @@ class ProjectCreate(BaseModel):
     description: Optional[str] = None
     style: Optional[str] = None
     aspect_ratio: str = "16:9"
+    story_seed: Optional[str] = None
 
 
 class ProjectUpdate(BaseModel):
@@ -27,6 +28,7 @@ class ProjectUpdate(BaseModel):
     description: Optional[str] = None
     style: Optional[str] = None
     aspect_ratio: Optional[str] = None
+    story_seed: Optional[str] = None
 
 
 @router.get("")
@@ -195,13 +197,17 @@ async def upload_character_image(
     with open(dest_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # Deactivate prior portraits, save this upload as a new active asset
+    # Deactivate prior portraits, save this upload as a new active asset.
+    # Snapshot the current description so the variant + description stay
+    # bundled — activating this asset later will also restore that snapshot
+    # onto the parent character.
     from app.services.versioning import make_active
     asset = CharacterAsset(
         character_id=char_id,
         file_path=dest_path,
         model_used="uploaded",
         cost_usd=0.0,
+        description=char.description,
     )
     make_active(
         db,
@@ -264,6 +270,10 @@ def activate_character_portrait(project_id: int, char_id: int, asset_id: int, db
     if not asset or asset.character_id != char_id:
         raise HTTPException(404, "Portrait not found")
 
+    # On activate: restore both the file pointer AND the description snapshot
+    # that was current when this variant was generated. Without the description
+    # swap, the character's description (which drives every scene's
+    # image_prompt via AI Expand) stays out-of-sync with the visible portrait.
     from app.services.versioning import make_active
     make_active(
         db,
@@ -271,11 +281,39 @@ def activate_character_portrait(project_id: int, char_id: int, asset_id: int, db
         siblings_filter=[CharacterAsset.character_id == char_id],
         on_active_change=lambda a: (
             setattr(char, "reference_image_path", a.file_path),
+            setattr(char, "description", a.description) if a.description else None,
             db.add(char),
         ),
     )
     db.commit()
     return _char_with_url(char, db)
+
+
+class PortraitDescriptionUpdate(BaseModel):
+    description: str
+
+
+@router.patch("/{project_id}/characters/{char_id}/portraits/{asset_id}")
+def update_portrait_description(
+    project_id: int, char_id: int, asset_id: int,
+    payload: PortraitDescriptionUpdate,
+    db: Session = Depends(get_session),
+):
+    """Edit a portrait variant's bundled description. When the variant is
+    currently active, also propagates the new description onto the parent
+    character so AI Expand picks it up immediately."""
+    char = db.get(Character, char_id)
+    asset = db.get(CharacterAsset, asset_id)
+    if not char or char.project_id != project_id or not asset or asset.character_id != char_id:
+        raise HTTPException(404, "Portrait not found")
+    asset.description = payload.description
+    db.add(asset)
+    if asset.is_active:
+        char.description = payload.description
+        db.add(char)
+    db.commit()
+    db.refresh(asset)
+    return _portrait_to_dict(asset)
 
 
 @router.delete("/{project_id}/characters/{char_id}/portraits/{asset_id}", status_code=204)
@@ -386,9 +424,13 @@ async def regenerate_character(
         except Exception:
             theme = {}
 
-    # Passing an empty current_description triggers the "invent from scratch"
-    # branch inside expand_character_description, so the LLM designs the
-    # character fresh without preserving any features of the old description.
+    # Collect other characters so the reroll can contrast against them.
+    other_chars = [
+        {"name": c.name, "description": c.description}
+        for c in db.exec(select(Character).where(Character.project_id == project_id)).all()
+        if c.id != char_id and c.description
+    ]
+
     from app.services.scene_planner import expand_character_description
     result = await expand_character_description(
         name=char.name,
@@ -396,6 +438,8 @@ async def regenerate_character(
         style=project.style if project else "",
         theme_analysis=theme,
         llm_model=req.llm_model or "google/gemini-3-flash-preview",
+        other_characters=other_chars or None,
+        previous_description=char.description or None,
     )
     new_desc = (result.get("description") or "").strip()
     if not new_desc:
@@ -461,13 +505,17 @@ async def _generate_portrait_bg(char_id: int, image_model: str):
 
             cost, detail = pricing.image_cost(image_model)
 
-            # Deactivate prior actives, save new asset, point char.reference_image_path at it
+            # Deactivate prior actives, save new asset, point char.reference_image_path at it.
+            # The description that drove this generation is snapshot onto the
+            # asset so the variant + description stay bundled (activating an
+            # old variant later restores its matching description).
             from app.services.versioning import make_active
             asset = CharacterAsset(
                 character_id=char_id,
                 file_path=dest_path,
                 model_used=image_model,
                 cost_usd=cost,
+                description=char.description,
             )
             make_active(
                 db,
@@ -566,6 +614,7 @@ def _portrait_to_dict(a: CharacterAsset) -> dict:
         "cost_usd": a.cost_usd,
         "is_active": a.is_active,
         "created_at": a.created_at.isoformat() if a.created_at else None,
+        "description": a.description,
         "url": to_storage_url(a.file_path),
     }
 

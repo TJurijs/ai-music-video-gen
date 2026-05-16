@@ -28,14 +28,18 @@ export default function StepAssembleCell({
     onSuccess: () => status.refetch(),
   });
 
-  const done = scenes.filter((s) => s.status === "done").length;
+  const doneScenes = scenes.filter((s) => s.status === "done");
+  const done = doneScenes.length;
   const total = scenes.length;
-  const totalDuration = scenes.reduce((acc, s) => acc + (s.audio_end - s.audio_start), 0);
+  // Only count done scenes — those are the ones that actually end up in the
+  // assembled output, and the muxed audio is `-shortest`-clipped to match.
+  const totalDuration = doneScenes.reduce((acc, s) => acc + (s.audio_end - s.audio_start), 0);
+  const isPartial = done > 0 && done < total;
 
-  if (total === 0 || done < total) {
+  if (total === 0 || done === 0) {
     return (
       <div className="pt-4 text-sm text-zinc-500">
-        Complete all scene generations to enable assembly. ({done}/{total} ready)
+        Generate at least one scene video to enable assembly. ({done}/{total} ready)
       </div>
     );
   }
@@ -47,9 +51,18 @@ export default function StepAssembleCell({
 
   return (
     <div className="space-y-4 pt-4">
+      {isPartial && (
+        <div className="bg-amber-900/20 border border-amber-800/40 rounded-lg p-3 flex items-start gap-2 text-amber-200">
+          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+          <div className="text-xs leading-snug">
+            <span className="font-medium">Partial assembly:</span> only {done} of {total} scenes have generated videos. The output will include those scenes only, and the song audio will be trimmed to match.
+          </div>
+        </div>
+      )}
+
       <div className="bg-surface-2 rounded-xl p-4 grid grid-cols-4 gap-3 text-center">
         <div>
-          <div className="text-2xl font-bold text-accent">{total}</div>
+          <div className="text-2xl font-bold text-accent">{isPartial ? `${done}/${total}` : total}</div>
           <div className="text-[10px] text-zinc-500 uppercase tracking-wide mt-0.5">Scenes</div>
         </div>
         <div>
@@ -156,7 +169,7 @@ function AssemblyRunningPanel({ startedAt }: { startedAt?: string | null }) {
         {elapsed > 0 && <span className="text-[10px] font-mono text-zinc-500">{elapsed}s</span>}
       </div>
       <p className="text-[11px] text-zinc-400 leading-relaxed">
-        ffmpeg is concatenating all scene clips and muxing the song audio. Typically takes 30–90s for a 3-minute song. This panel will switch to a video player when it's done.
+        ffmpeg is concatenating the generated scene clips and muxing the song audio (trimmed to the video length). Typically takes 30–90s for a 3-minute song. This panel will switch to a video player when it's done.
       </p>
       <div className="h-1 bg-surface-3 rounded-full overflow-hidden">
         <div className="h-full bg-accent animate-pulse" style={{ width: "70%" }} />

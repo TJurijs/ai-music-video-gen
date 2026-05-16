@@ -57,7 +57,13 @@ async def assemble_project(project_id: int, engine) -> str:
 
     # Build the concat list file. ffmpeg's concat demuxer needs forward
     # slashes on Windows or escaped backslashes — using forward slashes is
-    # simpler and works everywhere. Straight concat, no per-clip trimming.
+    # simpler and works everywhere.
+    #
+    # For chained scenes (chain_from_prev=True) the clip's first frame is
+    # identical to the previous clip's last frame — skip it with inpoint so
+    # we don't get a duplicate frame at every seam. One frame at 24 fps ≈
+    # 0.042 s; 0.04 s is a safe trim that removes the dupe without cutting
+    # into real content.
     concat_path = os.path.join(output_dir, "concat.txt")
     file_count = 0
     with open(concat_path, "w", encoding="utf-8") as f:
@@ -66,6 +72,8 @@ async def assemble_project(project_id: int, engine) -> str:
             if video and os.path.exists(video):
                 normalized = os.path.abspath(video).replace("\\", "/")
                 f.write(f"file '{normalized}'\n")
+                if scene.chain_from_prev:
+                    f.write("inpoint 0.04\n")
                 file_count += 1
     if file_count == 0:
         raise RuntimeError("No video files found on disk for any done scene")

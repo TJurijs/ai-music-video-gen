@@ -19,6 +19,11 @@ export function SceneErrorBanner({ scene, onSoftened }: { scene: Scene; onSoften
   const err = scene.error_message || "";
   // Heuristic: did the model reject for content-policy reasons?
   const isContentFilter = /content.*filter|content.*policy|safety|moderation|blocked.*content|refused.*content|completed with no output/i.test(err);
+  // And which model side did the refusing — image gen or video gen? Image
+  // gen errors carry "Image model" verbatim; video gen errors carry "video"
+  // (Seedance/Veo/Kling). Default to video if no clear signal.
+  const isImageFilter = /image model|image content filter|image prompt/i.test(err);
+  const which = isImageFilter ? "image" : "video";
 
   const soften = useMutation({
     mutationFn: (field: "video_prompt" | "image_prompt") =>
@@ -48,25 +53,29 @@ export function SceneErrorBanner({ scene, onSoftened }: { scene: Scene; onSoften
       {isContentFilter && (
         <div className="bg-amber-900/20 border border-amber-700/40 rounded px-2 py-1.5 text-[10px] text-amber-200/90 space-y-1.5">
           <p>
-            <span className="font-medium">This was a content-filter rejection</span> — the video model refused to render. Common triggers: <em>Lucifer/demon/hell, blood/gore, weapons, explicit violence</em>. Soften the prompt to bypass the filter while preserving the cinematic intent, or pick a less strict model.
+            Content filter rejected the <span className="font-medium">{which} prompt</span>. Soften it (LLM rewrites without triggers) or pick a less strict model.
           </p>
           <div className="flex gap-2">
+            {/* Primary action: soften the SIDE that actually failed.
+                Show the other as a secondary option since sometimes both
+                prompts share the same triggering phrase. */}
             <button
-              onClick={() => soften.mutate("video_prompt")}
+              onClick={() => soften.mutate(`${which}_prompt` as "video_prompt" | "image_prompt")}
               disabled={soften.isPending}
               className="text-[10px] px-2 py-0.5 bg-amber-500/20 hover:bg-amber-500/40 text-amber-100 border border-amber-500/40 rounded flex items-center gap-1 disabled:opacity-50"
-              title="Use the LLM to rewrite video_prompt without filter triggers"
+              title={`Use the LLM to rewrite ${which}_prompt without filter triggers`}
             >
-              {soften.isPending && soften.variables === "video_prompt" ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : <Wand2 className="w-2.5 h-2.5" />}
-              Soften video prompt
+              {soften.isPending && soften.variables === `${which}_prompt` ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : <Wand2 className="w-2.5 h-2.5" />}
+              Soften {which} prompt
             </button>
             <button
-              onClick={() => soften.mutate("image_prompt")}
+              onClick={() => soften.mutate(which === "video" ? "image_prompt" : "video_prompt")}
               disabled={soften.isPending}
-              className="text-[10px] px-2 py-0.5 bg-amber-500/20 hover:bg-amber-500/40 text-amber-100 border border-amber-500/40 rounded flex items-center gap-1 disabled:opacity-50"
+              className="text-[10px] px-2 py-0.5 bg-amber-500/10 hover:bg-amber-500/25 text-amber-200/70 border border-amber-500/25 rounded flex items-center gap-1 disabled:opacity-50"
+              title="Soften the other prompt too — useful when both share the triggering phrase"
             >
-              {soften.isPending && soften.variables === "image_prompt" ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : <Wand2 className="w-2.5 h-2.5" />}
-              Soften image prompt
+              {soften.isPending && soften.variables === (which === "video" ? "image_prompt" : "video_prompt") ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : <Wand2 className="w-2.5 h-2.5" />}
+              Soften {which === "video" ? "image" : "video"} prompt
             </button>
           </div>
           {softenErr && (
@@ -79,26 +88,12 @@ export function SceneErrorBanner({ scene, onSoftened }: { scene: Scene; onSoften
 }
 
 
-export function ExpandedBadge({ expanded }: { expanded: boolean }) {
-  if (expanded) {
-    return (
-      <span
-        className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] font-medium bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 shrink-0"
-        title="AI Expand has run on this scene — image_prompt and video_prompt are bridging-aware (saw neighbor scenes)"
-      >
-        <Wand2 className="w-2.5 h-2.5" />
-        AI-expanded
-      </span>
-    );
-  }
-  return (
-    <span
-      className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] font-medium bg-amber-500/10 text-amber-300/80 border border-amber-500/30 shrink-0"
-      title="This scene's prompts came from Auto-Plan only. Run AI Expand for richer, neighbor-aware prompts before generating."
-    >
-      plan-only
-    </span>
-  );
+// `ExpandedBadge` is now a no-op visually — the new batch generator always
+// produces fully-expanded scenes, so the AI-expanded / plan-only distinction
+// no longer carries useful information. Kept as a stub so existing callers
+// don't need to change; will be deleted in a follow-up sweep.
+export function ExpandedBadge({ expanded: _expanded }: { expanded: boolean }) {
+  return null;
 }
 
 

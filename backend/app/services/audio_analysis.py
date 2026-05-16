@@ -133,7 +133,7 @@ async def _transcribe(audio_path: str, existing_lyrics: Optional[str]) -> tuple:
 async def _transcribe_fal_whisper(audio_path: str) -> tuple:
     """Transcribe via fal-ai/whisper with word-level timestamps."""
     audio_url = await fal_client.upload_file(audio_path)
-    request_id = await fal_client.submit(
+    submission = await fal_client.submit(
         "fal-ai/whisper",
         {
             "audio_url": audio_url,
@@ -143,7 +143,7 @@ async def _transcribe_fal_whisper(audio_path: str) -> tuple:
             "batch_size": 64,
         },
     )
-    result = await fal_client.poll("fal-ai/whisper", request_id, timeout=600, interval=5)
+    result = await fal_client.poll(submission, timeout=600, interval=5)
 
     text = (result.get("text") or "").strip()
     chunks = result.get("chunks") or []

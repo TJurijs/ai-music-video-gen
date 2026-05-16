@@ -226,7 +226,7 @@ export default function SongPanel({ project, song, scenes, onAutoPlan, onRefresh
                 ))}
               </div>
               <textarea
-                className="w-full bg-surface-2 border border-white/10 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent resize-none"
+                className="w-full bg-surface-2 border border-white/10 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent resize-y"
                 rows={3}
                 placeholder="Describe the song: mood, genre, vibe, energy..."
                 value={genForm.description}
@@ -239,7 +239,7 @@ export default function SongPanel({ project, song, scenes, onAutoPlan, onRefresh
                 onChange={(e) => setGenForm({ ...genForm, style_tags: e.target.value })}
               />
               <textarea
-                className="w-full bg-surface-2 border border-white/10 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent resize-none"
+                className="w-full bg-surface-2 border border-white/10 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent resize-y"
                 rows={4}
                 placeholder="Lyrics (optional — leave blank for auto-generated)"
                 value={genForm.lyrics}

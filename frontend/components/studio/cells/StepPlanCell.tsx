@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Wand2, Loader2, Plus, ChevronDown, Pencil, Trash2, Cpu } from "lucide-react";
 import { api } from "@/lib/api";
@@ -14,14 +14,81 @@ export default function StepPlanCell({
   const confirm = useConfirm();
   const [planOpts, setPlanOpts] = useState({
     duration: 8,
+    // Single LLM model used for both the batch generator and per-scene
+    // re-expand. The two used to be configurable separately back when
+    // planning and AI-expanding were distinct passes — now they're one
+    // batch flow, so one knob is enough.
     plan_llm: "gemini-3-flash-preview",
-    expand_llm: "gemini-3-flash-preview",
-    story_seed: "",
+    // Seed hydrates from the persisted project value so a refresh, a fresh
+    // browser session, or another collaborator opening the project sees the
+    // same narrative direction the last auto-plan ran with.
+    story_seed: project.story_seed || "",
   });
+  // If the project's stored seed changes after mount (e.g. a backend write
+  // landed via auto-plan), bring the editable textarea in sync — but only
+  // when the user hasn't started typing a new seed locally.
+  useEffect(() => {
+    setPlanOpts((opts) => {
+      if (opts.story_seed.trim()) return opts;  // user has unsaved text — don't clobber
+      return { ...opts, story_seed: project.story_seed || "" };
+    });
+  }, [project.story_seed]);
   const [expandedScene, setExpandedScene] = useState<number | null>(null);
 
   const { data: models } = useQuery({ queryKey: ["models"], queryFn: api.models.list });
   const refresh = () => qc.invalidateQueries({ queryKey: ["project", project.id] });
+
+  // ─── Async operation state machine ─────────────────────────────────────
+  // Each long-running mutation (auto-plan, expand-all) goes through up to
+  // four states: idle → running → (maybe) verifying → idle/success/failed.
+  //
+  // "verifying" is the key piece: when the HTTP call errors, we DO NOT
+  // surface a red toast right away. The backend may still be working in
+  // the background (uvicorn reload mid-LLM, proxy timeout on a long call,
+  // connection blip after the DB commits landed), so we keep polling for
+  // ~30s. If scenes actually change during that window, we declare success
+  // and tell the user the connection dropped but the work landed. Only if
+  // nothing changes after the grace period do we show the actionable error.
+  const VERIFY_GRACE_MS = 30000;
+  const planBeforeRef = useRef<{ ids: Set<number> } | null>(null);
+  const expandBeforeRef = useRef<{ expandedCount: number } | null>(null);
+  const planVerifyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const expandVerifyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [planVerifying, setPlanVerifying] = useState(false);
+  const [expandVerifying, setExpandVerifying] = useState(false);
+  const [planRecoveredMsg, setPlanRecoveredMsg] = useState<string | null>(null);
+  const [expandRecoveredMsg, setExpandRecoveredMsg] = useState<string | null>(null);
+  const [planFinalError, setPlanFinalError] = useState<string | null>(null);
+  const [expandFinalError, setExpandFinalError] = useState<string | null>(null);
+  // Per-scene failures surfaced from the most-recent expand-all response.
+  // These come back as a 200 OK with a `failed: []` array; the user wants
+  // to see WHICH scenes failed and WHY, not just the count.
+  const [expandFailures, setExpandFailures] = useState<{ scene_id: number; reason: string }[]>([]);
+
+  // Predicate shared by both mutations: which errors are worth retrying
+  // before the user ever sees a red banner? Transient network/proxy issues
+  // (backend restart, network blip, upstream-unreachable) are safe to retry.
+  // Real backend errors (500 with a detail message about LLM failure, scene
+  // count mismatch, etc.) are NOT retried — they're real failures the user
+  // should know about.
+  const isTransientError = (error: any): boolean => {
+    const msg: string = String((error as Error)?.message || "");
+    return (
+      /Backend unreachable/i.test(msg) ||
+      /Network error/i.test(msg) ||
+      /ECONNREFUSED|ECONNRESET|ETIMEDOUT/i.test(msg) ||
+      /^5\d\d: Internal Server Error$/.test(msg)  // raw "500: Internal Server Error" from proxy
+    );
+  };
+
+  // Up to 5 retries on transient errors, with exponential backoff capped
+  // at 8s. Total wall-clock window: ~30s. While the mutation is retrying,
+  // `isPending` stays true, so the user sees the spinner the whole time
+  // and only ever finds out about transient blips if every retry fails.
+  const TRANSIENT_RETRY_COUNT = 5;
+  const transientRetry = (failureCount: number, error: any) =>
+    failureCount < TRANSIENT_RETRY_COUNT && isTransientError(error);
+  const transientRetryDelay = (attempt: number) => Math.min(1000 * 2 ** attempt, 8000);
 
   const autoPlan = useMutation({
     mutationFn: () =>
@@ -33,26 +100,252 @@ export default function StepPlanCell({
         llm_model: models?.llm?.[planOpts.plan_llm]?.model_id || "google/gemini-3-flash-preview",
         story_seed: planOpts.story_seed.trim() || undefined,
       }),
-    onSuccess: refresh,
+    retry: transientRetry,
+    retryDelay: transientRetryDelay,
+    onMutate: () => {
+      planBeforeRef.current = { ids: new Set(scenes.map((s) => s.id)) };
+      setPlanRecoveredMsg(null);
+      setPlanFinalError(null);
+      setPlanVerifying(false);
+      if (planVerifyTimerRef.current) clearTimeout(planVerifyTimerRef.current);
+    },
+    onSettled: async (_data, error) => {
+      await qc.invalidateQueries({ queryKey: ["project", project.id] });
+      await qc.refetchQueries({ queryKey: ["project", project.id] });
+      if (!error) return;
+      // HTTP failed. Enter verifying — keep polling, give the operation a
+      // chance to finish in the background before declaring real failure.
+      setPlanVerifying(true);
+      planVerifyTimerRef.current = setTimeout(() => {
+        const fresh = qc.getQueryData<any>(["project", project.id]);
+        const freshScenes: Scene[] = fresh?.scenes || [];
+        const before = planBeforeRef.current;
+        const succeeded =
+          before && freshScenes.length > 0 && freshScenes.some((s) => !before.ids.has(s.id));
+        if (succeeded) {
+          setPlanRecoveredMsg(
+            `Server connection dropped, but ${freshScenes.length} scenes were planned and loaded.`
+          );
+          autoPlan.reset();
+        } else {
+          setPlanFinalError(error.message);
+        }
+        setPlanVerifying(false);
+      }, VERIFY_GRACE_MS);
+    },
   });
-  const planError = autoPlan.error instanceof Error ? autoPlan.error.message : null;
 
-  const expandLlmId = models?.llm?.[planOpts.expand_llm]?.model_id || "google/gemini-3-flash-preview";
+  // Single LLM identifier used for both the batch generator and per-scene
+  // re-expand. Resolves the user's preference to OpenRouter's full model_id.
+  const llmId = models?.llm?.[planOpts.plan_llm]?.model_id || "google/gemini-3-flash-preview";
 
   const expandAll = useMutation({
     mutationFn: () =>
       api.scenes.expandAll({
         project_id: project.id,
-        llm_model: expandLlmId,
+        llm_model: llmId,
         only_empty: false,
       }),
-    onSuccess: refresh,
+    retry: transientRetry,
+    retryDelay: transientRetryDelay,
+    onMutate: () => {
+      expandBeforeRef.current = {
+        expandedCount: scenes.filter((s) => s.prompts_expanded).length,
+      };
+      setExpandRecoveredMsg(null);
+      setExpandFinalError(null);
+      setExpandFailures([]);
+      setExpandVerifying(false);
+      if (expandVerifyTimerRef.current) clearTimeout(expandVerifyTimerRef.current);
+    },
+    onSettled: async (data, error) => {
+      await qc.invalidateQueries({ queryKey: ["project", project.id] });
+      await qc.refetchQueries({ queryKey: ["project", project.id] });
+      // Even on a 200 OK, the backend may report per-scene failures —
+      // surface them so the user can see exactly which scenes didn't expand.
+      if (data?.failed && data.failed.length > 0) {
+        setExpandFailures(data.failed);
+      }
+      if (!error) return;
+      setExpandVerifying(true);
+      expandVerifyTimerRef.current = setTimeout(() => {
+        const fresh = qc.getQueryData<any>(["project", project.id]);
+        const freshScenes: Scene[] = fresh?.scenes || [];
+        const after = freshScenes.filter((s) => s.prompts_expanded).length;
+        const before = expandBeforeRef.current?.expandedCount ?? 0;
+        if (after > before) {
+          const delta = after - before;
+          setExpandRecoveredMsg(
+            `Server connection dropped, but ${delta} more scene${delta === 1 ? "" : "s"} were expanded (${after}/${freshScenes.length} total).`
+          );
+          expandAll.reset();
+        } else {
+          setExpandFinalError(error.message);
+        }
+        setExpandVerifying(false);
+      }, VERIFY_GRACE_MS);
+    },
   });
-  const expandAllError = expandAll.error instanceof Error ? expandAll.error.message : null;
+
+  // ─── Batch generator — the new single-button flow ─────────────────────
+  // Replaces (auto-plan + AI Expand all) with one loop that produces
+  // fully-expanded scenes 3 at a time, passing previously-generated scenes
+  // as continuity context. Short LLM calls per batch keep the connection
+  // alive and let the UI show new scenes after every step.
+  const BATCH_SIZE = 3;
+  const [genTotal, setGenTotal] = useState<number | null>(null);
+  const [genSoFar, setGenSoFar] = useState<number>(0);
+  const [genRunning, setGenRunning] = useState(false);
+  const [genError, setGenError] = useState<string | null>(null);
+  // When a transient error trips the per-batch retry loop, surface the
+  // attempt number so the user sees "Retrying after blip…" instead of just
+  // a frozen progress bar.
+  const [genRetryAttempt, setGenRetryAttempt] = useState<number>(0);
+  const genCancelRef = useRef(false);
+
+  // Three modes, all using the same batch endpoint:
+  //
+  //  - oneBatch=false, startFrom=0:
+  //      Full song. start_index=0 wipes any existing scenes on the backend,
+  //      then loops batches of 3 until has_more=false.
+  //
+  //  - oneBatch=true, startFrom=0:
+  //      Just scene 1 (when zero scenes exist). Backend wipes → plans 1.
+  //      Useful for iterating on the story seed cheaply before committing
+  //      to a full plan.
+  //
+  //  - oneBatch=true, startFrom=N (N >= 1):
+  //      Add scene N+1 to an existing plan. start_index>0 does NOT wipe;
+  //      backend reads existing scenes for continuity, plans 1 more at the
+  //      next position. This is the iterative-build path: generate scene 1,
+  //      render it, click "Add scene 2", run continuation-prompt on scene 2,
+  //      render it, repeat.
+  const runGenerateLoop = async ({
+    oneBatch = false,
+    startFrom = 0,
+  }: { oneBatch?: boolean; startFrom?: number } = {}) => {
+    setGenRunning(true);
+    setGenError(null);
+    setGenTotal(null);
+    setGenSoFar(0);
+    setGenRetryAttempt(0);
+    genCancelRef.current = false;
+    let start = startFrom;
+    // One-batch mode uses batch_size=1 so we get exactly the scene we want
+    // (no accidentally over-planning). Full-song mode uses BATCH_SIZE (3).
+    const callBatchSize = oneBatch ? 1 : BATCH_SIZE;
+
+    // Per-batch retry on transient errors (uvicorn restart, network blip,
+    // proxy upstream-unreachable). Each batch is its own request, so a
+    // single bad blip shouldn't abort the whole multi-minute generation.
+    // Up to 5 retries per batch, exponential backoff capped at 8s.
+    const callBatchWithRetry = async (startIdx: number) => {
+      let lastErr: unknown = null;
+      for (let attempt = 0; attempt <= TRANSIENT_RETRY_COUNT; attempt++) {
+        if (genCancelRef.current) throw new Error("Generation cancelled");
+        try {
+          const r = await api.scenes.generateBatch({
+            project_id: project.id,
+            song_id: song!.id,
+            target_scene_duration: planOpts.duration,
+            llm_model: models?.llm?.[planOpts.plan_llm]?.model_id || "google/gemini-3-flash-preview",
+            story_seed: planOpts.story_seed.trim() || undefined,
+            start_index: startIdx,
+            batch_size: callBatchSize,
+          });
+          setGenRetryAttempt(0);  // success — clear the retry indicator
+          return r;
+        } catch (e) {
+          lastErr = e;
+          if (!isTransientError(e) || attempt === TRANSIENT_RETRY_COUNT) {
+            throw e;
+          }
+          setGenRetryAttempt(attempt + 1);
+          // Sleep + retry. The polling effect refreshes the project query
+          // each 2s anyway, so the UI keeps showing progress.
+          await new Promise((r) => setTimeout(r, transientRetryDelay(attempt)));
+        }
+      }
+      throw lastErr;
+    };
+
+    try {
+      while (!genCancelRef.current) {
+        const data = await callBatchWithRetry(start);
+        setGenTotal(data.total_planned);
+        setGenSoFar(data.scenes_so_far);
+        // Pull fresh scenes immediately so the UI updates between batches.
+        await qc.invalidateQueries({ queryKey: ["project", project.id] });
+        await qc.refetchQueries({ queryKey: ["project", project.id] });
+        // Single-batch mode stops after one call regardless of has_more.
+        // Used by "Just scene 1" and "Add scene N+1".
+        if (oneBatch) break;
+        if (!data.has_more || data.next_start_index == null) break;
+        start = data.next_start_index;
+      }
+    } catch (e: any) {
+      setGenError(e?.message || "Generation failed");
+    } finally {
+      setGenRunning(false);
+    }
+  };
+
+  // While anything is in-flight OR verifying OR batch-loop is running, poll
+  // the project every 2s so per-scene progress flips live.
+  useEffect(() => {
+    if (!autoPlan.isPending && !expandAll.isPending && !planVerifying && !expandVerifying && !genRunning) return;
+    const iv = setInterval(refresh, 2000);
+    return () => clearInterval(iv);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoPlan.isPending, expandAll.isPending, planVerifying, expandVerifying, genRunning]);
+
+  // Early success during verification: if scenes change while we're waiting
+  // out the grace period, declare success now and skip the rest of the wait.
+  useEffect(() => {
+    if (!planVerifying) return;
+    const before = planBeforeRef.current;
+    if (before && scenes.length > 0 && scenes.some((s) => !before.ids.has(s.id))) {
+      if (planVerifyTimerRef.current) clearTimeout(planVerifyTimerRef.current);
+      setPlanRecoveredMsg(
+        `Server connection dropped, but ${scenes.length} scenes were planned and loaded.`
+      );
+      setPlanVerifying(false);
+      autoPlan.reset();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scenes, planVerifying]);
+
+  useEffect(() => {
+    if (!expandVerifying) return;
+    const before = expandBeforeRef.current?.expandedCount ?? 0;
+    const now = scenes.filter((s) => s.prompts_expanded).length;
+    if (now > before) {
+      if (expandVerifyTimerRef.current) clearTimeout(expandVerifyTimerRef.current);
+      const delta = now - before;
+      setExpandRecoveredMsg(
+        `Server connection dropped, but ${delta} more scene${delta === 1 ? "" : "s"} were expanded (${now}/${scenes.length} total).`
+      );
+      setExpandVerifying(false);
+      expandAll.reset();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scenes, expandVerifying]);
+
+  // While verifying, treat the operation as still in-flight for button labels
+  // (no point letting the user re-click while we're still listening for the
+  // first attempt to finish).
+  const planBusy = autoPlan.isPending || planVerifying;
+  const expandBusy = expandAll.isPending || expandVerifying;
+  const expandedCount = scenes.filter((s) => s.prompts_expanded).length;
 
   const addScene = useMutation({
     mutationFn: (data: any) => api.scenes.create(data),
     onSuccess: refresh,
+  });
+
+  const clearAll = useMutation({
+    mutationFn: () => api.scenes.deleteAll(project.id),
+    onSettled: refresh,
   });
 
   if (!song || song.status !== "ready") {
@@ -76,10 +369,12 @@ export default function StepPlanCell({
         </p>
         <div className="text-[11px] text-zinc-400 mb-4 bg-surface-3 border border-white/5 rounded-md p-2.5 leading-relaxed">
           <span className="text-accent font-medium">How it works:</span>{" "}
-          Each scene is a self-contained shot. The plan picks the strongest single moment for each section of the song,
-          gives it a still image (the opening frame) and a video (the motion that plays out within that one shot).
-          Scenes are joined by hard cuts in the final assembly — no frame anchoring between adjacent clips. AI Expand
-          later writes detailed image and motion prompts using neighbor descriptions only for narrative coherence.
+          Scenes are generated in batches of {BATCH_SIZE} — each batch is a short LLM call that produces
+          fully-expanded image + video prompts. Every new batch sees the scenes already planned
+          (descriptions, image prompts, video prompts) so the visual vocabulary stays consistent
+          across the song. Scenes are joined by hard cuts at assembly — no per-scene frame anchoring.
+          Short batches mean you see scenes appear progressively, and a network blip only loses the
+          in-flight batch.
         </div>
 
         <div className="mb-3">
@@ -91,7 +386,7 @@ export default function StepPlanCell({
             placeholder="e.g. A wanderer journeys through a dying city, searching for a lost lover. Ends at a rooftop reunion at dawn."
             value={planOpts.story_seed}
             onChange={(e) => setPlanOpts({ ...planOpts, story_seed: e.target.value })}
-            className="w-full bg-surface-3 border border-white/10 rounded-md px-2.5 py-2 text-xs text-white focus:outline-none focus:border-accent placeholder:text-zinc-600 resize-none"
+            className="w-full bg-surface-3 border border-white/10 rounded-md px-2.5 py-2 text-xs text-white focus:outline-none focus:border-accent placeholder:text-zinc-600 resize-y"
           />
         </div>
 
@@ -110,40 +405,22 @@ export default function StepPlanCell({
           </div>
         </div>
 
-        {/* LLM pickers — separate model for Auto-Plan vs AI Expand */}
-        <div className="grid grid-cols-2 gap-2 mb-3">
-          <div className="bg-surface-3 rounded-lg px-2.5 py-1.5">
-            <div className="flex items-center gap-1.5 mb-1">
-              <Cpu className="w-3 h-3 text-zinc-500" />
-              <span className="text-[10px] text-zinc-500">Plan LLM</span>
-            </div>
-            <select
-              value={planOpts.plan_llm}
-              onChange={(e) => setPlanOpts({ ...planOpts, plan_llm: e.target.value })}
-              className="w-full bg-surface-2 border border-white/10 rounded px-2 py-1 text-xs text-white focus:outline-none focus:border-accent"
-            >
-              {models && Object.entries(models.llm).map(([key, m]) => (
-                <option key={key} value={key}>{m.name}</option>
-              ))}
-              {!models && <option value={planOpts.plan_llm}>{planOpts.plan_llm}</option>}
-            </select>
+        {/* Single LLM picker — used for batch generation AND per-scene re-expand. */}
+        <div className="bg-surface-3 rounded-lg px-2.5 py-1.5 mb-3">
+          <div className="flex items-center gap-1.5 mb-1">
+            <Cpu className="w-3 h-3 text-zinc-500" />
+            <span className="text-[10px] text-zinc-500">LLM (used for both batch generation and per-scene re-expand)</span>
           </div>
-          <div className="bg-surface-3 rounded-lg px-2.5 py-1.5">
-            <div className="flex items-center gap-1.5 mb-1">
-              <Cpu className="w-3 h-3 text-zinc-500" />
-              <span className="text-[10px] text-zinc-500">AI Expand LLM</span>
-            </div>
-            <select
-              value={planOpts.expand_llm}
-              onChange={(e) => setPlanOpts({ ...planOpts, expand_llm: e.target.value })}
-              className="w-full bg-surface-2 border border-white/10 rounded px-2 py-1 text-xs text-white focus:outline-none focus:border-accent"
-            >
-              {models && Object.entries(models.llm).map(([key, m]) => (
-                <option key={key} value={key}>{m.name}</option>
-              ))}
-              {!models && <option value={planOpts.expand_llm}>{planOpts.expand_llm}</option>}
-            </select>
-          </div>
+          <select
+            value={planOpts.plan_llm}
+            onChange={(e) => setPlanOpts({ ...planOpts, plan_llm: e.target.value })}
+            className="w-full bg-surface-2 border border-white/10 rounded px-2 py-1 text-xs text-white focus:outline-none focus:border-accent"
+          >
+            {models && Object.entries(models.llm).map(([key, m]) => (
+              <option key={key} value={key}>{m.name}</option>
+            ))}
+            {!models && <option value={planOpts.plan_llm}>{planOpts.plan_llm}</option>}
+          </select>
         </div>
         {models && models.llm[planOpts.plan_llm]?.note && (
           <p className="text-[10px] text-zinc-600 -mt-2 mb-3">
@@ -153,34 +430,107 @@ export default function StepPlanCell({
 
         {scenes.length > 0 && (
           <p className="text-[11px] text-warning mb-3">
-            ⚠ Auto-plan replaces all {scenes.length} existing scenes
+            ⚠ Generate replaces all {scenes.length} existing scenes
           </p>
         )}
 
-        <button
-          onClick={() => autoPlan.mutate()}
-          disabled={autoPlan.isPending}
-          className="w-full flex items-center justify-center gap-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-white text-sm font-medium py-2.5 rounded-lg transition-colors"
-        >
-          {autoPlan.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />}
-          {autoPlan.isPending ? "Generating plan… (can take 30–90s for long songs)" : scenes.length ? "Re-plan Scenes" : "Auto-Plan Scenes"}
-        </button>
-        {planError && (
-          <div className="mt-2 bg-red-900/20 border border-red-800/40 rounded-md px-2.5 py-2 text-[11px] text-red-300">
-            <span className="font-medium">Auto-plan failed: </span>{planError.length > 400 ? planError.slice(0, 400) + "…" : planError}
+        {/* BATCH GENERATOR — replaces (Re-plan + AI Expand all). One LLM
+            call per batch (default 3 scenes), runs sequentially, each batch
+            sees previous scenes for continuity. Short calls → no timeouts →
+            user sees scenes appear as they're created.
+
+            The full-song button on the LEFT generates everything. The "Just
+            scene 1" button on the RIGHT is for iterating cheaply on the seed
+            BEFORE committing to the full plan — it generates a single scene
+            so you can review and tweak. After scene 1 is approved and its
+            video rendered, use the chain icon (Link2) on the scene's row in
+            the Generate step to iteratively add scene 2, scene 3, etc. —
+            each chained from the previous one. No need to "add scene N+1"
+            from here. */}
+        <div className="flex gap-2">
+          <button
+            onClick={() => runGenerateLoop({ oneBatch: false, startFrom: 0 })}
+            disabled={genRunning}
+            className="flex-1 flex items-center justify-center gap-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-white text-sm font-medium py-2.5 rounded-lg transition-colors"
+          >
+            {genRunning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />}
+            {(() => {
+              if (!genRunning) {
+                return scenes.length ? "Re-generate Scenes" : "Generate Scenes";
+              }
+              if (genRetryAttempt > 0) {
+                return `Retrying after backend blip… (attempt ${genRetryAttempt + 1}/${TRANSIENT_RETRY_COUNT + 1})`;
+              }
+              if (genTotal == null) return "Starting…";
+              return `Generating ${genSoFar}/${genTotal} scenes…`;
+            })()}
+          </button>
+          <button
+            onClick={() => runGenerateLoop({ oneBatch: true, startFrom: 0 })}
+            disabled={genRunning}
+            className="shrink-0 flex items-center justify-center gap-1.5 bg-surface-3 hover:bg-surface-2 disabled:opacity-50 text-zinc-200 text-xs font-medium px-3 py-2.5 rounded-lg border border-white/10 transition-colors"
+            title={
+              "Generate ONLY scene #1 (one short LLM call) so you can iterate " +
+              "on the story seed and style before committing to the full plan. " +
+              "Wipes any existing scenes. After scene 1 is approved, use the " +
+              "chain icon on its row in the Generate step to add scenes 2, 3, …"
+            }
+          >
+            <Wand2 className="w-3.5 h-3.5" />
+            Just scene 1
+          </button>
+        </div>
+        {genRunning && (
+          <div className="mt-2">
+            <div className="h-1.5 bg-surface-3 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-accent transition-all"
+                style={{ width: `${genTotal ? (genSoFar / genTotal) * 100 : 5}%` }}
+              />
+            </div>
+            <div className="mt-1 flex items-center justify-between text-[10px] text-zinc-500">
+              <span>Batches of {BATCH_SIZE} · each batch carries previous scenes as continuity context</span>
+              <button
+                onClick={() => { genCancelRef.current = true; }}
+                className="text-zinc-400 hover:text-red-400"
+              >Stop after current batch</button>
+            </div>
+          </div>
+        )}
+        {genError && (
+          <div className="mt-2 bg-red-900/20 border border-red-800/40 rounded-md px-2.5 py-2 text-[11px] text-red-300 flex items-start justify-between gap-2">
+            <div>
+              <span className="font-medium">Generation failed at batch starting #{genSoFar + 1}: </span>
+              {genError.length > 400 ? genError.slice(0, 400) + "…" : genError}
+              <div className="text-[10px] text-red-300/70 mt-1">
+                {genSoFar > 0
+                  ? `${genSoFar} scenes were planned before the failure — click Re-generate to start fresh, or fix the issue and re-run to retry the failed batch.`
+                  : "No scenes were planned. Try again."}
+              </div>
+            </div>
+            <button
+              onClick={() => setGenError(null)}
+              className="text-red-400/60 hover:text-red-200 shrink-0"
+              title="Dismiss"
+            >✕</button>
+          </div>
+        )}
+        {planRecoveredMsg && (
+          <div className="mt-2 bg-emerald-900/20 border border-emerald-800/40 rounded-md px-2.5 py-2 text-[11px] text-emerald-300 flex items-start justify-between gap-2">
+            <span>{planRecoveredMsg}</span>
+            <button
+              onClick={() => setPlanRecoveredMsg(null)}
+              className="text-emerald-400/60 hover:text-emerald-200 shrink-0"
+              title="Dismiss"
+            >✕</button>
           </div>
         )}
 
         <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1">
           <ModelTag
-            label="Plan"
+            label="LLM"
             model={models?.llm?.[planOpts.plan_llm]?.name || planOpts.plan_llm}
-            hint="Reads lyrics + beats + sections and writes scene-by-scene plan"
-          />
-          <ModelTag
-            label="AI Expand"
-            model={models?.llm?.[planOpts.expand_llm]?.name || planOpts.expand_llm}
-            hint="Per-scene prompt expansion"
+            hint="Used for batch scene generation and per-scene re-expansion"
           />
         </div>
       </div>
@@ -196,23 +546,11 @@ export default function StepPlanCell({
               <DurationSum scenes={scenes} song={song} />
             </div>
             <div className="flex items-center gap-3 ml-auto">
-              <button
-                onClick={async () => {
-                  if (await confirm({
-                    title: "AI Expand all scenes",
-                    message: `Run AI Expand on all ${scenes.length} scenes? Estimated cost ~$${(0.005 * scenes.length).toFixed(2)}.`,
-                    confirmLabel: "Expand all",
-                  })) {
-                    expandAll.mutate();
-                  }
-                }}
-                disabled={expandAll.isPending}
-                className="text-[11px] text-accent hover:text-accent-hover flex items-center gap-1 disabled:opacity-50"
-                title="Re-write video/image prompts for every scene with full narrative context (previous + next scene + duration)"
-              >
-                {expandAll.isPending ? <Loader2 className="w-3 h-3 animate-spin" /> : <Wand2 className="w-3 h-3" />}
-                {expandAll.isPending ? "Expanding..." : "AI Expand all"}
-              </button>
+              {/* AI Expand all is no longer a separate step — the batch
+                  generator produces fully-expanded scenes inline. Keeping
+                  this stub commented out as breadcrumb in case we need
+                  per-scene re-expansion later (the /expand-prompts endpoint
+                  still works for individual scenes via the cog menu). */}
               <button
                 onClick={() =>
                   addScene.mutate({
@@ -227,11 +565,89 @@ export default function StepPlanCell({
               >
                 <Plus className="w-3 h-3" /> Add Scene
               </button>
+              <button
+                onClick={async () => {
+                  if (await confirm({
+                    title: `Delete all ${scenes.length} scenes?`,
+                    message:
+                      `This removes every scene from this project (and their image / video assets in the DB). The plan starts from scratch. ` +
+                      `Files on disk under storage/${project.id}/ are not touched — they're orphaned but cheap.`,
+                    confirmLabel: "Clear all scenes",
+                    destructive: true,
+                  })) {
+                    clearAll.mutate();
+                  }
+                }}
+                disabled={clearAll.isPending}
+                className="text-[11px] text-red-400 hover:text-red-300 flex items-center gap-1 disabled:opacity-50"
+                title="Delete every scene in this project — useful before a fresh Re-plan"
+              >
+                {clearAll.isPending ? <Loader2 className="w-3 h-3 animate-spin" /> : <Trash2 className="w-3 h-3" />}
+                {clearAll.isPending ? "Clearing…" : "Clear all"}
+              </button>
             </div>
           </div>
-          {expandAllError && (
-            <div className="bg-red-900/20 border border-red-800/40 rounded-md px-2.5 py-2 text-[11px] text-red-300">
-              <span className="font-medium">AI Expand all failed: </span>{expandAllError.length > 400 ? expandAllError.slice(0, 400) + "…" : expandAllError}
+          {expandVerifying && (
+            <div className="bg-yellow-900/20 border border-yellow-800/40 rounded-md px-2.5 py-2 text-[11px] text-yellow-200 flex items-start gap-2">
+              <Loader2 className="w-3 h-3 animate-spin shrink-0 mt-0.5" />
+              <span>
+                Connection to the server dropped, but AI Expand may still be running. Checking for results — this can take up to 30 seconds…
+              </span>
+            </div>
+          )}
+          {expandFinalError && (
+            <div className="bg-red-900/20 border border-red-800/40 rounded-md px-2.5 py-2 text-[11px] text-red-300 flex items-start justify-between gap-2">
+              <div>
+                <span className="font-medium">AI Expand all failed: </span>{expandFinalError.length > 400 ? expandFinalError.slice(0, 400) + "…" : expandFinalError}
+              </div>
+              <button
+                onClick={() => setExpandFinalError(null)}
+                className="text-red-400/60 hover:text-red-200 shrink-0"
+                title="Dismiss"
+              >✕</button>
+            </div>
+          )}
+          {expandRecoveredMsg && (
+            <div className="bg-emerald-900/20 border border-emerald-800/40 rounded-md px-2.5 py-2 text-[11px] text-emerald-300 flex items-start justify-between gap-2">
+              <span>{expandRecoveredMsg}</span>
+              <button
+                onClick={() => setExpandRecoveredMsg(null)}
+                className="text-emerald-400/60 hover:text-emerald-200 shrink-0"
+                title="Dismiss"
+              >✕</button>
+            </div>
+          )}
+          {expandFailures.length > 0 && (
+            <div className="bg-amber-900/20 border border-amber-800/40 rounded-md px-2.5 py-2 text-[11px] text-amber-300 flex items-start justify-between gap-2">
+              <div>
+                <div className="font-medium mb-1">
+                  {expandFailures.length} scene{expandFailures.length === 1 ? "" : "s"} couldn't be expanded:
+                </div>
+                <ul className="space-y-0.5 leading-snug">
+                  {expandFailures.map((f) => {
+                    const sc = scenes.find((s) => s.id === f.scene_id);
+                    return (
+                      <li key={f.scene_id}>
+                        <span className="font-medium">
+                          scene #{sc?.order ?? f.scene_id}
+                        </span>
+                        {sc?.description && (
+                          <span className="text-amber-200/60"> · {sc.description.slice(0, 60)}{sc.description.length > 60 ? "…" : ""}</span>
+                        )}
+                        <span className="text-amber-200/80"> — {f.reason}</span>
+                      </li>
+                    );
+                  })}
+                </ul>
+                <div className="text-[10px] text-amber-200/60 mt-1">
+                  Click <span className="font-medium">AI Expand all</span> again to retry just these scenes (toggle on <span className="font-medium">only_empty</span> — already the default — or re-run to retry everything).
+                </div>
+              </div>
+              <button
+                onClick={() => setExpandFailures([])}
+                className="text-amber-400/60 hover:text-amber-200 shrink-0"
+                title="Dismiss"
+              >✕</button>
             </div>
           )}
           <div className="space-y-1.5">
@@ -242,7 +658,8 @@ export default function StepPlanCell({
                 expanded={expandedScene === s.id}
                 onToggle={() => setExpandedScene(expandedScene === s.id ? null : s.id)}
                 onUpdate={refresh}
-                expandLlm={expandLlmId}
+                expandLlm={llmId}
+                isExpandingBatch={genRunning}
               />
             ))}
           </div>
@@ -253,13 +670,16 @@ export default function StepPlanCell({
 }
 
 function ScenePlanRow({
-  scene, expanded, onToggle, onUpdate, expandLlm,
+  scene, expanded, onToggle, onUpdate, expandLlm, isExpandingBatch,
 }: {
   scene: Scene;
   expanded: boolean;
   onToggle: () => void;
   onUpdate: () => void;
   expandLlm: string;
+  // True while AI Expand All is running for the project. Scenes that haven't
+  // yet flipped prompts_expanded=true are either queued or in flight.
+  isExpandingBatch: boolean;
 }) {
   const qc = useQueryClient();
   const [form, setForm] = useState({
@@ -302,6 +722,31 @@ function ScenePlanRow({
     onSuccess: onUpdate,
   });
 
+  // Confirmation for delete — reads the cached project to see if the next
+  // scene is chained from this one, so we can warn about the unlink.
+  const confirm = useConfirm();
+  const cachedProject = qc.getQueryData<any>(["project", scene.project_id]);
+  const nextScene: Scene | undefined = (cachedProject?.scenes || [])
+    .find((s: Scene) => s.order === scene.order + 1);
+  const nextChainedFromHere = !!nextScene?.chain_from_prev;
+  const onDeleteClick = async () => {
+    const msg = [
+      `Permanently remove scene #${scene.order} from this project.`,
+      "All its assets (images, videos) and prompt history will be deleted.",
+      nextChainedFromHere
+        ? `Scene #${nextScene?.order} is chained from here — its chain will be cleared (scene stays in place; you can re-chain or use its own first frame).`
+        : null,
+    ].filter(Boolean).join("\n");
+    if (await confirm({
+      title: `Delete scene #${scene.order}?`,
+      message: msg,
+      confirmLabel: "Delete scene",
+      destructive: true,
+    })) {
+      remove.mutate();
+    }
+  };
+
   return (
     <div className="bg-surface-2 rounded-lg overflow-hidden">
       <button
@@ -315,19 +760,16 @@ function ScenePlanRow({
         <span className="text-xs flex-1 truncate text-zinc-300">
           {scene.description || <span className="text-zinc-600 italic">No description</span>}
         </span>
-        {scene.prompts_expanded ? (
+        {/* AI / plan-only / expanding badge removed — the new batch generator
+            always produces fully-expanded scenes, so the distinction is moot.
+            Only surface the "expanding" indicator while a batch is mid-flight
+            for the not-yet-generated rows. */}
+        {!scene.prompts_expanded && isExpandingBatch && (
           <span
-            className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 shrink-0 flex items-center gap-0.5"
-            title="AI Expand has run on this scene — bridging-aware prompts ready"
+            className="text-[9px] px-1.5 py-0.5 rounded bg-accent/15 text-accent border border-accent/30 shrink-0 flex items-center gap-0.5"
+            title="Generation in progress — this scene is queued"
           >
-            <Wand2 className="w-2.5 h-2.5" /> AI
-          </span>
-        ) : (
-          <span
-            className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300/80 border border-amber-500/30 shrink-0"
-            title="Prompts came from Auto-Plan only. Click 'AI Expand all' for richer bridging-aware prompts."
-          >
-            plan-only
+            <Loader2 className="w-2.5 h-2.5 animate-spin" /> generating
           </span>
         )}
         <ChevronDown className={`w-3.5 h-3.5 text-zinc-500 transition-transform shrink-0 ${expanded ? "rotate-180" : ""}`} />
@@ -370,7 +812,7 @@ function ScenePlanRow({
           <textarea rows={2} value={form.description}
             placeholder="Scene description..."
             onChange={(e) => setForm({ ...form, description: e.target.value })}
-            className={inputCls + " resize-none"} />
+            className={inputCls + " resize-y"} />
 
           {/* Lyrics in this scene — auto-extracted from word timestamps and
               recomputed whenever the duration slider moves (after Save). */}
@@ -400,19 +842,25 @@ function ScenePlanRow({
               </div>
               <textarea rows={3} value={form.video_prompt}
                 onChange={(e) => setForm({ ...form, video_prompt: e.target.value })}
-                className={inputCls + " resize-none"} />
+                className={inputCls + " resize-y"} />
               <span className="text-[10px] text-zinc-500">Image prompt</span>
               <textarea rows={2} value={form.image_prompt}
                 onChange={(e) => setForm({ ...form, image_prompt: e.target.value })}
-                className={inputCls + " resize-none"} />
+                className={inputCls + " resize-y"} />
             </div>
           </details>
           <div className="flex gap-2 pt-1">
             <button
-              onClick={() => remove.mutate()}
-              className="text-[11px] text-zinc-600 hover:text-error transition-colors flex items-center gap-1 px-2"
+              onClick={onDeleteClick}
+              disabled={remove.isPending}
+              className="text-[11px] text-zinc-600 hover:text-error transition-colors flex items-center gap-1 px-2 disabled:opacity-50"
+              title={
+                nextChainedFromHere
+                  ? `Delete scene #${scene.order}. Also unlinks scene #${nextScene?.order} (its chain will clear).`
+                  : `Delete scene #${scene.order} (removes from the plan + all its assets + prompt history).`
+              }
             >
-              <Trash2 className="w-3 h-3" /> Delete
+              <Trash2 className="w-3 h-3" /> {remove.isPending ? "Deleting..." : "Delete"}
             </button>
             <div className="flex-1" />
             <button

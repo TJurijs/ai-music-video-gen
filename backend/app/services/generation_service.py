@@ -1,17 +1,22 @@
-"""Generation orchestrator: image → video → lipsync per scene.
+"""Generation orchestrator: image → video per scene.
 
-Video generation goes through OpenRouter (the 3 supported models all live
-there). Lipsync is a post-hoc step on fal since none of our video models
-accept audio input. Runs as a FastAPI BackgroundTask.
+Video generation goes through OpenRouter (all supported models live there).
+Runs as a FastAPI BackgroundTask.
+
+The pipeline is purely visual — lipsync / audio-sync features were tried
+(fal Seedance reference-to-video, fal OmniHuman) but produced poor results
+on music-vocal audio and were removed. The song's audio is muxed in
+verbatim at the assembly stage.
 """
 
 import json
 import os
+import re
 from datetime import datetime
 from sqlmodel import Session, select
-from app.config import settings, VIDEO_MODELS, LIPSYNC_MODELS
-from app.models import Scene, SceneAsset, GenerationJob, Project, Song, Character
-from app.services import openrouter, fal_client, pricing
+from app.config import settings, VIDEO_MODELS
+from app.models import Scene, SceneAsset, GenerationJob, Project, Character
+from app.services import openrouter, pricing
 from app.services.versioning import make_active
 
 
@@ -90,12 +95,19 @@ def _extract_last_frame(video_path: str, dest_path: str) -> bool:
     video gen takes scene N's actual last rendered frame (this JPG) as its
     `first_frame_path`, producing a pixel-perfect handoff at the seam.
 
-    Uses ffmpeg's `-sseof` to seek relative to the END of the file — far
-    cheaper than transcoding through the whole video.
+    Implementation: seek to a few seconds before EOF (cheap), then decode
+    every frame in that tail window with `-update 1` (no `-frames:v 1`).
+    `-update` overwrites the same output file on each decoded frame, so
+    the final file on disk is the genuine last frame of the video.
+
+    Historical bug (fixed 2026-05): we used `-sseof -0.5 ... -frames:v 1`,
+    which writes the FIRST frame inside the last 0.5s window — i.e. ~12
+    frames (at 24fps) before the real end. Scene N+1's chained first
+    frame visibly differed from the end of scene N's video.
 
     Returns True on success, False on failure (e.g. ffmpeg not installed,
-    video unreadable). Failure is non-fatal: chaining simply falls back to
-    the planned still on consumption.
+    video unreadable). Failure is non-fatal: chaining falls back to the
+    planned still on consumption.
     """
     import subprocess
     try:
@@ -103,10 +115,17 @@ def _extract_last_frame(video_path: str, dest_path: str) -> bool:
         proc = subprocess.run(
             [
                 "ffmpeg", "-y", "-v", "error",
-                "-sseof", "-0.5",         # seek to 0.5s before EOF
+                # Seek to 3s before EOF. Cheap (no full-video decode) and
+                # wide enough to cover any reasonable video framerate +
+                # GOP boundary so the decoder lands on a keyframe before
+                # the tail.
+                "-sseof", "-3",
                 "-i", video_path,
+                # Overwrite the output file on every decoded frame. After
+                # ffmpeg processes the entire tail window, the file on
+                # disk holds the *last* decoded frame. NO `-frames:v 1`
+                # here — that would stop at the first frame instead.
                 "-update", "1",
-                "-frames:v", "1",
                 "-q:v", "2",              # high JPEG quality
                 dest_path,
             ],
@@ -181,21 +200,20 @@ async def _run_pipeline(scene: Scene, db: Session, engine, phase: str = "all") -
         db.add(scene); db.commit()
         return
 
-    if phase == "lipsync":
-        # User-driven explicit lipsync. Requires an existing video.
-        if not scene.video_path or not os.path.exists(scene.video_path):
-            raise RuntimeError("Generate a video first before running lipsync.")
-        await _run_lipsync(scene, db)
-        scene.status = "done"
-        db.add(scene); db.commit()
-        return
-
-    # phases "video" and "all" both need a reference image first
-    if not scene.reference_image_path:
+    # phases "video" and "all" normally generate a reference image first —
+    # UNLESS the scene is chained from the previous, in which case the prev
+    # scene's extracted last frame replaces the planned still anyway when
+    # we submit to the video model. Generating a still here would be wasted
+    # work and waste an image-gen credit. Skip straight to video.
+    if not scene.reference_image_path and not scene.chain_from_prev:
         await _generate_image(scene, db)
         if _check_cancelled(engine, scene.id):
             raise asyncio.CancelledError()
 
+    # All video gen goes through OpenRouter. Pipeline is purely visual —
+    # audio-sync / lipsync features were explored (fal Seedance ref-to-video,
+    # fal OmniHuman) but didn't produce usable results on music audio, so
+    # they were removed.
     await _generate_video_openrouter(scene, db, model_cfg, engine=engine)
 
     scene.status = "done"
@@ -292,7 +310,19 @@ async def _generate_video_openrouter(scene: Scene, db: Session, model_cfg: dict,
 
     # Character refs: portraits whose name appears in the prompt go to
     # input_references so the model preserves identity through the clip.
-    char_refs = _find_character_references(scene, db, prompt)
+    # BUT only Seedance variants effectively use input_references on the
+    # OpenRouter route:
+    #   - Seedance: triggers R2V pathway, strong identity anchor (~70% weight)
+    #   - Kling: refs silently ignored by OpenRouter passthrough
+    #   - Veo: refs rejected when first_frame is also sent (we always send it)
+    # For Kling/Veo we send NO refs — saves bandwidth and avoids the bad
+    # signal that "we tried to pass them, they just didn't take." The model
+    # card's `supports_reference_images` flag drives both this decision and
+    # the UI badge.
+    if model_cfg.get("supports_reference_images"):
+        char_refs = _find_character_references(scene, db, prompt)
+    else:
+        char_refs = []
 
     # Resolve first_frame_path. Default: this scene's planned reference still.
     # Chained: previous scene's EXTRACTED LAST FRAME — its actual final
@@ -320,6 +350,16 @@ async def _generate_video_openrouter(scene: Scene, db: Session, model_cfg: dict,
             )
         first_frame_path = prev_scene.extracted_last_frame_path
 
+    # Native audio reference is a forward-compatible feature flag: the scene
+    # may carry `audio_sync_enabled=True`, but OpenRouter's video schema
+    # currently doesn't expose an audio-input field for any model — even
+    # Seedance, which supports it natively elsewhere. So we don't slice or
+    # send the audio. The user can hit lipsync today via the post-process
+    # path (`phase="lipsync"`) which routes to fal.ai. When/if a direct
+    # Replicate/Volcengine submitter is added, the audio slice + payload
+    # wiring should reactivate here.
+    audio_ref_path: str | None = None
+
     # generate_audio is always false now — the user's song is the audio track.
     cost, detail = pricing.video_cost(
         scene.video_model, duration, resolution, with_audio=False,
@@ -328,6 +368,8 @@ async def _generate_video_openrouter(scene: Scene, db: Session, model_cfg: dict,
         detail += f" + {len(char_refs)} char ref(s)"
     if scene.chain_from_prev:
         detail += " + chained"
+    if audio_ref_path:
+        detail += " + audio sync"
     job = _create_job(db, scene, "video", "openrouter", cost, detail)
     try:
         job_id = await openrouter.submit_video_job(
@@ -339,6 +381,7 @@ async def _generate_video_openrouter(scene: Scene, db: Session, model_cfg: dict,
             generate_audio=False,
             first_frame_path=first_frame_path,
             reference_image_paths=char_refs,
+            reference_audio_path=audio_ref_path,
         )
         scene.openrouter_job_id = job_id
         job.external_id = job_id
@@ -358,6 +401,7 @@ async def _generate_video_openrouter(scene: Scene, db: Session, model_cfg: dict,
             metadata={
                 "duration": duration, "resolution": resolution,
                 "aspect": aspect_ratio, "audio": scene.generate_audio,
+                "provider": "openrouter",
                 "char_refs": len(char_refs or []),
                 "chained_from": prev_scene.id if scene.chain_from_prev else None,
             },
@@ -408,96 +452,7 @@ def _append_style(prompt: str, db: Session, project_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Post-hoc lipsync (LatentSync on fal)
-# ---------------------------------------------------------------------------
-
-async def _run_lipsync(scene: Scene, db: Session) -> None:
-    if not settings.fal_api_key:
-        raise RuntimeError("FAL_API_KEY required for lipsync. Add it to .env.")
-
-    scene.status = "lipsync"
-    db.add(scene); db.commit()
-
-    lipsync_cfg = LIPSYNC_MODELS.get(scene.lipsync_model, LIPSYNC_MODELS["fal-latentsync"])
-    lipsync_model_id = lipsync_cfg["model_id"]
-
-    cost, detail = pricing.lipsync_cost(scene.lipsync_model)
-    job = _create_job(db, scene, "lipsync", "fal", cost, detail)
-    try:
-        if not scene.video_path or not os.path.exists(scene.video_path):
-            raise RuntimeError("No video found — generate a video first before lipsync.")
-        audio_path = await _extract_audio_segment(scene, db)
-        video_url = await fal_client.upload_file(scene.video_path)
-        audio_url = await fal_client.upload_file(audio_path)
-
-        request_id = await fal_client.submit(
-            lipsync_model_id,
-            {"video_url": video_url, "audio_url": audio_url},
-        )
-        result = await fal_client.poll(lipsync_model_id, request_id)
-        out_url = fal_client.extract_video_url(result)
-        if not out_url:
-            raise RuntimeError(f"{lipsync_cfg['name']} returned no URL: {str(result)[:300]}")
-
-        ts = int(datetime.utcnow().timestamp())
-        dest = _storage(scene.project_id, "lipsync", f"scene_{scene.id}_{ts}.mp4")
-        await openrouter.download_file(out_url, dest)
-
-        # Lipsync output is a NEW VIDEO VARIANT, not a separate concept.
-        # Save it as a `video` asset so it shows up alongside the source in
-        # the video chooser; the model label includes "+ LatentSync" so the
-        # user can see at a glance it's a post-processed variant.
-        prior_video = db.exec(
-            select(SceneAsset).where(
-                SceneAsset.scene_id == scene.id,
-                SceneAsset.asset_type == "video",
-                SceneAsset.is_active == True,  # noqa: E712
-            )
-        ).first()
-        source_label = prior_video.model_used if prior_video else scene.video_model
-        lipsync_label = LIPSYNC_MODELS.get(scene.lipsync_model, {}).get("name", scene.lipsync_model)
-        combined_label = f"{source_label} + {lipsync_label}"
-        _save_asset(
-            db, scene, "video", dest,
-            model_used=combined_label, cost_usd=cost, cost_detail=detail,
-            metadata={
-                "lipsynced": True,
-                "lipsync_model": scene.lipsync_model,
-                "source_video_asset_id": prior_video.id if prior_video else None,
-            },
-        )
-        job.status = "completed"
-        job.result_path = dest
-    except Exception as e:
-        job.status = "failed"; job.error = str(e); raise
-    finally:
-        job.completed_at = datetime.utcnow()
-        db.add(job); db.add(scene); db.commit()
-
-
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
-
-async def _extract_audio_segment(scene: Scene, db: Session) -> str:
-    """Extract scene's audio range from the song file via ffmpeg."""
-    import ffmpeg as ff
-
-    song = db.exec(select(Song).where(Song.project_id == scene.project_id)).first()
-    if not song or not song.file_path:
-        raise RuntimeError("No song file found for audio extraction")
-
-    dest = _storage(scene.project_id, "audio_segments", f"scene_{scene.id}.mp3")
-    duration = scene.audio_end - scene.audio_start
-    (
-        ff.input(song.file_path, ss=scene.audio_start, t=duration)
-        .output(dest, acodec="libmp3lame", q=2)
-        .overwrite_output()
-        .run(quiet=True)
-    )
-    return dest
-
-
 def _create_job(
     db: Session, scene: Scene, job_type: str, provider: str,
     cost_usd: float = 0.0, cost_detail: str | None = None,

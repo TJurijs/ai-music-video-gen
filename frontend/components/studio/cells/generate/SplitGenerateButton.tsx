@@ -71,7 +71,7 @@ export default function SplitGenerateButton({
         onClick={onClickMain}
         disabled={disabled}
         className={`text-xs pl-2.5 pr-1.5 py-1.5 border rounded-l-lg transition-colors disabled:opacity-50 flex items-center gap-1 ${colorClasses}`}
-        title={title + ` — uses ${currentModel}. Click ▾ to pick a different model for this run.`}
+        title={title + ` — uses ${currentModel}. Click ▾ to switch the model (selection saves; press this button to generate).`}
       >
         {running ? <Loader2 className="w-3 h-3 animate-spin" /> : icon}
         {label}
@@ -81,7 +81,7 @@ export default function SplitGenerateButton({
         onClick={(e) => { e.stopPropagation(); setOpen((o) => !o); }}
         disabled={disabled || options.length === 0}
         className={`text-xs px-1 py-1.5 border-l-0 border rounded-r-lg transition-colors disabled:opacity-50 flex items-center ${colorClasses}`}
-        title="Pick a model for this run (also sets this scene's default)"
+        title="Pick a model — saves to this scene without generating. Press the main button to generate with it."
       >
         <ChevronDown className={`w-2.5 h-2.5 transition-transform ${open ? "rotate-180" : ""}`} />
       </button>

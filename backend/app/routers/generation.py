@@ -54,7 +54,12 @@ async def trigger_scene_generation(
         raise HTTPException(404, "Scene not found")
     if req.phase not in ("image", "video", "lipsync", "all"):
         raise HTTPException(400, "phase must be one of: image, video, lipsync, all")
-    if scene.status == "done" and not req.force and req.phase != "image":
+    # Lipsync and image are both ADDITIVE on a done scene — lipsync runs on
+    # top of the rendered video (saves as a new video variant), image creates
+    # a new still variant. Neither overwrites the video itself, so neither
+    # needs `force`. Only video-phase regeneration on a done scene requires
+    # explicit force, because that DOES replace the previously-rendered clip.
+    if scene.status == "done" and not req.force and req.phase not in ("image", "lipsync"):
         raise HTTPException(400, "Scene already done. Use force=true to regenerate.")
     if scene.status in ("generating_image", "generating_video", "lipsync"):
         raise HTTPException(400, f"Scene is already being processed: {scene.status}")

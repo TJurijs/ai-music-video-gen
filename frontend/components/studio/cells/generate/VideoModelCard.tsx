@@ -1,5 +1,5 @@
 "use client";
-import { AlertCircle } from "lucide-react";
+import { AlertCircle, Mic2 } from "lucide-react";
 import { Badge } from "./SceneStatus";
 
 export default function VideoModelCard({
@@ -68,12 +68,18 @@ export default function VideoModelCard({
       <p className="text-[10px] text-zinc-500 mb-1.5">{model.tagline}</p>
       <div className="flex flex-wrap gap-1">
         <Badge tone={conflict ? "warn" : "default"}>{dRange}</Badge>
-        <Badge>{model.resolutions.join(" / ")}</Badge>
+        {/* Resolution badges per-option, with the scene's current selection
+            highlighted in accent so it's obvious what this card will render at. */}
+        {model.resolutions.map((r) => (
+          <Badge key={r} tone={r === resolution ? "accent" : "default"}>
+            {r}
+            {r === resolution ? " ✓" : ""}
+          </Badge>
+        ))}
         {model.supports_reference_images && <Badge tone="accent">refs</Badge>}
         {model.supports_first_frame && <Badge tone="accent">first frame</Badge>}
         {model.supports_last_frame && <Badge tone="accent">last frame</Badge>}
-        {model.generates_audio && <Badge>native audio</Badge>}
-        {!model.supports_audio_input && <Badge tone="warn">needs lipsync</Badge>}
+        {/* audio-sync badge removed — lipsync features retired */}
       </div>
     </button>
   );

@@ -147,7 +147,7 @@ export default function SceneEditor({ scene, project, onUpdate, onGenerate, onDe
         <div>
           <label className="text-xs text-zinc-500 block mb-1">Description</label>
           <textarea
-            className={`${inputCls} resize-none`} rows={2}
+            className={`${inputCls} resize-y`} rows={2}
             placeholder="Brief scene description..."
             value={form.description}
             onChange={(e) => setForm({ ...form, description: e.target.value })}
@@ -173,7 +173,7 @@ export default function SceneEditor({ scene, project, onUpdate, onGenerate, onDe
         >
           <div>
             <label className="text-xs text-zinc-500 mb-1 flex items-center gap-1"><Video className="w-3 h-3" /> Video Prompt</label>
-            <textarea className={`${inputCls} resize-none`} rows={4}
+            <textarea className={`${inputCls} resize-y`} rows={4}
               placeholder="Detailed prompt for video generation..."
               value={form.video_prompt}
               onChange={(e) => setForm({ ...form, video_prompt: e.target.value })}
@@ -181,7 +181,7 @@ export default function SceneEditor({ scene, project, onUpdate, onGenerate, onDe
           </div>
           <div>
             <label className="text-xs text-zinc-500 mb-1 flex items-center gap-1"><ImageIcon className="w-3 h-3" /> Image Prompt</label>
-            <textarea className={`${inputCls} resize-none`} rows={3}
+            <textarea className={`${inputCls} resize-y`} rows={3}
               placeholder="Reference still image prompt..."
               value={form.image_prompt}
               onChange={(e) => setForm({ ...form, image_prompt: e.target.value })}
@@ -221,12 +221,7 @@ export default function SceneEditor({ scene, project, onUpdate, onGenerate, onDe
               )}
             </select>
           </div>
-          <label className="flex items-center gap-2 text-xs mt-3 cursor-pointer">
-            <input type="checkbox" className="accent-accent" checked={form.lipsync_enabled}
-              onChange={(e) => setForm({ ...form, lipsync_enabled: e.target.checked })} />
-            <Mic2 className="w-3 h-3 text-zinc-400" />
-            <span className="text-zinc-400">Enable lipsync (fal.ai)</span>
-          </label>
+          {/* Lipsync checkbox removed — lipsync features retired. */}
         </Section>
       </div>
 

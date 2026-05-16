@@ -4,8 +4,10 @@ AI-generated music videos end-to-end: song → lyrics + beat analysis → scene
 plan → character cast → per-scene image + video → final assembly with audio.
 
 **Stack:** FastAPI + SQLModel + SQLite (backend), Next.js 14 + React Query +
-TypeScript + Tailwind (frontend). All AI calls routed through OpenRouter
-(video/image/LLM) plus optional fal.ai for lipsync.
+TypeScript + Tailwind (frontend). All video / image / LLM calls route
+through OpenRouter. fal.ai is optional, used only for word-level lyric
+timestamps when `FAL_API_KEY` is set; otherwise OpenRouter transcription
+is the fallback (no per-word timing).
 
 ---
 
@@ -33,7 +35,7 @@ cd musicvideo
 # 3. Configure your API key
 cp backend/.env.example backend/.env
 # Edit backend/.env: paste your OpenRouter key from https://openrouter.ai/keys
-# (FAL_API_KEY is optional, only needed for lipsync)
+# (FAL_API_KEY is optional — only needed for word-level lyric timestamps)
 
 # 4. Bootstrap — creates backend/.venv, installs Python + npm deps,
 #    opens both servers in two Terminal windows
@@ -110,25 +112,61 @@ First-run installs take 2–3 minutes; subsequent starts are instant.
 
 ---
 
-## What does it do
+## What it does
 
 1. **Create a project** with a name, visual style ("cyberpunk noir"), and aspect ratio.
 2. **Upload or generate a song.** Backend analyzes it: BPM, key, beat
-   timestamps, section boundaries, word-level lyric transcription, song
-   theme/narrative/mood.
-3. **Define characters** — either manually or via "AI Suggest" which proposes
-   a cast from the song's theme.
-4. **Auto-plan scenes** — LLM divides the song into N self-contained shots
-   aligned to beats / sections, with image + video prompts per scene,
-   referencing concrete lyric imagery.
+   timestamps, section boundaries, word-level lyric transcription (via
+   fal-whisper if `FAL_API_KEY` is set, OpenRouter otherwise), song
+   theme / narrative / mood.
+3. **Define characters** — manually or via "AI Suggest" (cast proposed
+   from the song's theme). Each character has a name, description, and
+   optionally a portrait used as a visual reference at video gen time.
+4. **Plan scenes** in two flows:
+   - **Generate Scenes** — full-song batch plan. LLM divides the song
+     into N self-contained shots aligned to beat / section windows, with
+     fully-expanded image + video prompts per scene.
+   - **Just scene 1** — single-scene plan. Useful for iterating on the
+     story seed and visual style cheaply before committing to a full plan.
 5. **Per-scene generation** — image first (cheap preview), then video
-   (img-to-video), then optional lipsync. Character portraits attach
-   automatically when a character's name appears in the prompt.
-6. **Assembly** — ffmpeg concatenates all scene clips, muxes the song, writes
-   a final MP4 with HTTP-range streaming support so the browser can scrub it.
-7. **Scene chaining** (opt-in) — for seamless scene-to-scene handoffs, enable
-   chain on a scene and its video starts on the previous scene's actual last
-   rendered frame instead of its own planned still.
+   (img-to-video). Character portraits attach automatically when a
+   character's name appears in the prompt AND the chosen video model
+   supports reference images (Seedance variants only; Kling / Veo drop
+   them on the OpenRouter route).
+6. **Chain scenes iteratively** — click the chain icon on scene N to add
+   scene N+1 with `chain_from_prev=true`. The new scene starts with empty
+   prompts; the wand icon then asks a vision-LLM to write its
+   `video_prompt` + description using scene N's actual rendered last
+   frame as visual context. Result: pixel-accurate handoff at the seam,
+   motion that picks up from exactly where the previous clip ended.
+7. **Assembly** — ffmpeg concatenates all scene clips in order, muxes
+   the song verbatim, and writes a streaming-friendly MP4
+   (`-movflags +faststart`).
+
+---
+
+## Iterative-build flow (recommended)
+
+This is the usable workflow once a story seed is set:
+
+1. **Plan step:** "Just scene 1" → backend plans one scene from the seed.
+2. **Generate step:** click "Img" on scene 1 to render the still, then
+   "Vid" to render the video. The backend extracts the genuine last
+   frame of the rendered clip automatically.
+3. **Same row, scene 1:** click the chain icon `🔗` → creates an empty
+   scene 2 chained from scene 1.
+4. **Scene 2 row:** click the wand icon `✨` → vision-LLM reads scene 1's
+   actual last frame and writes scene 2's `video_prompt` + description.
+   The prompt is anchored to the song's mood + the arc position
+   (opening / rising / climax / resolution) so each clip evolves rather
+   than feeling like "more of the same."
+5. **Scene 2 row:** click "Vid" → renders the video starting on scene 1's
+   last frame. No need to generate a still for chained scenes — the
+   chain frame replaces the planned still at submit time.
+6. Repeat from step 3 for scenes 3, 4, … until the song ends.
+
+Alternative: skip the iterative chain workflow and use "Generate Scenes"
+(full song, batches of 3 in one go).
 
 ---
 
@@ -145,18 +183,20 @@ First-run installs take 2–3 minutes; subsequent starts are instant.
 │   │   ├── routers/              # FastAPI route modules
 │   │   │   ├── projects.py
 │   │   │   ├── songs.py
-│   │   │   ├── scenes.py         # auto-plan, expand-all, scene CRUD + versions
-│   │   │   └── generation.py     # generate / batch / assemble / costs
+│   │   │   ├── scenes.py         # generate-batch, expand, scene CRUD, chain-next,
+│   │   │   │                     # continuation-prompt, version mgmt
+│   │   │   └── generation.py     # per-scene render dispatcher + assembly
 │   │   └── services/
-│   │       ├── openrouter.py     # Provider client (video, image, LLM)
-│   │       ├── fal_client.py     # fal.ai for lipsync
+│   │       ├── openrouter.py     # Provider client (video, image, LLM, transcription)
+│   │       ├── fal_client.py     # Thin wrapper for fal-ai/whisper (optional)
 │   │       ├── audio_analysis.py # librosa + transcription
-│   │       ├── scene_planner.py  # LLM prompts: auto-plan, expand, soften, characters
-│   │       ├── generation_service.py  # The per-scene pipeline (image→video→lipsync)
+│   │       ├── scene_planner.py  # LLM prompts: plan_scene_batch, expand,
+│   │       │                     # generate_continuation_prompts, soften, characters
+│   │       ├── generation_service.py  # Per-scene pipeline (image → video)
 │   │       ├── assembly.py       # ffmpeg concat + audio mux
 │   │       ├── pricing.py        # Cost calc per model / phase
 │   │       ├── llm_json.py       # Tolerant JSON parsing for LLM outputs
-│   │       ├── urls.py           # Convert on-disk paths → public URLs
+│   │       ├── urls.py           # On-disk paths → public URLs (with cache-bust opt)
 │   │       └── versioning.py     # Shared make_active / delete_and_promote
 │   ├── storage/                  # Generated content (gitignored, 100s of MB)
 │   ├── requirements.txt
@@ -170,23 +210,21 @@ First-run installs take 2–3 minutes; subsequent starts are instant.
 │   │   ├── ConfirmDialog.tsx     # In-app overlay replacing window.confirm()
 │   │   └── studio/
 │   │       ├── FlowStudio.tsx    # Main per-project workspace
-│   │       ├── SceneEditor.tsx
 │   │       ├── SongPanel.tsx
 │   │       ├── Lightbox.tsx
 │   │       └── cells/            # Workflow "steps" — one cell per stage
 │   │           ├── StepSongCell.tsx
 │   │           ├── StepCharactersCell.tsx
-│   │           ├── StepPlanCell.tsx
-│   │           ├── StepGenerateCell.tsx
+│   │           ├── StepPlanCell.tsx        # Generate Scenes / Just scene 1
+│   │           ├── StepGenerateCell.tsx    # Per-scene image / video rendering
 │   │           ├── StepAssembleCell.tsx
-│   │           └── generate/     # Subcomponents split out of StepGenerateCell
+│   │           └── generate/     # SceneGenRow, FrameSlot, tooltip, badges, ...
 │   ├── lib/
 │   │   ├── api.ts                # Typed fetch wrapper
 │   │   └── types.ts              # Shared Scene / Character / Project types
 │   ├── next.config.mjs           # Proxies /api → backend
 │   └── package.json
 ├── .gitignore
-├── .env                          # YOUR keys (gitignored — do not commit)
 ├── CLAUDE.md                     # ⭐ Agent instructions — READ THIS if you're an AI working here
 ├── README.md                     # this file
 ├── start.sh                      # macOS/Linux
@@ -201,13 +239,17 @@ First-run installs take 2–3 minutes; subsequent starts are instant.
 All settings live in `backend/app/config.py`. Env vars override defaults
 (read from `.env` at repo root or `backend/.env`).
 
-**Required env var:** `OPENROUTER_API_KEY`
-**Optional:** `FAL_API_KEY` (lipsync), `SUNO_API_KEY` (alternative music gen)
+**Required:** `OPENROUTER_API_KEY`
+**Optional:** `FAL_API_KEY` (word-level lyric timestamps via fal-ai/whisper;
+falls back to OpenRouter transcription without per-word timing if unset),
+`SUNO_API_KEY` (Suno music generation; Lyria 3 Pro via OpenRouter is the
+default music source).
 
 Default model selections live in `config.py`'s `VIDEO_MODELS`, `IMAGE_MODELS`,
-`LLM_MODELS`, `LIPSYNC_MODELS` dicts. Each entry has a key (used in `.env`
-defaults + the per-scene model picker), the OpenRouter `model_id`, pricing,
-supported durations / resolutions, and a `note` describing tradeoffs.
+`LLM_MODELS` dicts. Each entry has a key (used in the per-scene model
+picker), the OpenRouter `model_id`, pricing, supported durations /
+resolutions, a `supports_reference_images` flag (Seedance: yes; Kling /
+Veo: no on the OpenRouter route), and a `note` describing tradeoffs.
 
 ---
 
@@ -224,6 +266,23 @@ supported durations / resolutions, and a `note` describing tradeoffs.
 - **Backend port.** Defaults to `8010` to avoid colliding with anything on
   `8000`. If you change it, update the Next.js rewrites in
   `frontend/next.config.mjs` AND `PUBLIC_BASE_URL` in your `.env`.
+
+---
+
+## What's NOT in the pipeline (deliberately removed)
+
+- **Lipsync / audio-sync.** Tried fal Seedance reference-to-video with
+  audio and fal OmniHuman; neither produced acceptable results on music
+  vocals. Removed. The pipeline produces purely visual scenes; the song
+  is muxed in verbatim at assembly time.
+- **Frame chaining via the video model's `last_frame_path`.** Used to
+  pass scene N+1's planned still to the video model as a soft target;
+  the model rarely landed on it pixel-perfect and the seam showed.
+  Replaced with chain_from_prev: scene N+1's first_frame is scene N's
+  actual extracted last frame (pixel-accurate).
+- **Per-clip motion-offset trim in assembly.** A heuristic that
+  shortened clips to mask old chaining's slow-ramp artifact. Removed
+  along with the artifact.
 
 ---
 

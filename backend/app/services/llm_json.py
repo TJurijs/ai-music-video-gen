@@ -17,9 +17,11 @@ import json
 from typing import Literal, Type, Union
 
 
-def strip_fences_and_prose(raw: str) -> str:
+def strip_fences_and_prose(raw: str | None) -> str:
     """Trim markdown code fences and any leading/trailing prose around the
     first complete JSON value."""
+    if not raw:
+        return ""
     text = raw.strip()
     if text.startswith("```"):
         # Take the content between the first two ``` markers
@@ -60,6 +62,8 @@ def parse_llm_json(
         ValueError with a helpful message including a 300-char snippet of
         the raw response.
     """
+    if not raw:
+        raise ValueError(f"{context} returned empty/null response")
     text = strip_fences_and_prose(raw)
     try:
         parsed = json.loads(text)

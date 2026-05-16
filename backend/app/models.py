@@ -9,6 +9,10 @@ class Project(SQLModel, table=True):
     description: Optional[str] = None
     style: Optional[str] = None
     aspect_ratio: str = Field(default="16:9")
+    # Persisted narrative seed. Set by auto-plan (the user's textarea), reused
+    # by AI Expand so per-scene prompts respect the same story direction the
+    # original plan was anchored to. Survives refreshes / re-opens.
+    story_seed: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -88,6 +92,13 @@ class CharacterAsset(SQLModel, table=True):
     model_used: Optional[str] = None  # e.g. "gemini-3.1-flash-image" or "uploaded"
     cost_usd: float = Field(default=0.0)
     is_active: bool = Field(default=True, index=True)
+    # Snapshot of `Character.description` at the moment this portrait was
+    # generated/uploaded. Activating the asset also restores this onto the
+    # parent character — so a "Blindfolded" portrait variant carries a
+    # blindfold-aware description, switching back to a plain portrait restores
+    # the plain description, and every scene's image_prompt stays consistent
+    # with whichever portrait is currently active.
+    description: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
     character: Optional[Character] = Relationship(back_populates="portraits")
@@ -112,6 +123,11 @@ class Scene(SQLModel, table=True):
     generate_audio: bool = Field(default=False)  # let video model produce its own audio (we usually don't want this; we have the song)
     lipsync_enabled: bool = Field(default=False)
     lipsync_path: Optional[str] = None
+    # Native audio reference for video gen (Seedance 2.0 / Fast / 1.5). When
+    # True, the scene's audio window is sliced from the song and passed as
+    # `reference_audios` so the model lipsyncs the character to the singing.
+    # Silently no-ops when the chosen video_model doesn't support audio input.
+    audio_sync_enabled: bool = Field(default=False)
     align_to_beats: bool = Field(default=True)
     prompts_expanded: bool = Field(default=False)  # True once AI Expand has processed this scene's image+video prompts with neighbor context
 

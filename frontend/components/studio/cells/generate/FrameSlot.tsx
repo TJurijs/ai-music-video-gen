@@ -1,12 +1,13 @@
 "use client";
-import { Image as ImageIcon, Video, Mic2, Layers, FileText, Link2 } from "lucide-react";
+import { Image as ImageIcon, Video, Mic2, Layers, FileText, Link2, Trash2, Download, Upload } from "lucide-react";
 import { useState } from "react";
 import type { Scene, SceneAsset } from "@/lib/types";
+import { useConfirm } from "@/components/ConfirmDialog";
 import VariantGallery from "./VariantGallery";
 import PromptVersionGallery from "./PromptVersionGallery";
 
 export default function FrameSlot({
-  title, assetType, assets, activeUrl, modelLabel, isLipsynced, onOpenLightbox, onActivate, onDelete, modelLookup, actionButton,
+  title, assetType, assets, activeUrl, renderedWithLabel, renderedProvider, renderedResolution, nextModelLabel, nextProvider, nextResolution, isLipsynced, onOpenLightbox, onActivate, onDelete, onDownloadUrl, onDownloadLabel, onUpload, uploadLabel, uploading, modelLookup, actionButton,
   scene, onPromptActivate, onPromptDelete,
   chainedFromUrl, chainedFromOrder,
 }: {
@@ -14,11 +15,36 @@ export default function FrameSlot({
   assetType: "image" | "video";
   assets: SceneAsset[];
   activeUrl?: string | null;
-  modelLabel: string;
+  // Model that produced the asset currently on display. null when nothing is
+  // rendered yet — shown as "not generated yet".
+  renderedWithLabel: string | null;
+  // Provider that produced the displayed asset (e.g. "openrouter", "fal").
+  // Pulled from the asset's metadata_json. null when missing/unknown.
+  renderedProvider?: string | null;
+  // Resolution recorded on the displayed asset (e.g. "720p", "1080p").
+  // Pulled from the asset's metadata_json. null when missing.
+  renderedResolution?: string | null;
+  // Model currently selected for the NEXT generation. Always set. Used to
+  // tell the user what will run if they press the action button.
+  nextModelLabel: string;
+  // Provider the NEXT generation will route through (computed from current
+  // scene settings — e.g. "fal" when audio_sync_enabled on a Seedance 2.0
+  // family model, otherwise "openrouter").
+  nextProvider?: string | null;
+  // Resolution the NEXT generation will use (scene.resolution).
+  nextResolution?: string | null;
   isLipsynced?: boolean;
   onOpenLightbox: () => void;
   onActivate: (id: number) => void;
   onDelete: (id: number) => void;
+  // Optional download / upload hooks. When set, a small icon button appears
+  // on the slot title row. Used for: first-frame download (image slot),
+  // video upload to skip generation (video slot).
+  onDownloadUrl?: string | null;
+  onDownloadLabel?: string;
+  onUpload?: (file: File) => void;
+  uploadLabel?: string;
+  uploading?: boolean;
   modelLookup?: Record<string, any>;
   actionButton: React.ReactNode;
   scene: Scene;
@@ -33,7 +59,48 @@ export default function FrameSlot({
 }) {
   const [showGallery, setShowGallery] = useState(false);
   const [showPrompts, setShowPrompts] = useState(false);
+  const confirm = useConfirm();
   const variantCount = assets.length;
+  const activeAsset = assets.find((a) => a.is_active) ?? null;
+
+  // Small resolution chip — sits next to provider so render quality is
+  // visible at a glance. Highlighted accent when set, dimmed when unknown.
+  const renderResolutionChip = (res: string | null | undefined) => {
+    if (!res) return null;
+    return (
+      <span
+        className="ml-1 align-baseline text-[8px] uppercase tracking-wide px-1 py-[1px] rounded border bg-accent/15 text-accent border-accent/30"
+        title={`Resolution: ${res}`}
+      >
+        {res}
+      </span>
+    );
+  };
+
+  // Small provider chip — colored to make it obvious WHERE the request will
+  // hit (OpenRouter vs fal.ai). Cost shape and capabilities differ enough
+  // that the user wants to see this before pressing Generate.
+  const renderProviderChip = (provider: string | null | undefined) => {
+    if (!provider) return null;
+    const isFal = provider === "fal";
+    return (
+      <span
+        className={
+          "ml-1 align-baseline text-[8px] uppercase tracking-wide px-1 py-[1px] rounded border " +
+          (isFal
+            ? "bg-fuchsia-500/15 text-fuchsia-300 border-fuchsia-500/30"
+            : "bg-zinc-500/15 text-zinc-400 border-zinc-500/30")
+        }
+        title={
+          isFal
+            ? "Routes through fal.ai — required for native audio reference (Seedance 2.0 family with audio_sync on). ~6× the OpenRouter rate."
+            : "Routes through OpenRouter — the default. Cheaper, faster, but no native audio reference."
+        }
+      >
+        {provider}
+      </span>
+    );
+  };
   // Filter prompt versions for this slot's type ("image" or "video")
   const promptVersions = (scene.prompt_versions || []).filter((p) => p.prompt_type === assetType);
   const activePrompt = promptVersions.find((p) => p.is_active);
@@ -79,6 +146,54 @@ export default function FrameSlot({
             >
               <Layers className="w-2.5 h-2.5" />
               ×{variantCount}
+            </button>
+          )}
+          {onDownloadUrl && (
+            <a
+              href={onDownloadUrl}
+              download
+              className="text-zinc-500 hover:text-zinc-200 transition-colors"
+              title={onDownloadLabel || "Download"}
+            >
+              <Download className="w-2.5 h-2.5" />
+            </a>
+          )}
+          {onUpload && (
+            <label
+              className={`text-zinc-500 hover:text-zinc-200 transition-colors cursor-pointer ${uploading ? "opacity-50 pointer-events-none" : ""}`}
+              title={uploadLabel || "Upload a file as this variant"}
+            >
+              <input
+                type="file"
+                accept="video/mp4,video/quicktime,video/webm"
+                className="hidden"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) onUpload(f);
+                  e.target.value = "";  // reset so re-selecting the same file fires onChange again
+                }}
+              />
+              <Upload className="w-2.5 h-2.5" />
+            </label>
+          )}
+          {activeAsset && (
+            <button
+              onClick={async () => {
+                if (await confirm({
+                  title: `Delete this ${assetType}?`,
+                  message: variantCount > 1
+                    ? `Delete the active ${assetType}. The most recent remaining variant will become active.`
+                    : `Delete this ${assetType} — there are no other variants, so the slot will go back to "not generated".`,
+                  confirmLabel: "Delete",
+                  destructive: true,
+                })) {
+                  onDelete(activeAsset.id);
+                }
+              }}
+              className="text-zinc-500 hover:text-red-400 transition-colors"
+              title={`Delete the current ${assetType}`}
+            >
+              <Trash2 className="w-2.5 h-2.5" />
             </button>
           )}
         </div>
@@ -131,11 +246,59 @@ export default function FrameSlot({
           </span>
         )}
       </div>
-      <div className="text-[9px] text-zinc-500 truncate" title={modelLabel}>
-        {isImageSlotChainOverride
-          ? <span className="text-emerald-400/80 italic">last frame of scene #{chainedFromOrder ?? scene.order}</span>
-          : displayUrl ? modelLabel : <span className="italic">not generated</span>}
+      {/* Line 1: what generated the asset currently on screen (or chain note,
+          or empty-slot fallback). Reads as the PAST: "this is what you see". */}
+      <div
+        className="text-[9px] truncate"
+        title={renderedWithLabel ? `Rendered with ${renderedWithLabel}` : "No asset rendered yet"}
+      >
+        {isImageSlotChainOverride ? (
+          <span className="text-emerald-400/80 italic">
+            last frame of scene #{chainedFromOrder ?? scene.order}
+          </span>
+        ) : renderedWithLabel ? (
+          <>
+            <span className="text-zinc-600">rendered with </span>
+            <span className="text-zinc-300">{renderedWithLabel}</span>
+            {renderProviderChip(renderedProvider)}
+            {renderResolutionChip(renderedResolution)}
+          </>
+        ) : (
+          <span className="italic text-zinc-600">not generated yet</span>
+        )}
       </div>
+      {/* Line 2: model staged for the NEXT generation. Reads as the FUTURE:
+          "this is what will run if you press the button". Highlighted when it
+          differs from what produced the on-screen asset so a staged switch
+          is visually obvious. */}
+      {(() => {
+        const isChange =
+          !!renderedWithLabel && renderedWithLabel !== nextModelLabel;
+        return (
+          <div
+            className="text-[9px] truncate"
+            title={`Pressing the button below will generate using ${nextModelLabel}. Use the ▾ menu to switch.`}
+          >
+            <span className="text-zinc-600">{renderedWithLabel ? "next " : "will use "}</span>
+            <span
+              className={
+                isChange
+                  ? "text-fuchsia-300 font-medium"
+                  : "text-zinc-300"
+              }
+            >
+              {nextModelLabel}
+            </span>
+            {renderProviderChip(nextProvider)}
+            {renderResolutionChip(nextResolution)}
+            {isChange && (
+              <span className="ml-1 text-[8px] uppercase tracking-wide text-fuchsia-400/80">
+                · staged change
+              </span>
+            )}
+          </div>
+        );
+      })()}
       <div>
         {actionButton}
       </div>

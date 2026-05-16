@@ -16,6 +16,7 @@ async def lifespan(app: FastAPI):
     create_db_and_tables()
     os.makedirs(settings.storage_dir, exist_ok=True)
     _apply_schema_migrations()
+    _backfill_portrait_descriptions()
     _reset_zombie_scenes()
     yield
 
@@ -34,6 +35,13 @@ def _apply_schema_migrations():
         "scene": {
             "chain_from_prev": "BOOLEAN NOT NULL DEFAULT 0",
             "extracted_last_frame_path": "VARCHAR",
+            "audio_sync_enabled": "BOOLEAN NOT NULL DEFAULT 0",
+        },
+        "project": {
+            "story_seed": "VARCHAR",
+        },
+        "characterasset": {
+            "description": "VARCHAR",
         },
     }
     insp = inspect(_engine)
@@ -49,6 +57,36 @@ def _apply_schema_migrations():
                     added.append(f"{table}.{col_name}")
     if added:
         print(f"[startup] schema migration added: {', '.join(added)}")
+
+
+def _backfill_portrait_descriptions():
+    """One-time backfill: every existing portrait variant gets its parent
+    character's current description as a default. New variants snapshot the
+    description at the moment of creation; this just bootstraps the old ones
+    so the activate-restores-description behaviour works retroactively."""
+    from sqlmodel import Session
+    from app.database import engine as _engine
+    from app.models import Character, CharacterAsset
+    with Session(_engine) as db:
+        rows = db.exec(
+            __import__("sqlmodel").select(CharacterAsset).where(
+                CharacterAsset.description.is_(None)  # type: ignore[union-attr]
+            )
+        ).all()
+        if not rows:
+            return
+        char_by_id: dict[int, Character] = {}
+        for a in rows:
+            ch = char_by_id.get(a.character_id)
+            if ch is None:
+                ch = db.get(Character, a.character_id)
+                if ch is None:
+                    continue
+                char_by_id[a.character_id] = ch
+            a.description = ch.description
+            db.add(a)
+        db.commit()
+        print(f"[startup] backfilled description on {len(rows)} portrait variant(s)")
 
 
 def _reset_zombie_scenes():
@@ -263,10 +301,13 @@ async def health():
 
 @app.get("/api/models")
 async def list_models():
-    from app.config import VIDEO_MODELS, IMAGE_MODELS, LLM_MODELS, LIPSYNC_MODELS
+    from app.config import VIDEO_MODELS, IMAGE_MODELS, LLM_MODELS
+    # `lipsync` key kept in the response for frontend backward-compat (some
+    # cost-breakdown UI iterates by_type.lipsync). Empty dict signals "no
+    # configured lipsync models" without breaking iteration.
     return {
         "video": VIDEO_MODELS,
         "image": IMAGE_MODELS,
         "llm": LLM_MODELS,
-        "lipsync": LIPSYNC_MODELS,
+        "lipsync": {},
     }
