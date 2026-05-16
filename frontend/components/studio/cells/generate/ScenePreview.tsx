@@ -75,14 +75,12 @@ export default function ScenePreview({ scene, song, onClose }: { scene: Scene; s
           controls
           autoPlay
           loop
-          muted={!scene.generate_audio}
+          muted
         />
         {/* Hidden audio element overlays the song segment when toggled on */}
         {songUrl && songOn && <audio ref={audioRef} src={songUrl} preload="auto" />}
         <p className="text-[10px] text-zinc-500 px-3 py-2 border-t border-white/5">
-          Video has {scene.generate_audio ? "model-generated audio (sfx)" : "no embedded audio"}.
-          {scene.lipsync_enabled && " Lipsync to song was applied."}
-          {" Toggle song to A/B with your music."}
+          Video has no embedded audio. Toggle the song to preview it against this clip.
         </p>
       </div>
     </div>

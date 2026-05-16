@@ -103,7 +103,6 @@ export function StatusPill({ status }: { status: string }) {
     generating_image: { label: "Image", cls: "bg-blue-900/40 text-blue-300", icon: <Loader2 className="w-2.5 h-2.5 animate-spin" /> },
     image_ready: { label: "Still ready", cls: "bg-blue-900/40 text-blue-300", icon: <ImageIcon className="w-2.5 h-2.5" /> },
     generating_video: { label: "Video", cls: "bg-purple-900/40 text-purple-300", icon: <Loader2 className="w-2.5 h-2.5 animate-spin" /> },
-    lipsync: { label: "Lipsync", cls: "bg-indigo-900/40 text-indigo-300", icon: <Loader2 className="w-2.5 h-2.5 animate-spin" /> },
     done: { label: "Done", cls: "bg-green-900/40 text-green-400", icon: <Check className="w-2.5 h-2.5" /> },
     error: { label: "Error", cls: "bg-red-900/40 text-red-400", icon: <AlertCircle className="w-2.5 h-2.5" /> },
     cancelled: { label: "Cancelled", cls: "bg-zinc-700/50 text-zinc-300", icon: <Square className="w-2.5 h-2.5" /> },

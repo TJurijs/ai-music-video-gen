@@ -1,5 +1,5 @@
 "use client";
-import { Image as ImageIcon, Video, Mic2, Layers, FileText, Link2, Trash2, Download, Upload } from "lucide-react";
+import { Image as ImageIcon, Video, Layers, FileText, Link2, Trash2, Download, Upload } from "lucide-react";
 import { useState } from "react";
 import type { Scene, SceneAsset } from "@/lib/types";
 import { useConfirm } from "@/components/ConfirmDialog";
@@ -7,7 +7,7 @@ import VariantGallery from "./VariantGallery";
 import PromptVersionGallery from "./PromptVersionGallery";
 
 export default function FrameSlot({
-  title, assetType, assets, activeUrl, renderedWithLabel, renderedProvider, renderedResolution, nextModelLabel, nextProvider, nextResolution, isLipsynced, onOpenLightbox, onActivate, onDelete, onDownloadUrl, onDownloadLabel, onUpload, uploadLabel, uploading, modelLookup, actionButton,
+  title, assetType, assets, activeUrl, renderedWithLabel, renderedProvider, renderedResolution, nextModelLabel, nextProvider, nextResolution, onOpenLightbox, onActivate, onDelete, onDownloadUrl, onDownloadLabel, onUpload, uploadLabel, uploading, modelLookup, actionButton,
   scene, onPromptActivate, onPromptDelete,
   chainedFromUrl, chainedFromOrder,
 }: {
@@ -18,8 +18,9 @@ export default function FrameSlot({
   // Model that produced the asset currently on display. null when nothing is
   // rendered yet — shown as "not generated yet".
   renderedWithLabel: string | null;
-  // Provider that produced the displayed asset (e.g. "openrouter", "fal").
-  // Pulled from the asset's metadata_json. null when missing/unknown.
+  // Provider that produced the displayed asset (always "openrouter" for
+  // current renders). Pulled from the asset's metadata_json. null when
+  // missing on older entries.
   renderedProvider?: string | null;
   // Resolution recorded on the displayed asset (e.g. "720p", "1080p").
   // Pulled from the asset's metadata_json. null when missing.
@@ -27,13 +28,11 @@ export default function FrameSlot({
   // Model currently selected for the NEXT generation. Always set. Used to
   // tell the user what will run if they press the action button.
   nextModelLabel: string;
-  // Provider the NEXT generation will route through (computed from current
-  // scene settings — e.g. "fal" when audio_sync_enabled on a Seedance 2.0
-  // family model, otherwise "openrouter").
+  // Provider the NEXT generation will route through. Always "openrouter"
+  // in v1 — kept on the prop for forward compatibility.
   nextProvider?: string | null;
   // Resolution the NEXT generation will use (scene.resolution).
   nextResolution?: string | null;
-  isLipsynced?: boolean;
   onOpenLightbox: () => void;
   onActivate: (id: number) => void;
   onDelete: (id: number) => void;
@@ -77,25 +76,15 @@ export default function FrameSlot({
     );
   };
 
-  // Small provider chip — colored to make it obvious WHERE the request will
-  // hit (OpenRouter vs fal.ai). Cost shape and capabilities differ enough
-  // that the user wants to see this before pressing Generate.
+  // Small provider chip. v1 always routes through OpenRouter; the chip
+  // is kept so historical assets (with provider in their metadata) still
+  // render a label, but visually distinct providers don't exist any more.
   const renderProviderChip = (provider: string | null | undefined) => {
     if (!provider) return null;
-    const isFal = provider === "fal";
     return (
       <span
-        className={
-          "ml-1 align-baseline text-[8px] uppercase tracking-wide px-1 py-[1px] rounded border " +
-          (isFal
-            ? "bg-fuchsia-500/15 text-fuchsia-300 border-fuchsia-500/30"
-            : "bg-zinc-500/15 text-zinc-400 border-zinc-500/30")
-        }
-        title={
-          isFal
-            ? "Routes through fal.ai — required for native audio reference (Seedance 2.0 family with audio_sync on). ~6× the OpenRouter rate."
-            : "Routes through OpenRouter — the default. Cheaper, faster, but no native audio reference."
-        }
+        className="ml-1 align-baseline text-[8px] uppercase tracking-wide px-1 py-[1px] rounded border bg-zinc-500/15 text-zinc-400 border-zinc-500/30"
+        title="Routes through OpenRouter."
       >
         {provider}
       </span>
@@ -227,11 +216,6 @@ export default function FrameSlot({
           <div className="w-full h-full flex items-center justify-center text-zinc-700">
             {assetType === "image" ? <ImageIcon className="w-5 h-5" /> : <Video className="w-5 h-5" />}
           </div>
-        )}
-        {isLipsynced && displayUrl && (
-          <span className="absolute top-1 left-1 text-[8px] bg-indigo-500/80 text-white px-1 py-0.5 rounded font-medium flex items-center gap-0.5">
-            <Mic2 className="w-2 h-2" /> sync
-          </span>
         )}
         {isChained && (
           <span

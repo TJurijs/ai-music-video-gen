@@ -201,7 +201,6 @@ async def _bytes_from_url(url: str) -> bytes:
 #   - prompt, model               (required)
 #   - duration                    (must be in model.supported_durations)
 #   - aspect_ratio, resolution
-#   - generate_audio              (model decides default; we override per-scene)
 #   - frame_images[{frame_type, image}]   (first/last frame anchors)
 #   - input_references[{...image_url}]    (character/style ref images)
 # ---------------------------------------------------------------------------
@@ -261,11 +260,9 @@ async def submit_video_job(
     duration: int = 8,
     aspect_ratio: str = "16:9",
     resolution: str = "720p",
-    generate_audio: bool = False,
     first_frame_path: Optional[str] = None,
     last_frame_path: Optional[str] = None,
     reference_image_paths: Optional[list[str]] = None,
-    reference_audio_path: Optional[str] = None,
 ) -> str:
     """Submit a video generation job. Returns the job ID for polling.
 
@@ -276,6 +273,11 @@ async def submit_video_job(
     user (the clip appears, but doesn't start on the expected pixel). The
     user picks the recovery path explicitly: switch to a permissive model
     (Kling / Veo) or activate a less-recognizable portrait variant.
+
+    Note on audio: we never set `generate_audio` — the song's audio is
+    muxed verbatim at assembly time, so model-generated audio would just
+    get overwritten. The OpenRouter payload omits the field entirely (the
+    model decides its default, which is "off" for all video models we use).
     """
     payload: dict = {
         "model": model_id,
@@ -283,7 +285,6 @@ async def submit_video_job(
         "duration": duration,
         "aspect_ratio": aspect_ratio,
         "resolution": resolution,
-        "generate_audio": generate_audio,
     }
 
     # Veo accepts a personGeneration passthrough that controls its real-person
@@ -332,16 +333,6 @@ async def submit_video_job(
         f"input_references={len(refs)} ref(s) "
         f"prompt[:120]={prompt[:120]!r}"
     )
-
-    # NOTE: OpenRouter's /api/v1/videos schema does NOT currently expose any
-    # audio-reference field. ByteDance's Seedance 2.0 supports `reference_audios`
-    # natively, but that path is only reachable via Replicate or Volcengine —
-    # OpenRouter silently drops unknown top-level keys. So we deliberately do
-    # not include a `reference_audios` field here, even when the scene's
-    # audio_sync_enabled toggle is on; doing so would just inflate the request
-    # body with a base64-encoded MP3 that the API ignores. The toggle exists
-    # as a forward-compatible scene flag for the day the user wires up a
-    # direct Replicate path or OpenRouter adds the field.
 
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(

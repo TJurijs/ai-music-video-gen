@@ -35,7 +35,6 @@ def _apply_schema_migrations():
         "scene": {
             "chain_from_prev": "BOOLEAN NOT NULL DEFAULT 0",
             "extracted_last_frame_path": "VARCHAR",
-            "audio_sync_enabled": "BOOLEAN NOT NULL DEFAULT 0",
         },
         "project": {
             "story_seed": "VARCHAR",
@@ -94,8 +93,8 @@ def _reset_zombie_scenes():
 
     Two failure modes get fixed:
 
-    1) STUCK MID-FLIGHT — status in generating_image/generating_video/lipsync
-       but the BackgroundTask that owned the row is gone (backend crashed or
+    1) STUCK MID-FLIGHT — status in generating_image/generating_video but
+       the BackgroundTask that owned the row is gone (backend crashed or
        reloaded). These rows would otherwise sit forever. Reset to a
        recoverable state and surface a message so the user knows to retry.
 
@@ -110,7 +109,7 @@ def _reset_zombie_scenes():
     from app.database import engine as _engine
     from app.models import Scene
 
-    transient = {"generating_image", "generating_video", "lipsync"}
+    transient = {"generating_image", "generating_video"}
     with Session(_engine) as db:
         # (1) Reset mid-flight zombies.
         stuck = db.exec(
@@ -302,12 +301,8 @@ async def health():
 @app.get("/api/models")
 async def list_models():
     from app.config import VIDEO_MODELS, IMAGE_MODELS, LLM_MODELS
-    # `lipsync` key kept in the response for frontend backward-compat (some
-    # cost-breakdown UI iterates by_type.lipsync). Empty dict signals "no
-    # configured lipsync models" without breaking iteration.
     return {
         "video": VIDEO_MODELS,
         "image": IMAGE_MODELS,
         "llm": LLM_MODELS,
-        "lipsync": {},
     }

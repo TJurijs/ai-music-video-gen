@@ -162,14 +162,6 @@ export const api = {
     delete: (id: number) => request<void>(`/scenes/${id}`, { method: "DELETE" }),
     deleteAll: (projectId: number) =>
       request<{ deleted: number }>(`/scenes?project_id=${projectId}`, { method: "DELETE" }),
-    autoPlan: (data: {
-      project_id: number;
-      song_id: number;
-      target_scene_duration?: number;
-      replace_existing?: boolean;
-      llm_model?: string;
-      story_seed?: string;
-    }) => request<Scene[]>("/scenes/auto-plan", { method: "POST", body: JSON.stringify(data) }),
     expandPrompts: (id: number, llm_model?: string) =>
       request<Scene>(`/scenes/${id}/expand-prompts`, {
         method: "POST",
@@ -193,19 +185,6 @@ export const api = {
     // scene's full data so callers can navigate to it / focus its row.
     chainToNext: (sceneId: number) =>
       request<Scene>(`/scenes/${sceneId}/chain-next`, { method: "POST" }),
-    expandAll: (data: { project_id: number; llm_model?: string; only_empty?: boolean }) =>
-      request<{
-        expanded: number;
-        skipped: number;
-        total_cost_usd: number;
-        // Per-scene failures — present on every response, may be empty.
-        // Each entry: { scene_id, reason }. Surfaced in the Plan cell so
-        // the user can see WHY a scene didn't expand instead of just a count.
-        failed?: { scene_id: number; reason: string }[];
-      }>(
-        "/scenes/expand-all",
-        { method: "POST", body: JSON.stringify(data) },
-      ),
     generateBatch: (data: {
       project_id: number;
       song_id: number;
@@ -273,7 +252,7 @@ export const api = {
   // Generation
   // ---------------------------------------------------------------------------
   generation: {
-    generateScene: (sceneId: number, force = false, phase: "image" | "video" | "lipsync" | "all" = "all") =>
+    generateScene: (sceneId: number, force = false, phase: "image" | "video" | "all" = "all") =>
       request<{ message: string; scene_id: number; phase: string }>("/generation/scene", {
         method: "POST",
         body: JSON.stringify({ scene_id: sceneId, force, phase }),

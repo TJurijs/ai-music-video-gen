@@ -153,36 +153,3 @@ async def poll(submission: dict, timeout: int = 900, interval: int = 8) -> dict:
     raise TimeoutError(f"fal job {request_id} timed out after {timeout}s")
 
 
-# ---------------------------------------------------------------------------
-# Seedance 2.0 reference-to-video (audio + image refs → video)
-# ---------------------------------------------------------------------------
-#
-# fal exposes ByteDance's full multimodal Seedance 2.0 here. Unlike OpenRouter's
-# `bytedance/seedance-2.0` (image-and-frame-only), this endpoint accepts up to
-# 3 `audio_urls` for native phoneme-level lipsync alongside up to 9 reference
-# images and an optional first frame. Audio + image must be public URLs, so
-# we upload them via `upload_file` first.
-#
-# Endpoint model IDs:
-#   standard: fal-ai/bytedance/seedance-2.0/reference-to-video
-#   fast:     fal-ai/bytedance/seedance-2.0/fast/reference-to-video
-#
-# Pricing (as of catalog snapshot — verify on fal.ai before high-volume use):
-#   standard ~$0.30/s at 720p
-#   fast     ~$0.15/s at 720p
-# Both more expensive than OpenRouter Seedance ($0.05/s @ 720p) — that's the
-# tradeoff for the native audio path. Use the per-scene `audio_sync_enabled`
-# toggle so the user opts in only when lipsync matters.
-
-# ---------------------------------------------------------------------------
-# OmniHuman 1.5 — audio-driven character animation
-# ---------------------------------------------------------------------------
-#
-# Purpose-built for "image of a person + audio → video where that person
-# performs the audio with frame-accurate lipsync." Designed for singing
-# specifically (handles sustained vowels, high-pitched performances). Single
-# image, single audio. No multi-character refs, no separate first_frame.
-#
-# Pricing: $0.16/s at any resolution. ~½ the cost of Seedance ref-to-video.
-# Audio cap: 30s @ 1080p, 60s @ 720p.
-

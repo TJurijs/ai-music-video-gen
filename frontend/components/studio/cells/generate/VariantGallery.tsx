@@ -1,5 +1,5 @@
 "use client";
-import { Mic2, X } from "lucide-react";
+import { X } from "lucide-react";
 import { useConfirm } from "@/components/ConfirmDialog";
 import type { SceneAsset } from "@/lib/types";
 
@@ -32,11 +32,9 @@ export default function VariantGallery({
         </p>
         <div className="grid grid-cols-3 gap-3">
           {assets.map((a) => {
-            let isLipsynced = false;
-            try { isLipsynced = !!(a.metadata_json && JSON.parse(a.metadata_json).lipsynced); } catch {}
-            const cleanLabel = a.model_used?.includes(" + ")
-              ? a.model_used
-              : (modelLookup?.[a.model_used || ""]?.name?.replace(/\s*\(.*\)/, "") || a.model_used || "—");
+            const cleanLabel = modelLookup?.[a.model_used || ""]?.name?.replace(/\s*\(.*\)/, "")
+              || a.model_used
+              || "—";
             return (
               <div
                 key={a.id}
@@ -44,7 +42,7 @@ export default function VariantGallery({
                   a.is_active ? "border-accent" : "border-white/10 hover:border-white/30"
                 }`}
                 onClick={() => onActivate(a.id)}
-                title={`${a.model_used} · $${a.cost_usd?.toFixed(3) || 0} · ${new Date(a.created_at).toLocaleString()}${isLipsynced ? "\n(Lipsynced variant)" : ""}`}
+                title={`${a.model_used} · $${a.cost_usd?.toFixed(3) || 0} · ${new Date(a.created_at).toLocaleString()}`}
               >
                 {assetType === "image" ? (
                   <img src={a.url} className="w-full aspect-video object-cover" alt="" />
@@ -55,12 +53,9 @@ export default function VariantGallery({
                 )}
                 <span
                   className={`absolute top-1 left-1 text-[9px] px-1.5 py-0.5 rounded font-medium ${
-                    assetType === "image" ? "bg-blue-500/80 text-white" :
-                    isLipsynced ? "bg-indigo-500/80 text-white" :
-                    "bg-accent/80 text-white"
+                    assetType === "image" ? "bg-blue-500/80 text-white" : "bg-accent/80 text-white"
                   }`}
                 >
-                  {isLipsynced && <Mic2 className="inline w-2 h-2 mr-0.5" />}
                   {cleanLabel}
                 </span>
                 {a.is_active && (

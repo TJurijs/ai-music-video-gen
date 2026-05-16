@@ -38,10 +38,12 @@ settings = Settings()
 
 
 # ---------------------------------------------------------------------------
-# Video models — three real OpenRouter video models spanning price tiers.
+# Video models — OpenRouter video models spanning price tiers.
 # IDs verified against GET /api/v1/videos/models on 2026-05-09.
-# Pricing comes from OpenRouter's pricing_skus and depends on resolution +
-# whether `generate_audio` is on; see pricing.video_cost().
+# Pricing comes from OpenRouter's pricing_skus and depends on resolution.
+# We never set `generate_audio` (the song's audio is muxed verbatim at
+# assembly), so the `with_audio=False` branch of pricing.video_cost()
+# is always used.
 # ---------------------------------------------------------------------------
 VIDEO_MODELS = {
     "seedance-1.5-pro": {
@@ -55,8 +57,6 @@ VIDEO_MODELS = {
         "supports_first_frame": True,
         "supports_last_frame": True,
         "supports_reference_images": True,
-        "supports_audio_input": False,
-        "generates_audio": True,
         # Token-priced at $0.0000012 (no audio) / $0.0000024 (with audio) per token.
         # Approximate per-second rates assuming ~24fps and typical token density.
         "pricing": {
@@ -82,8 +82,6 @@ VIDEO_MODELS = {
         # planned still or chained last frame), so refs get silently
         # dropped. Identity must come from `first_frame` alone.
         "supports_reference_images": False,
-        "supports_audio_input": False,
-        "generates_audio": True,
         # Resolution × audio price matrix ($/s)
         "pricing": {
             "720p":  {"with_audio": 0.05, "without_audio": 0.03},
@@ -103,8 +101,6 @@ VIDEO_MODELS = {
         "supports_first_frame": True,
         "supports_last_frame": True,
         "supports_reference_images": True,
-        "supports_audio_input": False,
-        "generates_audio": True,
         # Token-priced; approximate per-second rates based on typical 24fps render.
         # (OpenRouter charges $0.000007 per video token; tokens scale with res×duration.)
         "pricing": {
@@ -119,15 +115,13 @@ VIDEO_MODELS = {
         "name": "Seedance 2.0 Fast",
         "model_id": "bytedance/seedance-2.0-fast",
         "tier": "cheap",
-        "tagline": "Same lipsync, half the price — for drafting",
+        "tagline": "Same look as Seedance 2.0, half the price — for drafting",
         "durations": list(range(4, 11)),  # 4 through 10
         "resolutions": ["480p", "720p"],
         "aspects": ["1:1", "3:4", "9:16", "4:3", "16:9", "21:9", "9:21"],
         "supports_first_frame": True,
         "supports_last_frame": True,
         "supports_reference_images": True,
-        "supports_audio_input": False,
-        "generates_audio": True,
         "pricing": {
             "480p": {"with_audio": 0.012, "without_audio": 0.012},
             "720p": {"with_audio": 0.025, "without_audio": 0.025},
@@ -151,8 +145,6 @@ VIDEO_MODELS = {
         # ENTIRELY from `first_frame`. If face isn't visible there, Kling
         # improvises.
         "supports_reference_images": False,
-        "supports_audio_input": False,
-        "generates_audio": True,
         "pricing": {
             "720p": {"with_audio": 0.168, "without_audio": 0.112},
         },
@@ -173,8 +165,6 @@ VIDEO_MODELS = {
         # `input_references`. We always send first_frame so refs get
         # dropped on this route. Identity = first_frame alone.
         "supports_reference_images": False,
-        "supports_audio_input": False,
-        "generates_audio": True,
         "pricing": {
             "720p":  {"with_audio": 0.40, "without_audio": 0.20},
             "1080p": {"with_audio": 0.40, "without_audio": 0.20},
@@ -196,8 +186,6 @@ VIDEO_MODELS = {
         # Same as Kling Pro: OpenRouter doesn't forward `input_references`
         # to the Kling API. Identity comes from `first_frame` only.
         "supports_reference_images": False,
-        "supports_audio_input": False,
-        "generates_audio": False,
         # Standard is roughly 2/3 the price of Pro for comparable behaviour.
         "pricing": {
             "720p": {"with_audio": 0.075, "without_audio": 0.075},

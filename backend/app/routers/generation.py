@@ -36,7 +36,7 @@ async def cancel_scene_generation(scene_id: int, db: Session = Depends(get_sessi
     scene = db.get(Scene, scene_id)
     if not scene:
         raise HTTPException(404, "Scene not found")
-    if scene.status not in ("pending", "generating_image", "generating_video", "lipsync"):
+    if scene.status not in ("pending", "generating_image", "generating_video"):
         return {"message": f"Scene not running (status={scene.status}); nothing to cancel.", "scene_id": scene_id}
     scene.cancel_requested = True
     db.add(scene); db.commit()
@@ -52,16 +52,14 @@ async def trigger_scene_generation(
     scene = db.get(Scene, req.scene_id)
     if not scene:
         raise HTTPException(404, "Scene not found")
-    if req.phase not in ("image", "video", "lipsync", "all"):
-        raise HTTPException(400, "phase must be one of: image, video, lipsync, all")
-    # Lipsync and image are both ADDITIVE on a done scene — lipsync runs on
-    # top of the rendered video (saves as a new video variant), image creates
-    # a new still variant. Neither overwrites the video itself, so neither
-    # needs `force`. Only video-phase regeneration on a done scene requires
-    # explicit force, because that DOES replace the previously-rendered clip.
-    if scene.status == "done" and not req.force and req.phase not in ("image", "lipsync"):
+    if req.phase not in ("image", "video", "all"):
+        raise HTTPException(400, "phase must be one of: image, video, all")
+    # Image gen is ADDITIVE on a done scene — it creates a new still variant
+    # without overwriting the video. Only video-phase regeneration on a done
+    # scene requires explicit force, because that replaces the rendered clip.
+    if scene.status == "done" and not req.force and req.phase != "image":
         raise HTTPException(400, "Scene already done. Use force=true to regenerate.")
-    if scene.status in ("generating_image", "generating_video", "lipsync"):
+    if scene.status in ("generating_image", "generating_video"):
         raise HTTPException(400, f"Scene is already being processed: {scene.status}")
 
     scene.status = "pending"
@@ -95,7 +93,7 @@ async def trigger_batch_generation(
 
     queued = []
     for scene in scenes:
-        if scene.status in ("generating_image", "generating_video", "lipsync"):
+        if scene.status in ("generating_image", "generating_video"):
             continue
         scene.status = "pending"
         scene.error_message = None

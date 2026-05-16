@@ -1,7 +1,7 @@
 """Generic helpers for the 'one active version among many' lifecycle.
 
 Several kinds of versioned rows in this app share an identical pattern:
-- `SceneAsset` (image / video / lipsync variants per scene)
+- `SceneAsset` (image / video variants per scene)
 - `ScenePromptVersion` (image-prompt / video-prompt versions per scene)
 - `CharacterAsset` (portrait variants per character)
 

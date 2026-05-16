@@ -43,7 +43,7 @@ export default function StepGenerateCell({
 
   // Global default model setter — patches every scene at once
   const setGlobalModel = useMutation({
-    mutationFn: async (data: { image_model?: string; video_model?: string; lipsync_model?: string; resolution?: string }) => {
+    mutationFn: async (data: { image_model?: string; video_model?: string; resolution?: string }) => {
       await Promise.all(scenes.map((s) => api.scenes.update(s.id, data)));
     },
     onSuccess: refresh,
@@ -59,7 +59,7 @@ export default function StepGenerateCell({
   const errored = scenes.filter((s) => s.status === "error").length;
   const cancelled = scenes.filter((s) => s.status === "cancelled").length;
   const inProgress = scenes.filter((s) =>
-    ["generating_image", "generating_video", "lipsync"].includes(s.status)
+    ["generating_image", "generating_video"].includes(s.status)
   ).length;
   const noImage = scenes.filter((s) => !s.reference_image_url).length;
 
@@ -116,7 +116,6 @@ export default function StepGenerateCell({
               }}
               disabled={setGlobalModel.isPending}
             />
-            {/* Lipsync default-model picker removed — lipsync features retired. */}
             {/* Resolution picker — options derive from the currently-selected
                 video model. Mass-applies to every scene. */}
             {(() => {
@@ -228,7 +227,6 @@ export default function StepGenerateCell({
               ["Scene plan", (costs.by_type.llm_plan || 0) + (costs.by_type.llm_expand || 0)],
               ["Reference images", costs.by_type.image],
               ["Video clips", costs.by_type.video],
-              ["Lipsync", costs.by_type.lipsync],
             ].filter(([, v]) => v && (v as number) > 0).map(([label, value]) => (
               <div key={label as string} className="flex justify-between text-zinc-400">
                 <span>{label}</span>

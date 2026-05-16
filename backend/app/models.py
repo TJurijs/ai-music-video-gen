@@ -118,18 +118,9 @@ class Scene(SQLModel, table=True):
     video_path: Optional[str] = None
     video_model: str = Field(default="kling-v3.0-pro")
     image_model: str = Field(default="gemini-3.1-flash-image")
-    lipsync_model: str = Field(default="fal-latentsync")
     resolution: str = Field(default="720p")  # 720p / 1080p / 4K — must be supported by chosen video_model
-    generate_audio: bool = Field(default=False)  # let video model produce its own audio (we usually don't want this; we have the song)
-    lipsync_enabled: bool = Field(default=False)
-    lipsync_path: Optional[str] = None
-    # Native audio reference for video gen (Seedance 2.0 / Fast / 1.5). When
-    # True, the scene's audio window is sliced from the song and passed as
-    # `reference_audios` so the model lipsyncs the character to the singing.
-    # Silently no-ops when the chosen video_model doesn't support audio input.
-    audio_sync_enabled: bool = Field(default=False)
     align_to_beats: bool = Field(default=True)
-    prompts_expanded: bool = Field(default=False)  # True once AI Expand has processed this scene's image+video prompts with neighbor context
+    prompts_expanded: bool = Field(default=False)  # True once a prompt has been generated (planner or wand)
 
     # Scene chaining (opt-in, off by default).
     # When `chain_from_prev` is True, this scene's video generation uses the
@@ -143,7 +134,7 @@ class Scene(SQLModel, table=True):
     # to the JPG we extracted from the rendered video's final frame. Used
     # by the NEXT scene's video gen when its chain_from_prev is True.
     extracted_last_frame_path: Optional[str] = None
-    # status: "pending" | "generating_image" | "image_ready" | "generating_video" | "lipsync" | "done" | "error" | "cancelled"
+    # status: "pending" | "generating_image" | "image_ready" | "generating_video" | "done" | "error" | "cancelled"
     status: str = Field(default="pending")
     error_message: Optional[str] = None
     openrouter_job_id: Optional[str] = None
@@ -162,7 +153,7 @@ class Scene(SQLModel, table=True):
 
 
 class SceneAsset(SQLModel, table=True):
-    """One generated asset (image / video / lipsync output) for a scene.
+    """One generated asset (image or video) for a scene.
 
     Multiple assets per scene can exist; one per asset_type carries
     is_active=True and is what the next pipeline step consumes. Files on
@@ -170,7 +161,7 @@ class SceneAsset(SQLModel, table=True):
     """
     id: Optional[int] = Field(default=None, primary_key=True)
     scene_id: int = Field(foreign_key="scene.id", index=True)
-    asset_type: str  # "image" | "video" | "lipsync"
+    asset_type: str  # "image" | "video"
     file_path: str
     model_used: Optional[str] = None
     cost_usd: float = Field(default=0.0)
@@ -206,9 +197,10 @@ class GenerationJob(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     project_id: int = Field(foreign_key="project.id")
     scene_id: Optional[int] = None
-    # job_type: "image" | "video" | "lipsync" | "music" | "transcription"
+    # job_type: "image" | "video" | "music" | "transcription" | "llm_plan"
+    #         | "llm_expand" | "assembly"
     job_type: str
-    # provider: "openrouter" | "fal" | "suno"
+    # provider: "openrouter" | "fal" | "suno" | "ffmpeg"
     provider: str = Field(default="openrouter")
     external_id: Optional[str] = None
     # status: "pending" | "running" | "completed" | "failed"

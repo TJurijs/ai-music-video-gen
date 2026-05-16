@@ -1,6 +1,6 @@
 "use client";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Image as ImageIcon, Video, Mic2, Settings, Square, Trash2, Link2, Download, Wand2, Loader2, X } from "lucide-react";
+import { Image as ImageIcon, Video, Settings, Square, Trash2, Link2, Download, Wand2, Loader2, X } from "lucide-react";
 import { useState } from "react";
 import { api } from "@/lib/api";
 import { useConfirm } from "@/components/ConfirmDialog";
@@ -30,8 +30,8 @@ export default function SceneGenRow({
   const [showModels, setShowModels] = useState(false);
 
   const generate = useMutation({
-    mutationFn: ({ phase, force }: { phase: "image" | "video" | "lipsync" | "all"; force: boolean }) =>
-      api.generation.generateScene(scene.id, force, phase as any),
+    mutationFn: ({ phase, force }: { phase: "image" | "video" | "all"; force: boolean }) =>
+      api.generation.generateScene(scene.id, force, phase),
     onSuccess: onRefresh,
   });
   const cancel = useMutation({
@@ -73,7 +73,7 @@ export default function SceneGenRow({
   const [showImage, setShowImage] = useState(false);
 
   const updateModel = useMutation({
-    mutationFn: (data: { video_model?: string; image_model?: string; lipsync_model?: string; resolution?: string; generate_audio?: boolean; lipsync_enabled?: boolean; chain_from_prev?: boolean; audio_sync_enabled?: boolean }) =>
+    mutationFn: (data: { video_model?: string; image_model?: string; resolution?: string; chain_from_prev?: boolean }) =>
       api.scenes.update(scene.id, data),
     onSuccess: onRefresh,
   });
@@ -110,12 +110,11 @@ export default function SceneGenRow({
     (chainNext.error instanceof Error ? chainNext.error.message : null) ||
     (unchainNext.error instanceof Error ? unchainNext.error.message : null);
 
-  const isRunning = ["generating_image", "generating_video", "lipsync"].includes(scene.status);
+  const isRunning = ["generating_image", "generating_video"].includes(scene.status);
   const hasImage = !!scene.reference_image_url;
   const hasVideo = !!scene.video_url;
   const imageAssets = scene.assets?.filter((a) => a.asset_type === "image") || [];
   const videoAssets = scene.assets?.filter((a) => a.asset_type === "video") || [];
-  const lipsyncAssets = scene.assets?.filter((a) => a.asset_type === "lipsync") || [];
 
   // Pull adjacent scenes from the cached project query.
   //  - prevScene: the one before this one. Used to display the chained
@@ -142,17 +141,10 @@ export default function SceneGenRow({
   const videoModelCfg = models?.video?.[scene.video_model];
   const nextVideoProvider = "openrouter";
 
-  // Detect whether the active video is lipsynced (for the badge on the video frame)
   const activeVideoAsset = videoAssets.find((a) => a.is_active);
-  const activeVideoIsLipsynced = (() => {
-    if (!activeVideoAsset?.metadata_json) return false;
-    try { return !!JSON.parse(activeVideoAsset.metadata_json).lipsynced; } catch { return false; }
-  })();
   // Pull the recorded provider from the active video asset's metadata_json.
-  // _generate_video_fal_seedance_audio writes provider="fal"; the OpenRouter
-  // path doesn't currently set this field explicitly, so for legacy assets we
-  // default to "openrouter". When metadata is missing/unparseable the chip
-  // just doesn't render.
+  // v1 always writes "openrouter"; the field stays for forward compatibility
+  // and to keep historical assets rendering correctly.
   const renderedVideoProvider = (() => {
     if (!activeVideoAsset?.metadata_json) return null;
     try {
@@ -271,10 +263,6 @@ export default function SceneGenRow({
             <Download className="w-3.5 h-3.5" />
           </a>
         )}
-        {/* Mic / audio sync toggle removed — audio-sync / lipsync features
-            were retired (Seedance ref-to-video's lipsync was weak on music,
-            OmniHuman had no separate character ref). Pipeline now produces
-            purely visual scenes. */}
         <button
           onClick={() => setShowModels(!showModels)}
           className="text-zinc-500 hover:text-white p-1 rounded transition-colors shrink-0"
@@ -298,7 +286,7 @@ export default function SceneGenRow({
             onClick={async () => {
               if (await confirm({
                 title: `Clear scene #${scene.order}`,
-                message: "Clear all generated content for this scene?\nDescription and prompts stay; images, videos, and lipsync clips will be deleted.",
+                message: "Clear all generated content for this scene?\nDescription and prompts stay; images and videos will be deleted.",
                 confirmLabel: "Clear scene",
                 destructive: true,
               })) {
@@ -471,9 +459,8 @@ export default function SceneGenRow({
           onDownloadUrl={hasVideo ? scene.video_url : null}
           onDownloadLabel="Download the active video"
           onUpload={(f) => uploadVideo.mutate(f)}
-          uploadLabel="Upload an MP4 as this scene's video — skips generation, saves as a new variant. Useful for plugging in a clip you rendered elsewhere (e.g. fal Seedance web UI)."
+          uploadLabel="Upload an MP4 as this scene's video — skips generation, saves as a new variant. Useful for plugging in a clip you rendered elsewhere."
           uploading={uploadVideo.isPending}
-          isLipsynced={activeVideoIsLipsynced}
           onOpenLightbox={() => scene.video_url && setShowPreview(true)}
           onActivate={(id) => activate.mutate(id)}
           onDelete={(id) => deleteAsset.mutate(id)}
@@ -497,8 +484,6 @@ export default function SceneGenRow({
                   ? "Generate another video variant — keeps prior versions"
                   : "Generate video from reference image"}
               />
-              {/* +Sync (post-process lipsync via fal) removed — see comment at the
-                  audio-sync toggle for context. Generate purely visual scenes. */}
             </div>
           }
         />
@@ -542,14 +527,11 @@ export default function SceneGenRow({
                   selected={scene.video_model === key}
                   duration={Math.round(scene.audio_end - scene.audio_start)}
                   resolution={scene.resolution}
-                  withAudio={scene.generate_audio}
                   onSelect={() => updateModel.mutate({ video_model: key })}
                 />
               ))}
             </div>
           </div>
-
-          {/* Lipsync model picker removed — lipsync features were retired. */}
 
           {/* Resolution / quality selector — constrained to current model's options */}
           {(() => {

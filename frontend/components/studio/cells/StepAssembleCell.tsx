@@ -93,7 +93,6 @@ export default function StepAssembleCell({
               ["Scene planning (LLM)", (costs.by_type.llm_plan || 0) + (costs.by_type.llm_expand || 0)],
               ["Reference images", costs.by_type.image],
               ["Video generation", costs.by_type.video],
-              ["Lipsync", costs.by_type.lipsync],
             ]} />
             <CostGroup title="By provider" entries={[
               ["OpenRouter", costs.by_provider.openrouter],

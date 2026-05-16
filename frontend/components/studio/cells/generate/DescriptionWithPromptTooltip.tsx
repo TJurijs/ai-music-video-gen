@@ -1,37 +1,8 @@
 "use client";
-import { Image as ImageIcon, Video, Mic2 } from "lucide-react";
+import { Image as ImageIcon, Video } from "lucide-react";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { createPortal } from "react-dom";
 import type { Scene, Character } from "@/lib/types";
-
-// Mirror of `_swap_names_for_tokens` in backend/app/services/fal_client.py.
-// Keeps the tooltip preview in sync with what fal Seedance will actually
-// receive. Backend remains the source of truth — this is a UI preview.
-function escapeRegex(s: string) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-function applyTokenSwap(prompt: string, characterMap: { name: string; token: string }[]): string {
-  if (!characterMap.length) return prompt;
-  // Longest name first so 'Elias' doesn't shadow 'Elias Thorne'
-  const sorted = [...characterMap].sort((a, b) => b.name.length - a.name.length);
-  let out = prompt;
-  for (const { name, token } of sorted) {
-    const escaped = escapeRegex(name);
-    // Pass 1: "Name (parenthetical description)" → token
-    out = out.replace(new RegExp(`\\b${escaped}\\b\\s*\\([^)]*\\)`, "gi"), token);
-    // Pass 2: any remaining "Name" → token
-    out = out.replace(new RegExp(`\\b${escaped}\\b`, "gi"), token);
-  }
-  return out;
-}
-
-// Backend's fal-Seedance route mapping — keep in sync with
-// fal_client.fal_seedance_audio_model_id().
-const FAL_SEEDANCE_AUDIO_MODELS = new Set(["seedance-2.0", "seedance-2.0-fast"]);
-// fal-OmniHuman mapping — keep in sync with fal_client.fal_omnihuman_model_id().
-// OmniHuman uses a simpler payload (single image, single audio, plain prompt —
-// no @Image1/@Audio1 token convention) so we render its tooltip differently.
-const FAL_OMNIHUMAN_MODELS = new Set(["omnihuman-1.5"]);
 
 export default function DescriptionWithPromptTooltip({
   scene,

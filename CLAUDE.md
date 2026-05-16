@@ -11,13 +11,15 @@ on this codebase, **read this end-to-end before making changes**.
 An AI-driven music-video studio. User uploads a song → backend extracts
 beats / sections / lyrics → LLM plans scenes → image model renders stills
 → video model animates them → ffmpeg assembles the final MP4 with the
-song muxed in.
+song muxed in. **Purely visual pipeline** — lipsync was removed in v1.
 
 **Stack:**
 - **Backend:** FastAPI + SQLModel + SQLite (one .db file in repo root)
 - **Frontend:** Next.js 14 App Router + React Query + TypeScript + Tailwind
-- **AI provider:** OpenRouter for everything (video / image / LLM), fal.ai
-  optional for lipsync
+- **AI provider:** OpenRouter for everything (video / image / LLM). fal.ai
+  is optional and used only for word-level lyric transcription via
+  fal-ai/whisper when `FAL_API_KEY` is set; otherwise OpenRouter
+  transcription is used (no per-word timing).
 - **Media tools:** ffmpeg + ffprobe (system binaries, must be on PATH)
 
 ---
@@ -58,7 +60,6 @@ environment are cryptic and waste time.
 ```bash
 # Backend imports without error
 cd backend && backend/.venv/bin/python -c "from app.main import app; print('ok')"
-# (or just `python` if venv is activated)
 
 # Frontend type-check
 cd frontend && npx tsc --noEmit
@@ -96,8 +97,8 @@ subsequent starts are instant.
 
 **Always** run these checks before declaring work done:
 ```bash
-# Backend hygiene
-cd backend && python -m pyflakes app/
+# Backend can start
+cd backend && .venv/bin/python -c "from app.main import app; print('ok')"
 
 # Frontend type-check
 cd frontend && npx tsc --noEmit
@@ -116,9 +117,6 @@ When testing in Claude Code Preview, you can:
 
 ## Code conventions — DO follow
 
-These were established by recent refactors. Breaking them creates exactly
-the kind of duplication and inconsistency the codebase was just cleaned of.
-
 ### 1. Storage URLs go through `to_storage_url()`
 
 Every response that returns a public URL for a file in `storage/` must use
@@ -133,8 +131,12 @@ return {"url": to_storage_url(asset.file_path)}
 return {"url": f"http://localhost:8010/storage/{...}"}
 ```
 
-The base URL is `settings.public_base_url` (env-configurable). This is
-what makes the app deployable behind a reverse proxy.
+The base URL is `settings.public_base_url` (env-configurable).
+
+For files **mutated in place** (same filename, new bytes per regen — e.g.
+`extracted_last_frame_path` which is always `scene_N_last.jpg`), pass
+`cache_bust=True` to append an mtime query string. Otherwise browsers
+hold the stale cached version after a regen.
 
 ### 2. LLM JSON parsing goes through `parse_llm_json()`
 
@@ -153,14 +155,13 @@ if isinstance(parsed, list): parsed = parsed[0]
 ```
 
 Use `expect="dict"` (default) or `expect="list"`. Errors include the first
-300 chars of the raw response in the message — keep that pattern when
-adapting.
+300 chars of the raw response in the message — keep that pattern.
 
 ### 3. Versioned rows use `make_active()` / `delete_and_promote()`
 
 Several tables share an "exactly one active row per scope" lifecycle:
-`SceneAsset` (image/video/lipsync per scene), `ScenePromptVersion` (image
-/ video prompt history), `CharacterAsset` (portrait versions). The helpers
+`SceneAsset` (image/video per scene), `ScenePromptVersion` (image / video
+prompt history), `CharacterAsset` (portrait versions). The helpers
 in `backend/app/services/versioning.py` enforce the invariant.
 
 ```python
@@ -182,14 +183,11 @@ new_asset.is_active = True
 db.add(new_asset)
 ```
 
-Adding a new "versioned" model type? Use these helpers — same scope-filter +
-on_active_change callback pattern works regardless of the table.
-
 ### 4. Endpoints have a top-level try/except with traceback logging
 
-Both `auto_plan_scenes` and `expand_all_scenes` wrap their entire body. Any
-unhandled exception logs `traceback.print_exc()` and surfaces a 500 with a
-specific message:
+`generate_scene_batch`, `generate_continuation_prompt`, and similar
+endpoints wrap their entire body. Any unhandled exception logs
+`traceback.print_exc()` and surfaces a 500 with a specific message:
 
 ```python
 try:
@@ -203,9 +201,7 @@ except Exception as e:
     raise HTTPException(500, f"My endpoint crashed ({type(e).__name__}: {str(e)[:300]}).")
 ```
 
-Any new endpoint that does meaningful work (LLM calls, DB writes, file IO)
-should follow this pattern. Generic "500: Internal Server Error" toasts
-without detail are the past, not the future.
+Generic "500: Internal Server Error" toasts without detail are the past.
 
 ### 5. Schema migrations go through `_apply_schema_migrations()`
 
@@ -224,8 +220,7 @@ expected = {
 }
 ```
 
-The startup hook runs `ALTER TABLE ADD COLUMN` for any missing fields. The
-user gets a console message `[startup] schema migration added: ...`.
+The startup hook runs `ALTER TABLE ADD COLUMN` for any missing fields.
 
 ### 6. Frontend confirms use `useConfirm()`, not `window.confirm()`
 
@@ -252,53 +247,65 @@ const errMsg = mutation.error instanceof Error ? mutation.error.message : null;
 // errMsg will be like "500: My endpoint crashed (KeyError: 'foo')." — already clean
 ```
 
-Don't re-parse the message. The status prefix + clean detail is what users see.
+Don't re-parse the message.
+
+### 8. Prompts are written through `_save_prompt_version`
+
+`Scene.image_prompt` and `Scene.video_prompt` are convenience MIRRORS of
+the currently-active `ScenePromptVersion`. Writes go through
+`_save_prompt_version()` in `routers/scenes.py` which keeps the version
+history and updates the mirror via `make_active`'s `on_active_change`
+callback. Never write directly to `Scene.image_prompt` from a router or
+service — that bypasses the audit trail and the mirror falls out of sync.
 
 ---
 
 ## Patterns to avoid — DO NOT add back
 
-### Frame chaining via model `last_frame_path`
+### Lipsync / audio-sync paths
 
-Old chaining passed scene N+1's *planned still* to the video model as
-`last_frame`. The model treated it as a soft target and rarely landed on
-it pixel-perfect → visible seam discontinuity. **Removed.**
+Tried fal Seedance reference-to-video with audio + fal OmniHuman; neither
+produced acceptable results on music vocals. **Removed in v1.** Do not
+reintroduce: the song's audio is muxed in verbatim at assembly time, and
+no video model on the OpenRouter route accepts audio reference anyway.
+
+If a future Seedance variant on OpenRouter starts exposing audio-input
+support, that's worth revisiting — but the `audio_sync_enabled` field
+and the `_generate_video_fal_*` functions are gone for a reason.
+
+### Frame chaining via the video model's `last_frame`
+
+Old chaining passed scene N+1's *planned still* to the video model as a
+soft target. The model rarely landed on it pixel-perfect → visible seam
+discontinuity. **Removed.**
 
 The current chaining uses `Scene.chain_from_prev` (off by default). When
-true, video gen at scene N+1 uses scene N's **extracted last frame** (real
-rendered pixels from the .mp4) as `first_frame_path`. See
+true, video gen at scene N+1 uses scene N's **extracted last frame**
+(real rendered pixels from the .mp4) as `first_frame_path`. See
 `generation_service.py` and `_extract_last_frame()`.
 
-Don't reintroduce the old approach.
+### Per-clip motion-offset trim in assembly
 
-### Velocity-based seam trim
-
-There used to be a `_detect_motion_offset()` function in `assembly.py` that
-trimmed per-clip leading frames to fight the slow-ramp + duplicate-frame
-issue introduced by old chaining. With old chaining gone, the trim was
-solving a non-problem and silently shortening videos. **Removed.**
-
-The current assembly is a straight ffmpeg concat with no per-clip trim,
-plus `-movflags +faststart` for streaming-friendly MP4s.
+`_detect_motion_offset()` used to trim leading frames per clip to mask
+old chaining's slow-ramp artifact. With old chaining gone, the trim
+silently shortened videos. **Removed.** Assembly is now a straight
+ffmpeg concat + audio mux, plus `-movflags +faststart`.
 
 ### Hardcoded `http://localhost:8010/storage/...` strings
 
-There used to be 4 separate hand-built URL constructions. Now there's
-exactly one: `to_storage_url()` in `services/urls.py`. Use it.
+One helper: `to_storage_url()` in `services/urls.py`. Use it.
 
 ### Manual `is_active = True/False` loops
 
-There used to be ~280 lines of these scattered across routers. Now there's
-exactly one set of helpers in `services/versioning.py`. Use them.
+One set of helpers: `services/versioning.py`. Use them.
 
 ### `window.confirm()` / `window.alert()` popups
 
-Replaced with `useConfirm()` overlay. Do not reintroduce native dialogs.
+`useConfirm()` overlay.
 
 ### Re-implementing LLM JSON parsing
 
-Use `parse_llm_json()`. Don't inline `json.loads` + fence stripping + list
-unwrapping per call site.
+`parse_llm_json()`.
 
 ### Adding a field to a model without a migration entry
 
@@ -306,55 +313,69 @@ The .db file is gitignored. Developers get a fresh DB on first run, BUT
 existing developers already have a DB. New fields must be registered in
 `_apply_schema_migrations()` or they'll silently 500 on read.
 
+### `/scenes/auto-plan` and `/scenes/expand-all`
+
+Removed in v1. The single batch endpoint `/scenes/generate-batch`
+produces fully-expanded scenes (image_prompt + video_prompt +
+description) inline, in batches. Per-scene re-expansion still happens
+via `/scenes/{id}/expand-prompts`. Adding a new "plan everything at
+once" endpoint is reverting to the v0 architecture — don't.
+
 ---
 
-## How the pipeline flows
+## How the pipeline flows (v1)
 
 ```
-User uploads song
+User uploads / generates song
   └─→ songs.upload (POST /songs/upload)
       └─→ audio_analysis.analyze_song()
           ├─→ librosa: BPM, key, beats, sections
-          ├─→ openrouter / fal: word-level lyric transcription
-          └─→ openrouter LLM: theme/narrative/mood/visual_world
+          ├─→ fal whisper (if FAL_API_KEY) OR openrouter: lyric transcription
+          └─→ openrouter LLM: theme / narrative / mood / visual_world
 
 User clicks "Suggest characters"
   └─→ projects.suggest_characters
-      └─→ scene_planner.suggest_characters()
-          └─→ openrouter LLM: 3 character cards
+      └─→ scene_planner.suggest_characters() → 3 character cards
 
-User clicks "Auto-plan scenes"
-  └─→ scenes.auto_plan_scenes (POST /scenes/auto-plan)
-      └─→ scene_planner.auto_plan_scenes()
-          └─→ openrouter LLM: list of scene dicts
-              (audio_start/end, image_prompt, video_prompt, lyrics_segment)
+User clicks "Generate Scenes" or "Just scene 1"
+  └─→ POST /scenes/generate-batch (one call per batch of N scenes)
+      └─→ scene_planner.plan_scene_batch()
+          └─→ openrouter LLM (with song theme + prior scenes as continuity)
+              → fully-expanded scene dicts inserted into DB
 
-User clicks "Generate image" on a scene
-  └─→ generation.generate_scene (POST /generation/scene, phase="image")
+User clicks chain icon `🔗` on a rendered scene
+  └─→ POST /scenes/{id}/chain-next
+      └─→ ensures scene N+1 exists with chain_from_prev=true, empty prompts
+
+User clicks wand icon `✨` on a chained scene
+  └─→ POST /scenes/{id}/continuation-prompt
+      └─→ scene_planner.generate_continuation_prompts()
+          └─→ Multimodal LLM call: text (story seed + theme + arc position +
+              prior scenes + lyrics) + image (prev scene's extracted last frame)
+              → video_prompt + 1-line description (NOT image_prompt — chained
+              scenes don't use one)
+
+User clicks "Img" on a scene
+  └─→ POST /generation/scene (phase="image")
       └─→ BackgroundTask: generation_service.generate_scene(phase="image")
-          └─→ openrouter image gen
-              + char_refs (portraits of named characters)
-              + style suffix via _append_style()
+          └─→ openrouter image gen + character refs
 
-User clicks "Generate video" on a scene
-  └─→ generation.generate_scene (POST /generation/scene, phase="video")
+User clicks "Vid" on a scene
+  └─→ POST /generation/scene (phase="video")
       └─→ BackgroundTask: generation_service.generate_scene(phase="video")
-          ├─→ Resolve first_frame_path
-          │     - Default: scene.reference_image_path
-          │     - If scene.chain_from_prev: prev_scene.extracted_last_frame_path
-          ├─→ openrouter video submission
-          ├─→ Poll until completion
-          ├─→ Download .mp4
-          ├─→ _extract_last_frame() → scene.extracted_last_frame_path (for chaining downstream)
+          ├─→ Resolve first_frame_path:
+          │     - chain_from_prev: prev_scene.extracted_last_frame_path
+          │     - else: scene.reference_image_path
+          ├─→ openrouter video submit + poll + download .mp4
+          ├─→ _extract_last_frame() → scene.extracted_last_frame_path
           └─→ _save_asset() via make_active()
 
 User clicks "Assemble final video"
-  └─→ generation.trigger_assembly (POST /generation/assemble/{project_id})
+  └─→ POST /generation/assemble/{project_id}
       └─→ BackgroundTask: assembly.assemble_project()
-          ├─→ Write concat.txt listing all scene .mp4s in order
           ├─→ ffmpeg concat (re-encode video)
           ├─→ ffmpeg mux with song audio (-shortest, -movflags +faststart)
-          └─→ Job row updated to status="completed"
+          └─→ GenerationJob status="completed", result_path=storage/N/final.mp4
 ```
 
 ---
@@ -367,24 +388,31 @@ The studio is a **multi-step workflow** rendered as a stack of "cells":
 FlowStudio
 ├── StepSongCell        — upload/generate the song + audio analysis
 ├── StepCharactersCell  — define cast (manual or AI Suggest)
-├── StepPlanCell        — auto-plan scenes + AI Expand all
-├── StepGenerateCell    — per-scene image/video/lipsync generation
+├── StepPlanCell        — Generate Scenes (full song) / Just scene 1
+├── StepGenerateCell    — per-scene image / video rendering
 └── StepAssembleCell    — assemble final video, scrub strip, download
 ```
 
-`StepGenerateCell.tsx` was a 1591-line monolith; it's now a 228-line
-orchestrator + 12 focused files in `cells/generate/`. Most per-scene
-features go in `generate/SceneGenRow.tsx`.
+Per-scene UI lives in `cells/generate/`:
+- `SceneGenRow.tsx` — the scene row (status pill, description, chain `🔗`,
+  wand `✨`, settings cog, delete `X`, clear-assets trash, frame slots)
+- `FrameSlot.tsx` — left/right slot for image / video
+- `DescriptionWithPromptTooltip.tsx` — hover preview of the prompts the
+  model will see
+- `CharacterRefsBadge.tsx` — which characters' portraits will be sent as
+  `input_references` (model-aware: only Seedance variants use refs on
+  the OpenRouter route; Kling / Veo drop them silently)
+- `VideoModelCard.tsx`, `SplitGenerateButton.tsx`, `SceneStatus.tsx`,
+  `VariantGallery.tsx`, `PromptVersionGallery.tsx`, `ScenePreview.tsx`
 
 **State management:** React Query. Every query key is structured (e.g.
 `["project", projectId]`). After a mutation, call `qc.invalidateQueries(...)`
-or pass `onSuccess: refresh` where `refresh` is a closure that invalidates
-the right key.
+or pass `onSuccess: refresh` where `refresh` invalidates the right key.
 
-**Auto-polling** is wired ad-hoc per cell. Example:
-- `StepAssembleCell` polls `/api/generation/assemble/{id}/status` every 3s while running
-- `StepCharactersCell` polls the project every 2.5s while any character is
-  in `portrait_status: "generating"`
+**Auto-polling** is wired ad-hoc per cell:
+- `StepPlanCell` polls every 2s while the batch loop is running
+- `StepAssembleCell` polls `/api/generation/assemble/{id}/status` every 3s
+- `StepCharactersCell` polls the project every 2.5s while a portrait is `generating`
 
 ---
 
@@ -394,10 +422,10 @@ the right key.
 |---|---|
 | Add a new video model | `backend/app/config.py` (`VIDEO_MODELS` dict) |
 | Add a new image model | `backend/app/config.py` (`IMAGE_MODELS` dict) |
-| Add a new endpoint | `backend/app/routers/` (or new file under `routers/`) |
 | New LLM-driven feature (prompt) | `backend/app/services/scene_planner.py` |
-| Change how characters are described | `CHAR_SUGGEST_PROMPT` and `expand_character_description` in `scene_planner.py` |
-| Change how scenes are planned | `SCENE_PLAN_SYSTEM` and `SCENE_PLAN_USER` in `scene_planner.py` |
+| Change how characters are described | `expand_character_description` in `scene_planner.py` |
+| Change how scenes are planned in batch | `plan_scene_batch` in `scene_planner.py` |
+| Change the wand (continuation prompt) | `generate_continuation_prompts` in `scene_planner.py` |
 | Per-scene generation pipeline | `backend/app/services/generation_service.py` |
 | Final ffmpeg assembly | `backend/app/services/assembly.py` |
 | Pricing | `backend/app/services/pricing.py` |
@@ -406,95 +434,104 @@ the right key.
 | Frontend shared types | `frontend/lib/types.ts` |
 | Confirm dialog system | `frontend/components/ConfirmDialog.tsx` |
 | Per-scene UI | `frontend/components/studio/cells/generate/SceneGenRow.tsx` |
-| Assembly UI (scrubber, download, preview) | `frontend/components/studio/cells/StepAssembleCell.tsx` |
+| Plan-step UI | `frontend/components/studio/cells/StepPlanCell.tsx` |
+| Assembly UI | `frontend/components/studio/cells/StepAssembleCell.tsx` |
 
 ---
 
 ## Known gotchas
 
-### The OpenRouter API contract drifts
+### OpenRouter contract drifts per provider
 
-OpenRouter is an aggregator; the per-provider quirks leak through. Specific
-behaviors we know about:
-
-- **Seedance** has a server-side image-content filter that **refuses photo-
-  realistic portraits as `input_references`** with `InputImageSensitiveContentDetected`.
-  Mitigation: auto-retry-with-degradation in `submit_video_job` drops refs,
-  then drops first_frame, before erroring out. Users should pick Kling /
-  Hailuo / Wan / Veo for character-heavy scenes.
-- **Veo** has a `personGeneration` field; we set it to `"allow_adult"` on
-  Veo submissions to allow photoreal people. Without this, Veo refuses.
-- **Gemini Image** occasionally returns *text describing the image* instead
-  of an image. Auto-retry-on-text in `generate_image` handles this; the
-  most common cause is a celebrity name in the prompt triggering the
-  likeness filter. Character prompts forbid celebrity references for this
-  reason.
+- **Seedance** has a server-side image-content filter that **refuses
+  photoreal portraits as `input_references`** with `InputImageSensitiveContentDetected`.
+  The backend used to auto-degrade (drop refs, then first_frame) but
+  that silently broke chaining. v1 surfaces the error explicitly so the
+  user picks recovery (switch to Kling/Veo, or activate a less
+  recognizable portrait variant).
+- **Veo** requires `personGeneration="allow_adult"` to render real people.
+  We set it on every Veo submission. Without it, Veo refuses.
+- **Veo + refs incompatibility**: Veo on OpenRouter ignores
+  `input_references` when a `first_frame` is also present. So
+  `supports_reference_images=False` for Veo variants in `VIDEO_MODELS`.
+- **Kling on OpenRouter** ignores `input_references` entirely (the
+  feature is exposed in Kling's native UI but OpenRouter's passthrough
+  drops it). So `supports_reference_images=False`.
+- **Gemini Image** occasionally returns *text describing the image*
+  instead of an image. Auto-retry-on-text in `generate_image` handles
+  this; the most common cause is a celebrity name in the prompt
+  tripping the likeness filter.
 
 ### Backend reload kills in-flight requests
 
 `uvicorn --reload` watches files; saving any Python file kills the worker.
-If you save during a long auto-plan (60s+), the request dies even though
-the LLM call completed. Mitigations:
+Mitigations:
+- Startup uses `--timeout-graceful-shutdown 300` so in-flight requests
+  get 5 minutes to finish before reload.
+- The batch endpoint (`generate-batch`) makes SHORT LLM calls per batch
+  (~5-10s each), so a single bad reload loses at most one batch.
+- The frontend retries transient errors up to 5× with exponential
+  backoff. When mid-batch transient errors happen, you see "Retrying
+  after backend blip…" without losing in-flight work.
 
-- Backend startup uses `--timeout-graceful-shutdown 300` so in-flight
-  requests get 5 minutes to finish before the reload kills them.
-- Both `auto_plan_scenes` and `expand_all_scenes` wrap their bodies in try
-  /except with traceback logging so partial-success cases at least leave
-  the DB consistent and a useful error message.
+### Scene chaining requires sequential generation
 
-When debugging "auto-plan failed but actually succeeded": refresh and
-check if scenes are in the DB. They usually are.
+`scene.chain_from_prev` reads `prev_scene.extracted_last_frame_path`,
+which only exists after prev's video has been fully rendered. If you
+enable chain on scene 5 but scene 4 hasn't been generated yet, video
+gen errors out with: *"Scene 5 is chained from scene 4 but that
+scene's video hasn't been rendered yet. Generate scene 4 first."*
 
-### Scene chaining requires sequential ordering
-
-`scene.chain_from_prev` reads `prev_scene.extracted_last_frame_path` which
-only exists after prev's video has been fully rendered. If a user enables
-chain on scene 5 but scene 4 hasn't been generated yet, video gen errors
-out with an actionable message: *"Scene 5 is chained from scene 4 but
-that scene's video hasn't been rendered yet. Generate scene 4 first."*
-
-For batch generation, this means chained scenes must be generated in order.
-Parallel batch fires all scenes at once — the chained ones will fail with
-that error and need a re-run after the upstream finishes.
+The continuation-prompt endpoint enforces the same precondition: it
+needs the prev's last frame on disk to feed the vision LLM. Don't
+parallelize chained scenes.
 
 ### Scene durations get snapped by the video model
 
-`generation_service` calls `_closest_supported(raw_duration, model.durations)`
-to fit the scene duration to what the model supports. A 10s scene routed
-to Veo Lite (supports `[4, 6, 8]`) will render as 8s. This is why assembled
-videos are sometimes shorter than the song. To preserve full duration: use
-Kling (3-15s) or Wan (5/10/15s) for any scene that needs >8s.
+`generation_service._closest_supported(raw_duration, model.durations)`
+fits the scene duration to what the model supports. A 10s scene routed
+to Veo Lite (`[4, 6, 8]`) will render as 8s. Assembled videos can come
+out shorter than the song. To preserve full duration use Kling (3-15s)
+or Seedance 2.0 (4-15s) for any scene needing >8s.
 
-### Scene `image_prompt` / `video_prompt` have BOTH a "live" field and a versioned history
+### `extracted_last_frame_path` is mutated in place
+
+It's always `storage/{project}/extracted/scene_{N}_last.jpg` regardless
+of how many times scene N's video has been regenerated. Browsers cache
+the URL → stale chain preview. Fix: `to_storage_url(path, cache_bust=True)`
+appends an mtime query string. This is the ONLY file the codebase
+mutates in place; everything else uses unique-timestamped filenames.
+
+### `Scene.image_prompt` / `Scene.video_prompt` mirror active prompt version
 
 `Scene.image_prompt` and `Scene.video_prompt` are convenience fields
-mirroring the **currently-active** `ScenePromptVersion`. Reads go through
-the convenience fields (faster, simpler), writes go through
-`_save_prompt_version` which keeps the version history *and* updates the
-mirror via `make_active`'s `on_active_change` callback.
+mirroring the **currently-active** `ScenePromptVersion`. Reads go
+through the convenience fields (faster); writes go through
+`_save_prompt_version` which keeps the version history and updates
+the mirror via `make_active`'s `on_active_change` callback.
 
-Don't write directly to `Scene.image_prompt` — bypasses the versioning
-audit trail and the mirror falls out of sync with `is_active`.
+Don't write directly to `Scene.image_prompt` — bypasses the audit
+trail and the mirror falls out of sync.
 
 ---
 
 ## Test workflow before declaring done
 
-1. **Backend:** `python -m pyflakes app/` returns nothing
-2. **Frontend:** `npx tsc --noEmit` returns nothing
-3. **Backend can start:** `python -c "from app.main import app; print('ok')"`
-4. **One smoke test in the area you touched.** Examples:
-   - Touched the LLM JSON parser? Run a real auto-plan, verify it returns scenes.
-   - Touched the video gen flow? Generate one scene's image (cheap), verify
-     it lands on disk and the API surfaces the URL.
+1. **Backend can start:** `cd backend && .venv/bin/python -c "from app.main import app; print('ok')"`
+2. **Frontend type-check:** `cd frontend && npx tsc --noEmit` returns nothing
+3. **One smoke test in the area you touched.** Examples:
+   - Touched the LLM JSON parser? Run a real generate-batch, verify scenes appear.
+   - Touched the video gen flow? Generate one scene's image (cheap), verify it
+     lands on disk and the API surfaces the URL.
+   - Touched the chain icon? Render scene 1, click `🔗` on its row, verify
+     scene 2 appears with chain_from_prev=true.
+   - Touched the wand? Click it on a chained scene, verify the description
+     fills in and video_prompt updates.
    - Touched the URL helper? Hit `GET /api/projects/{id}` and verify URLs
      point at `settings.public_base_url`.
-   - Touched the versioning service? Create + activate + delete a prompt
-     version and verify exactly one row stays `is_active = True`.
 
-The user gets unhappy when checks pass but actual behavior is broken —
-specifically because most of the recent fixes were "the type-check passed
-but the feature didn't work end-to-end." Always smoke-test.
+The user gets unhappy when checks pass but actual behavior is broken.
+Always smoke-test.
 
 ---
 

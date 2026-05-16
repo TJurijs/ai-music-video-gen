@@ -27,8 +27,6 @@ def _sync_scene_pointer(scene: Scene, asset_type: str, file_path: str | None) ->
         scene.reference_image_path = file_path
     elif asset_type == "video":
         scene.video_path = file_path
-    elif asset_type == "lipsync":
-        scene.lipsync_path = file_path
 
 
 def _save_asset(
@@ -154,9 +152,11 @@ async def generate_scene(scene_id: int, engine, phase: str = "all") -> None:
     phase:
       - "image":  reference still only (cheap, ~$0.04). Lets the user review
                   before paying for video.
-      - "video":  video gen + optional lipsync. Skips image step if a
-                  reference already exists; auto-generates one if missing.
-      - "all":    image → video → optional lipsync (legacy behavior).
+      - "video":  video gen. Skips image step if a reference already exists;
+                  auto-generates one if missing. Skips image entirely when
+                  scene.chain_from_prev is True (the prev scene's extracted
+                  last frame is used as the first_frame instead).
+      - "all":    image → video.
     """
     with Session(engine) as db:
         scene = db.get(Scene, scene_id)
@@ -350,17 +350,9 @@ async def _generate_video_openrouter(scene: Scene, db: Session, model_cfg: dict,
             )
         first_frame_path = prev_scene.extracted_last_frame_path
 
-    # Native audio reference is a forward-compatible feature flag: the scene
-    # may carry `audio_sync_enabled=True`, but OpenRouter's video schema
-    # currently doesn't expose an audio-input field for any model — even
-    # Seedance, which supports it natively elsewhere. So we don't slice or
-    # send the audio. The user can hit lipsync today via the post-process
-    # path (`phase="lipsync"`) which routes to fal.ai. When/if a direct
-    # Replicate/Volcengine submitter is added, the audio slice + payload
-    # wiring should reactivate here.
-    audio_ref_path: str | None = None
-
-    # generate_audio is always false now — the user's song is the audio track.
+    # Audio is never sent to the video model — the song's audio is muxed
+    # in verbatim at assembly time, so model-generated audio would just be
+    # overwritten. Pricing reflects video-only (no audio surcharge).
     cost, detail = pricing.video_cost(
         scene.video_model, duration, resolution, with_audio=False,
     )
@@ -368,8 +360,6 @@ async def _generate_video_openrouter(scene: Scene, db: Session, model_cfg: dict,
         detail += f" + {len(char_refs)} char ref(s)"
     if scene.chain_from_prev:
         detail += " + chained"
-    if audio_ref_path:
-        detail += " + audio sync"
     job = _create_job(db, scene, "video", "openrouter", cost, detail)
     try:
         job_id = await openrouter.submit_video_job(
@@ -378,10 +368,8 @@ async def _generate_video_openrouter(scene: Scene, db: Session, model_cfg: dict,
             duration=duration,
             aspect_ratio=aspect_ratio,
             resolution=resolution,
-            generate_audio=False,
             first_frame_path=first_frame_path,
             reference_image_paths=char_refs,
-            reference_audio_path=audio_ref_path,
         )
         scene.openrouter_job_id = job_id
         job.external_id = job_id
@@ -400,7 +388,7 @@ async def _generate_video_openrouter(scene: Scene, db: Session, model_cfg: dict,
             model_used=scene.video_model, cost_usd=cost, cost_detail=detail,
             metadata={
                 "duration": duration, "resolution": resolution,
-                "aspect": aspect_ratio, "audio": scene.generate_audio,
+                "aspect": aspect_ratio,
                 "provider": "openrouter",
                 "char_refs": len(char_refs or []),
                 "chained_from": prev_scene.id if scene.chain_from_prev else None,

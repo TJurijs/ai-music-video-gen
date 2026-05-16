@@ -93,7 +93,6 @@ export type SceneStatus =
   | "generating_image"
   | "image_ready"
   | "generating_video"
-  | "lipsync"
   | "done"
   | "error"
   | "cancelled";
@@ -103,7 +102,7 @@ export type GenerationPhase = "image" | "video" | "all";
 export interface SceneAsset {
   id: number;
   scene_id: number;
-  asset_type: "image" | "video" | "lipsync";
+  asset_type: "image" | "video";
   model_used?: string;
   cost_usd: number;
   cost_detail?: string;
@@ -141,14 +140,7 @@ export interface Scene {
   video_url?: string;
   video_model: string;
   image_model: string;
-  lipsync_model: string;
   resolution: string;
-  generate_audio: boolean;
-  lipsync_enabled: boolean;
-  // Native audio reference for lipsync — slices this scene's audio window
-  // from the song and passes it as reference_audios to the video model.
-  // Only effective on models with supports_audio_input (Seedance family).
-  audio_sync_enabled?: boolean;
   align_to_beats: boolean;
   prompts_expanded: boolean;
   // Scene chaining: when on, video gen uses the PREVIOUS scene's extracted
@@ -166,7 +158,7 @@ export interface Scene {
   created_at: string;
 }
 
-export type JobType = "image" | "video" | "lipsync" | "music" | "transcription";
+export type JobType = "image" | "video" | "music" | "transcription";
 export type JobStatus = "pending" | "running" | "completed" | "failed";
 
 export interface GenerationJob {
@@ -207,8 +199,9 @@ export interface VideoModel {
   supports_first_frame: boolean;
   supports_last_frame: boolean;
   supports_reference_images: boolean;
-  supports_audio_input: boolean;
-  generates_audio: boolean;
+  // Pricing matrix kept as { with_audio, without_audio } for backward compat
+  // with existing OpenRouter pricing_skus snapshots. We always pay the
+  // without_audio rate (the song's audio is muxed in at assembly time).
   pricing: Record<string, { with_audio: number; without_audio: number }>;
   max_duration: number;
   note?: string;
@@ -229,17 +222,8 @@ export interface LLMModel {
   note?: string;
 }
 
-export interface LipsyncModel {
-  name: string;
-  model_id: string;
-  tier: "debug" | "cheap" | "mid" | "premium";
-  price_per_clip: number;
-  note?: string;
-}
-
 export interface ModelsConfig {
   video: Record<string, VideoModel>;
   image: Record<string, ImageModel>;
   llm: Record<string, LLMModel>;
-  lipsync: Record<string, LipsyncModel>;
 }

@@ -50,7 +50,7 @@ export default function FlowStudio({ project, song, scenes, characters, jobs, co
     : (() => {
         const done = scenes.filter((s) => s.status === "done").length;
         const running = scenes.some((s) =>
-          ["generating_image", "generating_video", "lipsync"].includes(s.status)
+          ["generating_image", "generating_video"].includes(s.status)
         );
         const errored = scenes.some((s) => s.status === "error");
         if (running) return "running";
@@ -208,7 +208,7 @@ export default function FlowStudio({ project, song, scenes, characters, jobs, co
           onToggle={() => toggle(4)}
           badge={costs && costs.by_type.video ? (
             <span className="text-[10px] text-green-400/80 font-mono">
-              {fmtCost((costs.by_type.video || 0) + (costs.by_type.image || 0) + (costs.by_type.lipsync || 0))}
+              {fmtCost((costs.by_type.video || 0) + (costs.by_type.image || 0))}
             </span>
           ) : undefined}
         >

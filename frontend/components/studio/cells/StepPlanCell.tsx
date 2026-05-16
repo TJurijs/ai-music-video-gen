@@ -38,160 +38,30 @@ export default function StepPlanCell({
   const { data: models } = useQuery({ queryKey: ["models"], queryFn: api.models.list });
   const refresh = () => qc.invalidateQueries({ queryKey: ["project", project.id] });
 
-  // ─── Async operation state machine ─────────────────────────────────────
-  // Each long-running mutation (auto-plan, expand-all) goes through up to
-  // four states: idle → running → (maybe) verifying → idle/success/failed.
-  //
-  // "verifying" is the key piece: when the HTTP call errors, we DO NOT
-  // surface a red toast right away. The backend may still be working in
-  // the background (uvicorn reload mid-LLM, proxy timeout on a long call,
-  // connection blip after the DB commits landed), so we keep polling for
-  // ~30s. If scenes actually change during that window, we declare success
-  // and tell the user the connection dropped but the work landed. Only if
-  // nothing changes after the grace period do we show the actionable error.
-  const VERIFY_GRACE_MS = 30000;
-  const planBeforeRef = useRef<{ ids: Set<number> } | null>(null);
-  const expandBeforeRef = useRef<{ expandedCount: number } | null>(null);
-  const planVerifyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const expandVerifyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [planVerifying, setPlanVerifying] = useState(false);
-  const [expandVerifying, setExpandVerifying] = useState(false);
-  const [planRecoveredMsg, setPlanRecoveredMsg] = useState<string | null>(null);
-  const [expandRecoveredMsg, setExpandRecoveredMsg] = useState<string | null>(null);
-  const [planFinalError, setPlanFinalError] = useState<string | null>(null);
-  const [expandFinalError, setExpandFinalError] = useState<string | null>(null);
-  // Per-scene failures surfaced from the most-recent expand-all response.
-  // These come back as a 200 OK with a `failed: []` array; the user wants
-  // to see WHICH scenes failed and WHY, not just the count.
-  const [expandFailures, setExpandFailures] = useState<{ scene_id: number; reason: string }[]>([]);
+  // Single LLM identifier used for both the batch generator and per-scene
+  // re-expand. Resolves the user's preference to OpenRouter's full model_id.
+  const llmId = models?.llm?.[planOpts.plan_llm]?.model_id || "google/gemini-3-flash-preview";
 
-  // Predicate shared by both mutations: which errors are worth retrying
-  // before the user ever sees a red banner? Transient network/proxy issues
-  // (backend restart, network blip, upstream-unreachable) are safe to retry.
-  // Real backend errors (500 with a detail message about LLM failure, scene
-  // count mismatch, etc.) are NOT retried — they're real failures the user
-  // should know about.
+  // ─── Per-batch retry on transient errors ──────────────────────────────
+  // Backend restart (uvicorn reload), network blip, or proxy upstream-
+  // unreachable shouldn't abort the whole multi-batch generation. Each
+  // batch retries up to 5 times with exponential backoff capped at 8s.
   const isTransientError = (error: any): boolean => {
     const msg: string = String((error as Error)?.message || "");
     return (
       /Backend unreachable/i.test(msg) ||
       /Network error/i.test(msg) ||
       /ECONNREFUSED|ECONNRESET|ETIMEDOUT/i.test(msg) ||
-      /^5\d\d: Internal Server Error$/.test(msg)  // raw "500: Internal Server Error" from proxy
+      /^5\d\d: Internal Server Error$/.test(msg)
     );
   };
-
-  // Up to 5 retries on transient errors, with exponential backoff capped
-  // at 8s. Total wall-clock window: ~30s. While the mutation is retrying,
-  // `isPending` stays true, so the user sees the spinner the whole time
-  // and only ever finds out about transient blips if every retry fails.
   const TRANSIENT_RETRY_COUNT = 5;
-  const transientRetry = (failureCount: number, error: any) =>
-    failureCount < TRANSIENT_RETRY_COUNT && isTransientError(error);
   const transientRetryDelay = (attempt: number) => Math.min(1000 * 2 ** attempt, 8000);
 
-  const autoPlan = useMutation({
-    mutationFn: () =>
-      api.scenes.autoPlan({
-        project_id: project.id,
-        song_id: song!.id,
-        target_scene_duration: planOpts.duration,
-        replace_existing: true,
-        llm_model: models?.llm?.[planOpts.plan_llm]?.model_id || "google/gemini-3-flash-preview",
-        story_seed: planOpts.story_seed.trim() || undefined,
-      }),
-    retry: transientRetry,
-    retryDelay: transientRetryDelay,
-    onMutate: () => {
-      planBeforeRef.current = { ids: new Set(scenes.map((s) => s.id)) };
-      setPlanRecoveredMsg(null);
-      setPlanFinalError(null);
-      setPlanVerifying(false);
-      if (planVerifyTimerRef.current) clearTimeout(planVerifyTimerRef.current);
-    },
-    onSettled: async (_data, error) => {
-      await qc.invalidateQueries({ queryKey: ["project", project.id] });
-      await qc.refetchQueries({ queryKey: ["project", project.id] });
-      if (!error) return;
-      // HTTP failed. Enter verifying — keep polling, give the operation a
-      // chance to finish in the background before declaring real failure.
-      setPlanVerifying(true);
-      planVerifyTimerRef.current = setTimeout(() => {
-        const fresh = qc.getQueryData<any>(["project", project.id]);
-        const freshScenes: Scene[] = fresh?.scenes || [];
-        const before = planBeforeRef.current;
-        const succeeded =
-          before && freshScenes.length > 0 && freshScenes.some((s) => !before.ids.has(s.id));
-        if (succeeded) {
-          setPlanRecoveredMsg(
-            `Server connection dropped, but ${freshScenes.length} scenes were planned and loaded.`
-          );
-          autoPlan.reset();
-        } else {
-          setPlanFinalError(error.message);
-        }
-        setPlanVerifying(false);
-      }, VERIFY_GRACE_MS);
-    },
-  });
-
-  // Single LLM identifier used for both the batch generator and per-scene
-  // re-expand. Resolves the user's preference to OpenRouter's full model_id.
-  const llmId = models?.llm?.[planOpts.plan_llm]?.model_id || "google/gemini-3-flash-preview";
-
-  const expandAll = useMutation({
-    mutationFn: () =>
-      api.scenes.expandAll({
-        project_id: project.id,
-        llm_model: llmId,
-        only_empty: false,
-      }),
-    retry: transientRetry,
-    retryDelay: transientRetryDelay,
-    onMutate: () => {
-      expandBeforeRef.current = {
-        expandedCount: scenes.filter((s) => s.prompts_expanded).length,
-      };
-      setExpandRecoveredMsg(null);
-      setExpandFinalError(null);
-      setExpandFailures([]);
-      setExpandVerifying(false);
-      if (expandVerifyTimerRef.current) clearTimeout(expandVerifyTimerRef.current);
-    },
-    onSettled: async (data, error) => {
-      await qc.invalidateQueries({ queryKey: ["project", project.id] });
-      await qc.refetchQueries({ queryKey: ["project", project.id] });
-      // Even on a 200 OK, the backend may report per-scene failures —
-      // surface them so the user can see exactly which scenes didn't expand.
-      if (data?.failed && data.failed.length > 0) {
-        setExpandFailures(data.failed);
-      }
-      if (!error) return;
-      setExpandVerifying(true);
-      expandVerifyTimerRef.current = setTimeout(() => {
-        const fresh = qc.getQueryData<any>(["project", project.id]);
-        const freshScenes: Scene[] = fresh?.scenes || [];
-        const after = freshScenes.filter((s) => s.prompts_expanded).length;
-        const before = expandBeforeRef.current?.expandedCount ?? 0;
-        if (after > before) {
-          const delta = after - before;
-          setExpandRecoveredMsg(
-            `Server connection dropped, but ${delta} more scene${delta === 1 ? "" : "s"} were expanded (${after}/${freshScenes.length} total).`
-          );
-          expandAll.reset();
-        } else {
-          setExpandFinalError(error.message);
-        }
-        setExpandVerifying(false);
-      }, VERIFY_GRACE_MS);
-    },
-  });
-
-  // ─── Batch generator — the new single-button flow ─────────────────────
-  // Replaces (auto-plan + AI Expand all) with one loop that produces
-  // fully-expanded scenes 3 at a time, passing previously-generated scenes
-  // as continuity context. Short LLM calls per batch keep the connection
-  // alive and let the UI show new scenes after every step.
+  // ─── Batch generator — the only scene-planning flow ───────────────────
+  // One LLM call per batch (default 3 scenes), runs sequentially, each
+  // batch sees previously-generated scenes for continuity. Short calls →
+  // no timeouts → user sees scenes appear as they're created.
   const BATCH_SIZE = 3;
   const [genTotal, setGenTotal] = useState<number | null>(null);
   const [genSoFar, setGenSoFar] = useState<number>(0);
@@ -290,53 +160,14 @@ export default function StepPlanCell({
     }
   };
 
-  // While anything is in-flight OR verifying OR batch-loop is running, poll
-  // the project every 2s so per-scene progress flips live.
+  // Poll the project every 2s while the batch loop is running so per-scene
+  // progress flips live in the UI.
   useEffect(() => {
-    if (!autoPlan.isPending && !expandAll.isPending && !planVerifying && !expandVerifying && !genRunning) return;
+    if (!genRunning) return;
     const iv = setInterval(refresh, 2000);
     return () => clearInterval(iv);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoPlan.isPending, expandAll.isPending, planVerifying, expandVerifying, genRunning]);
-
-  // Early success during verification: if scenes change while we're waiting
-  // out the grace period, declare success now and skip the rest of the wait.
-  useEffect(() => {
-    if (!planVerifying) return;
-    const before = planBeforeRef.current;
-    if (before && scenes.length > 0 && scenes.some((s) => !before.ids.has(s.id))) {
-      if (planVerifyTimerRef.current) clearTimeout(planVerifyTimerRef.current);
-      setPlanRecoveredMsg(
-        `Server connection dropped, but ${scenes.length} scenes were planned and loaded.`
-      );
-      setPlanVerifying(false);
-      autoPlan.reset();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scenes, planVerifying]);
-
-  useEffect(() => {
-    if (!expandVerifying) return;
-    const before = expandBeforeRef.current?.expandedCount ?? 0;
-    const now = scenes.filter((s) => s.prompts_expanded).length;
-    if (now > before) {
-      if (expandVerifyTimerRef.current) clearTimeout(expandVerifyTimerRef.current);
-      const delta = now - before;
-      setExpandRecoveredMsg(
-        `Server connection dropped, but ${delta} more scene${delta === 1 ? "" : "s"} were expanded (${now}/${scenes.length} total).`
-      );
-      setExpandVerifying(false);
-      expandAll.reset();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scenes, expandVerifying]);
-
-  // While verifying, treat the operation as still in-flight for button labels
-  // (no point letting the user re-click while we're still listening for the
-  // first attempt to finish).
-  const planBusy = autoPlan.isPending || planVerifying;
-  const expandBusy = expandAll.isPending || expandVerifying;
-  const expandedCount = scenes.filter((s) => s.prompts_expanded).length;
+  }, [genRunning]);
 
   const addScene = useMutation({
     mutationFn: (data: any) => api.scenes.create(data),
@@ -515,16 +346,6 @@ export default function StepPlanCell({
             >✕</button>
           </div>
         )}
-        {planRecoveredMsg && (
-          <div className="mt-2 bg-emerald-900/20 border border-emerald-800/40 rounded-md px-2.5 py-2 text-[11px] text-emerald-300 flex items-start justify-between gap-2">
-            <span>{planRecoveredMsg}</span>
-            <button
-              onClick={() => setPlanRecoveredMsg(null)}
-              className="text-emerald-400/60 hover:text-emerald-200 shrink-0"
-              title="Dismiss"
-            >✕</button>
-          </div>
-        )}
 
         <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1">
           <ModelTag
@@ -587,69 +408,6 @@ export default function StepPlanCell({
               </button>
             </div>
           </div>
-          {expandVerifying && (
-            <div className="bg-yellow-900/20 border border-yellow-800/40 rounded-md px-2.5 py-2 text-[11px] text-yellow-200 flex items-start gap-2">
-              <Loader2 className="w-3 h-3 animate-spin shrink-0 mt-0.5" />
-              <span>
-                Connection to the server dropped, but AI Expand may still be running. Checking for results — this can take up to 30 seconds…
-              </span>
-            </div>
-          )}
-          {expandFinalError && (
-            <div className="bg-red-900/20 border border-red-800/40 rounded-md px-2.5 py-2 text-[11px] text-red-300 flex items-start justify-between gap-2">
-              <div>
-                <span className="font-medium">AI Expand all failed: </span>{expandFinalError.length > 400 ? expandFinalError.slice(0, 400) + "…" : expandFinalError}
-              </div>
-              <button
-                onClick={() => setExpandFinalError(null)}
-                className="text-red-400/60 hover:text-red-200 shrink-0"
-                title="Dismiss"
-              >✕</button>
-            </div>
-          )}
-          {expandRecoveredMsg && (
-            <div className="bg-emerald-900/20 border border-emerald-800/40 rounded-md px-2.5 py-2 text-[11px] text-emerald-300 flex items-start justify-between gap-2">
-              <span>{expandRecoveredMsg}</span>
-              <button
-                onClick={() => setExpandRecoveredMsg(null)}
-                className="text-emerald-400/60 hover:text-emerald-200 shrink-0"
-                title="Dismiss"
-              >✕</button>
-            </div>
-          )}
-          {expandFailures.length > 0 && (
-            <div className="bg-amber-900/20 border border-amber-800/40 rounded-md px-2.5 py-2 text-[11px] text-amber-300 flex items-start justify-between gap-2">
-              <div>
-                <div className="font-medium mb-1">
-                  {expandFailures.length} scene{expandFailures.length === 1 ? "" : "s"} couldn't be expanded:
-                </div>
-                <ul className="space-y-0.5 leading-snug">
-                  {expandFailures.map((f) => {
-                    const sc = scenes.find((s) => s.id === f.scene_id);
-                    return (
-                      <li key={f.scene_id}>
-                        <span className="font-medium">
-                          scene #{sc?.order ?? f.scene_id}
-                        </span>
-                        {sc?.description && (
-                          <span className="text-amber-200/60"> · {sc.description.slice(0, 60)}{sc.description.length > 60 ? "…" : ""}</span>
-                        )}
-                        <span className="text-amber-200/80"> — {f.reason}</span>
-                      </li>
-                    );
-                  })}
-                </ul>
-                <div className="text-[10px] text-amber-200/60 mt-1">
-                  Click <span className="font-medium">AI Expand all</span> again to retry just these scenes (toggle on <span className="font-medium">only_empty</span> — already the default — or re-run to retry everything).
-                </div>
-              </div>
-              <button
-                onClick={() => setExpandFailures([])}
-                className="text-amber-400/60 hover:text-amber-200 shrink-0"
-                title="Dismiss"
-              >✕</button>
-            </div>
-          )}
           <div className="space-y-1.5">
             {scenes.map((s) => (
               <ScenePlanRow
