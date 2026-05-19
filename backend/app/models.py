@@ -122,6 +122,15 @@ class Scene(SQLModel, table=True):
     align_to_beats: bool = Field(default=True)
     prompts_expanded: bool = Field(default=False)  # True once a prompt has been generated (planner or wand)
 
+    # Audio sync via Seedance reference-to-video (fal-routed).
+    # When True AND the chosen video_model has `supports_audio_input=True`
+    # (Seedance variants), the video gen submits to fal's R2V endpoint with
+    # the scene's audio window passed as audio_url + character portraits as
+    # image_urls. In this mode, first_frame is NOT used (Seedance R2V doesn't
+    # accept it) so the scene's reference still is skipped at render time.
+    # No effect on non-Seedance models — silently ignored.
+    audio_sync_enabled: bool = Field(default=False)
+
     # Scene chaining (opt-in, off by default).
     # When `chain_from_prev` is True, this scene's video generation uses the
     # PREVIOUS scene's extracted last frame as its first_frame_path instead

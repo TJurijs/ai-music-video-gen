@@ -3,12 +3,14 @@ import { Image as ImageIcon, Video } from "lucide-react";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { createPortal } from "react-dom";
 import type { Scene, Character } from "@/lib/types";
+import { fmt } from "./shared";
 
 export default function DescriptionWithPromptTooltip({
   scene,
   characters,
   videoModelLabel,
   videoModelUsesRefs,
+  audioSyncActive,
 }: {
   scene: Scene;
   characters?: Character[];
@@ -21,6 +23,10 @@ export default function DescriptionWithPromptTooltip({
   // are dropped at the OpenRouter passthrough layer. Drives the
   // "Sent to ..." summary so we don't lie about what reaches the model.
   videoModelUsesRefs?: boolean;
+  // Whether audio-sync is active on this scene (toggle + model supports it).
+  // When true, the request routes through fal Seedance R2V instead of
+  // OpenRouter I2V; no first_frame is sent, audio reference IS sent.
+  audioSyncActive?: boolean;
 }) {
   // Portal-rendered tooltip — necessary because the parent scene card uses
   // overflow-hidden (for rounded corners on the inner divider), which clips
@@ -133,45 +139,76 @@ export default function DescriptionWithPromptTooltip({
           onMouseEnter={cancelClose}
           onMouseLeave={scheduleClose}
         >
-          {/* Honest summary of what the OpenRouter video call will include.
-              Important context: character refs go in as `input_references`,
-              which are SOFT references — they bias the rendered output but
-              don't lock identity. If the first_frame doesn't show the
-              character's face, the model improvises. */}
-          <div className="mb-3 text-[10px] text-zinc-400 bg-zinc-500/10 border border-zinc-500/30 rounded px-2 py-1.5">
-            <div className="font-semibold text-zinc-300 mb-1">
-              Sent to {videoModelLabel || "OpenRouter"}:
+          {/* Honest summary of what the video call will include. Two routes:
+                - OpenRouter I2V (default): first_frame + (optional) refs.
+                - fal Seedance R2V (audio-sync ON): audio + refs, NO first_frame.
+              The text changes per route so the user knows what's actually sent. */}
+          <div className={`mb-3 text-[10px] ${audioSyncActive ? "text-fuchsia-200" : "text-zinc-400"} ${audioSyncActive ? "bg-fuchsia-500/10 border-fuchsia-500/30" : "bg-zinc-500/10 border-zinc-500/30"} border rounded px-2 py-1.5`}>
+            <div className="font-semibold mb-1" style={{ color: audioSyncActive ? "rgb(244 114 182)" : "rgb(212 212 216)" }}>
+              {audioSyncActive
+                ? `Sent to fal ${videoModelLabel || "Seedance"} R2V (audio-sync route):`
+                : `Sent to ${videoModelLabel || "OpenRouter"} (image-to-video route):`}
             </div>
             <ul className="space-y-0.5 leading-snug">
               <li>· video_prompt (verbatim, below)</li>
-              <li>
-                · first_frame ={" "}
-                {scene.chain_from_prev
-                  ? <span className="text-emerald-300">prev scene's extracted last frame (chained)</span>
-                  : scene.reference_image_url
-                    ? <span className="text-zinc-300">this scene's generated still</span>
-                    : <span className="text-amber-300">none (no still generated yet)</span>}
-              </li>
-              <li>
-                · input_references ={" "}
-                {videoModelUsesRefs === false
-                  ? <span className="text-zinc-500 italic">none (model doesn't use refs — skipped)</span>
-                  : charsActuallyPassed.length === 0
-                    ? <span className="text-zinc-500 italic">none</span>
-                    : (
-                      <span className="text-zinc-300">
-                        {charsActuallyPassed.map((c) => c.name).join(", ")}
-                        {" "}({charsActuallyPassed.length} portrait{charsActuallyPassed.length === 1 ? "" : "s"})
-                      </span>
-                    )}
-              </li>
+              {audioSyncActive ? (
+                <>
+                  <li>
+                    · audio_url ={" "}
+                    <span className="text-fuchsia-200">
+                      song slice {fmt(scene.audio_start)}–{fmt(scene.audio_end)} (trimmed ~150ms under video duration)
+                    </span>
+                  </li>
+                  <li>
+                    · first_frame ={" "}
+                    <span className="text-zinc-500 italic">none — Seedance R2V doesn't accept one</span>
+                  </li>
+                  <li>
+                    · reference_image_urls ={" "}
+                    {charsActuallyPassed.length === 0
+                      ? <span className="text-red-300">none — REQUIRED in R2V mode (mention a cast character with a portrait)</span>
+                      : (
+                        <span className="text-fuchsia-100">
+                          {charsActuallyPassed.map((c) => c.name).join(", ")}
+                          {" "}({charsActuallyPassed.length} portrait{charsActuallyPassed.length === 1 ? "" : "s"})
+                        </span>
+                      )}
+                  </li>
+                </>
+              ) : (
+                <>
+                  <li>
+                    · first_frame ={" "}
+                    {scene.chain_from_prev
+                      ? <span className="text-emerald-300">prev scene's extracted last frame (chained)</span>
+                      : scene.reference_image_url
+                        ? <span className="text-zinc-300">this scene's generated still</span>
+                        : <span className="text-amber-300">none (no still generated yet)</span>}
+                  </li>
+                  <li>
+                    · input_references ={" "}
+                    {videoModelUsesRefs === false
+                      ? <span className="text-zinc-500 italic">none (model doesn't use refs — skipped)</span>
+                      : charsActuallyPassed.length === 0
+                        ? <span className="text-zinc-500 italic">none</span>
+                        : (
+                          <span className="text-zinc-300">
+                            {charsActuallyPassed.map((c) => c.name).join(", ")}
+                            {" "}({charsActuallyPassed.length} portrait{charsActuallyPassed.length === 1 ? "" : "s"})
+                          </span>
+                        )}
+                  </li>
+                </>
+              )}
             </ul>
             <div className="mt-1 text-zinc-500">
-              {videoModelUsesRefs === false
-                ? `${videoModelLabel || "This model"} doesn't accept input_references on the OpenRouter route — character identity comes entirely from the first_frame. Switch to a Seedance variant if you need character-portrait identity anchoring.`
-                : scene.chain_from_prev || scene.reference_image_url
-                  ? "Seedance is running in image-to-video mode (a first_frame is present), so first_frame pixels DOMINATE the output. input_references are a soft hint (~30% weight) — they nudge style/identity but don't lock the face. If the first_frame shows the character from behind, the model invents the face on turn-around and refs alone often won't keep it consistent. To get the strong ~70% identity anchor, drop the first_frame (disable chaining + clear the scene still) so Seedance runs in reference-to-video mode."
-                  : "No first_frame attached — Seedance runs in reference-to-video mode. input_references are the primary identity anchor (~70% weight per ByteDance). Pose and composition come from the prompt; the model is free to invent them."}
+              {audioSyncActive
+                ? "Audio-sync route: character refs are the model's ONLY visual anchor (~70% identity weight per ByteDance R2V). The model composes the shot from scratch and lipsyncs the character to the audio when faces are visible. Costs ~6× the OpenRouter rate — use sparingly."
+                : videoModelUsesRefs === false
+                  ? `${videoModelLabel || "This model"} doesn't accept input_references on the OpenRouter route — character identity comes entirely from the first_frame. Switch to a Seedance variant if you need character-portrait identity anchoring.`
+                  : scene.chain_from_prev || scene.reference_image_url
+                    ? "Seedance I2V mode (first_frame present) — first_frame pixels dominate. input_references are a soft hint (~30% weight). For the strong ~70% identity anchor, enable audio-sync (the mic icon) or drop the first_frame."
+                    : "Seedance is running in reference-to-video mode. input_references are the primary identity anchor (~70% weight per ByteDance). Pose and composition come from the prompt."}
             </div>
           </div>
           {scene.video_prompt && (

@@ -39,6 +39,48 @@ def video_cost(
     return total, f"{name} · {duration_seconds}s × ${rate}/s @ {resolution}{suffix}"
 
 
+# Seedance reference-to-video via fal — separate cost matrix because fal's
+# pricing is ~6× the OpenRouter image-to-video route (the audio path is a
+# different product, not a feature toggle). Numbers from fal's pricing page;
+# update if their catalog moves. The OpenRouter `video_cost` above doesn't
+# apply here — different provider, different SKU.
+FAL_R2V_PRICING_USD_PER_SEC = {
+    # standard tier — bytedance/seedance-{1.5-pro,2.0}/reference-to-video
+    "standard": {
+        "480p":  0.18,
+        "720p":  0.30,
+        "1080p": 0.62,
+    },
+    # fast tier — bytedance/seedance-2.0-fast/reference-to-video
+    "fast": {
+        "480p": 0.09,
+        "720p": 0.15,
+    },
+}
+
+
+def video_cost_fal_seedance_r2v(
+    model_key: str,
+    duration_seconds: int,
+    resolution: str = "720p",
+) -> tuple[float, str]:
+    """Cost for Seedance reference-to-video via fal (the audio-sync path).
+
+    Distinct from `video_cost()` because the same model on OpenRouter (I2V)
+    vs fal (R2V) bills very differently. The user opted into this path by
+    setting `audio_sync_enabled=True` on the scene; we report what fal will
+    charge, not what OpenRouter would have charged for the I2V route.
+    """
+    cfg = VIDEO_MODELS.get(model_key, {})
+    is_fast = "fast" in model_key.lower()
+    tier = "fast" if is_fast else "standard"
+    table = FAL_R2V_PRICING_USD_PER_SEC[tier]
+    rate = table.get(resolution) or next(iter(table.values()))
+    total = round(rate * duration_seconds, 4)
+    name = cfg.get("name", model_key)
+    return total, f"{name} R2V (fal) · {duration_seconds}s × ${rate}/s @ {resolution} +audio"
+
+
 def music_cost(source: str) -> tuple[float, str]:
     if source == "suno":
         return MUSIC_SUNO_USD, "Suno V4 · 1 song"

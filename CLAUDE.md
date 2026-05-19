@@ -11,7 +11,14 @@ on this codebase, **read this end-to-end before making changes**.
 An AI-driven music-video studio. User uploads a song → backend extracts
 beats / sections / lyrics → LLM plans scenes → image model renders stills
 → video model animates them → ffmpeg assembles the final MP4 with the
-song muxed in. **Purely visual pipeline** — lipsync was removed in v1.
+song muxed in.
+
+**Two video routes**, picked per scene:
+- **OpenRouter image-to-video** (default) — sends a first_frame + optional
+  character refs. Cheap, no audio.
+- **fal Seedance reference-to-video** (opt-in via the mic toggle on scenes
+  that use Seedance variants) — sends a sliced audio clip + character refs.
+  No first_frame. Character "performs" the audio with lipsync. ~6× cost.
 
 **Stack:**
 - **Backend:** FastAPI + SQLModel + SQLite (one .db file in repo root)
@@ -262,16 +269,22 @@ service — that bypasses the audit trail and the mirror falls out of sync.
 
 ## Patterns to avoid — DO NOT add back
 
-### Lipsync / audio-sync paths
+### OmniHuman / post-process lipsync (LatentSync / MuseTalk / Wav2Lip)
 
-Tried fal Seedance reference-to-video with audio + fal OmniHuman; neither
-produced acceptable results on music vocals. **Removed in v1.** Do not
-reintroduce: the song's audio is muxed in verbatim at assembly time, and
-no video model on the OpenRouter route accepts audio reference anyway.
+These all got tried (fal OmniHuman, LatentSync, MuseTalk, Wav2Lip via
+the lipsync_model field, audio-sync via the audio_sync_enabled field on
+v0). OmniHuman has no separate character ref slot — useless for
+multi-character scenes. The post-process lipsync models produce visible
+artifacts on music vocals (sustained notes, vibrato). All removed.
 
-If a future Seedance variant on OpenRouter starts exposing audio-input
-support, that's worth revisiting — but the `audio_sync_enabled` field
-and the `_generate_video_fal_*` functions are gone for a reason.
+The CURRENT audio path uses Seedance reference-to-video on fal (NOT post-
+process). That endpoint takes audio as a synthesis input, not a per-frame
+overlay, so it produces coherent character performance instead of mouth-
+shape overlays. Enabled via `scene.audio_sync_enabled` + model with
+`supports_audio_input=True`. See "Two video routes" in the intro.
+
+Do not reintroduce the post-process lipsync path or OmniHuman. If you
+want lipsync on a scene, use the existing audio-sync toggle.
 
 ### Frame chaining via the video model's `last_frame`
 
@@ -363,11 +376,22 @@ User clicks "Img" on a scene
 User clicks "Vid" on a scene
   └─→ POST /generation/scene (phase="video")
       └─→ BackgroundTask: generation_service.generate_scene(phase="video")
-          ├─→ Resolve first_frame_path:
-          │     - chain_from_prev: prev_scene.extracted_last_frame_path
-          │     - else: scene.reference_image_path
-          ├─→ openrouter video submit + poll + download .mp4
-          ├─→ _extract_last_frame() → scene.extracted_last_frame_path
+          ├─→ Pick route based on scene.audio_sync_enabled + model caps:
+          │
+          │   AUDIO-SYNC route (audio_sync_enabled + supports_audio_input):
+          │     ├─→ Skip image gen (Seedance R2V doesn't accept first_frame)
+          │     ├─→ _extract_audio_segment: slice song[start..end], trim ~150ms
+          │     ├─→ Upload audio + char ref images to fal.storage
+          │     ├─→ fal Seedance R2V submit + poll + download .mp4
+          │     └─→ _extract_last_frame() → scene.extracted_last_frame_path
+          │
+          │   I2V route (default):
+          │     ├─→ Resolve first_frame_path:
+          │     │     - chain_from_prev: prev_scene.extracted_last_frame_path
+          │     │     - else: scene.reference_image_path
+          │     ├─→ openrouter video submit + poll + download .mp4
+          │     └─→ _extract_last_frame() → scene.extracted_last_frame_path
+          │
           └─→ _save_asset() via make_active()
 
 User clicks "Assemble final video"
@@ -395,7 +419,9 @@ FlowStudio
 
 Per-scene UI lives in `cells/generate/`:
 - `SceneGenRow.tsx` — the scene row (status pill, description, chain `🔗`,
-  wand `✨`, settings cog, delete `X`, clear-assets trash, frame slots)
+  wand `✨`, audio-sync mic toggle, settings cog, delete `X`, clear-assets
+  trash, frame slots). The mic toggle is visible only when the chosen
+  video model has `supports_audio_input` (Seedance variants).
 - `FrameSlot.tsx` — left/right slot for image / video
 - `DescriptionWithPromptTooltip.tsx` — hover preview of the prompts the
   model will see

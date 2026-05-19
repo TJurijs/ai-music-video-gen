@@ -1,10 +1,17 @@
-"""fal.ai client — minimal helpers for the one fal endpoint we still use:
-fal-ai/whisper (word-level lyric transcription, called from audio_analysis.py).
+"""fal.ai client — covers:
+  1) fal-ai/whisper (word-level lyric transcription, audio_analysis.py)
+  2) Seedance reference-to-video for the audio-sync route (per-scene opt-in
+     when scene.audio_sync_enabled and the video model has supports_audio_input).
 
-Audio-conditioned video gen + lipsync paths were removed; this file is now
-a thin wrapper around fal's queue API: upload a file, submit a job, poll
-until completion. If FAL_API_KEY isn't set, audio_analysis falls back to
-OpenRouter transcription (no word-level timestamps).
+The Seedance R2V endpoint accepts character reference images + an audio
+clip + a text prompt and renders video where the character "performs" the
+audio (lipsynced to the audio when faces are present). It does NOT take a
+first_frame — that's the trade-off vs OpenRouter's image-to-video route.
+Pricing: ~$0.30/s standard, ~$0.15/s fast at 720p, vs ~$0.05/s on OpenRouter.
+
+Post-process lipsync (LatentSync / MuseTalk / Wav2Lip / OmniHuman) and
+the OpenRouter image-to-video path live elsewhere — those are NOT in
+this file.
 
 All fal queue endpoints use the pattern:
   POST   https://queue.fal.run/{model_id}                 -> { request_id }
@@ -15,7 +22,9 @@ Storage upload uses two steps: initiate (signed URL) -> PUT bytes.
 """
 
 import asyncio
+import json
 import os
+from typing import Optional
 import httpx
 from app.config import settings
 
@@ -151,5 +160,112 @@ async def poll(submission: dict, timeout: int = 900, interval: int = 8) -> dict:
 
             await asyncio.sleep(interval)
     raise TimeoutError(f"fal job {request_id} timed out after {timeout}s")
+
+
+# ---------------------------------------------------------------------------
+# Result shape: pulling the rendered video URL out of fal's response
+# ---------------------------------------------------------------------------
+
+def extract_video_url(result: dict) -> Optional[str]:
+    """Find the rendered video URL in a fal response.
+
+    Different fal model variants surface the URL at different paths:
+      - Most: result["video"]["url"]
+      - Some: result["output"][0]["url"]
+      - Some: result["video_url"]
+    Rather than coding all of them, recursively search for the first
+    .mp4 / .mov / .webm URL in the response dict.
+    """
+    return _find_first_url(result, suffixes=(".mp4", ".mov", ".webm"))
+
+
+def _find_first_url(obj, suffixes: tuple[str, ...]) -> Optional[str]:
+    """Walk a nested dict/list and return the first string value that looks
+    like a URL ending in one of `suffixes`. Used by extract_video_url."""
+    if isinstance(obj, str):
+        if obj.startswith(("http://", "https://")) and any(obj.lower().split("?")[0].endswith(s) for s in suffixes):
+            return obj
+        return None
+    if isinstance(obj, dict):
+        for v in obj.values():
+            found = _find_first_url(v, suffixes)
+            if found:
+                return found
+        return None
+    if isinstance(obj, list):
+        for v in obj:
+            found = _find_first_url(v, suffixes)
+            if found:
+                return found
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Seedance reference-to-video (audio + character refs → video)
+# ---------------------------------------------------------------------------
+#
+# Endpoint shape (verified on fal.ai):
+#   POST https://queue.fal.run/{model_id}
+#   {
+#     "prompt": "<text>",
+#     "reference_image_urls": ["<character portrait>", ...],   # 1-9
+#     "audio_url": "<scene audio slice>",
+#     "duration": "<int seconds>",
+#     "resolution": "480p" | "720p" | "1080p",
+#     "aspect_ratio": "16:9" | "9:16" | ...,
+#   }
+#
+# Critical constraint: audio MUST be shorter than the requested video
+# duration. fal will 422 with "Audio cannot be longer than the duration of
+# the video" if it isn't. We slice the song's audio window then trim
+# ~150ms off the end to stay safely under. See _extract_audio_segment in
+# generation_service.py.
+#
+# This endpoint does NOT accept a first_frame — that's the entire trade-off
+# of taking the R2V (reference-to-video) route instead of I2V. Identity
+# anchoring comes from the character refs at ~70% weight per ByteDance's
+# own docs (much stronger than the soft-hint ~30% in I2V mode).
+
+async def submit_seedance_audio_video(
+    fal_model_id: str,
+    prompt: str,
+    reference_image_urls: list[str],
+    audio_url: str,
+    duration: int,
+    resolution: str = "720p",
+    aspect_ratio: str = "16:9",
+) -> dict:
+    """Submit a Seedance R2V job. Returns the submission dict (pass to poll()).
+
+    `fal_model_id` is the FULL queue path
+    (e.g. "bytedance/seedance-2.0/reference-to-video") — comes from the
+    VIDEO_MODELS entry's `fal_r2v_model_id` field.
+    """
+    payload = {
+        "prompt": prompt,
+        "reference_image_urls": reference_image_urls,
+        "audio_url": audio_url,
+        "duration": str(duration),  # fal expects string for this field
+        "resolution": resolution,
+        "aspect_ratio": aspect_ratio,
+    }
+    print(
+        f"[fal seedance r2v] submit model={fal_model_id} duration={duration}s "
+        f"resolution={resolution} aspect={aspect_ratio} "
+        f"refs={len(reference_image_urls)} prompt[:120]={prompt[:120]!r}"
+    )
+    return await submit(fal_model_id, payload)
+
+
+async def download_file(url: str, dest_path: str) -> None:
+    """Stream-download a remote file to dest_path. Used for the rendered
+    Seedance R2V .mp4. Idempotent: overwrites dest_path."""
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    async with httpx.AsyncClient(timeout=300) as client:
+        async with client.stream("GET", url) as r:
+            r.raise_for_status()
+            with open(dest_path, "wb") as f:
+                async for chunk in r.aiter_bytes(1 << 16):
+                    f.write(chunk)
 
 

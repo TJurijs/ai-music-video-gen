@@ -111,6 +111,7 @@ class SceneCreate(BaseModel):
     image_model: str = "gemini-3.1-flash-image"
     resolution: str = "720p"
     align_to_beats: bool = True
+    audio_sync_enabled: bool = False
     lyrics_segment: Optional[str] = None
 
 
@@ -125,6 +126,7 @@ class SceneUpdate(BaseModel):
     image_model: Optional[str] = None
     resolution: Optional[str] = None
     align_to_beats: Optional[bool] = None
+    audio_sync_enabled: Optional[bool] = None
     lyrics_segment: Optional[str] = None
     chain_from_prev: Optional[bool] = None
 

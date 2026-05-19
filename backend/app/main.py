@@ -48,6 +48,11 @@ def _apply_schema_migrations():
         "scene": {
             "chain_from_prev": "BOOLEAN NOT NULL DEFAULT 0",
             "extracted_last_frame_path": "VARCHAR",
+            # audio_sync_enabled was retired then reintroduced (Seedance R2V
+            # path). On fresh DBs SQLModel.create_all makes this column; on
+            # DBs that went through the v1 cleanup it was dropped, so this
+            # entry re-creates it. DEFAULT 0 keeps existing rows valid.
+            "audio_sync_enabled": "BOOLEAN NOT NULL DEFAULT 0",
         },
         "project": {
             "story_seed": "VARCHAR",
@@ -59,12 +64,13 @@ def _apply_schema_migrations():
     # Columns retired in v1. Old DBs may have them as NOT NULL, which
     # breaks INSERTs because the application no longer writes a value.
     # Drop them on startup. Listed explicitly per-table — no auto-inference.
+    # NOTE: audio_sync_enabled was originally retired but came back when
+    # Seedance audio-sync was reintroduced; it's no longer in this list.
     retired = {
         "scene": [
             "lipsync_model",
             "lipsync_path",
             "lipsync_enabled",
-            "audio_sync_enabled",
             "generate_audio",
         ],
     }

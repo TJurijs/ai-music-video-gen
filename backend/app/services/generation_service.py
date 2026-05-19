@@ -1,22 +1,34 @@
 """Generation orchestrator: image → video per scene.
 
-Video generation goes through OpenRouter (all supported models live there).
-Runs as a FastAPI BackgroundTask.
+Two video paths, picked per scene:
 
-The pipeline is purely visual — lipsync / audio-sync features were tried
-(fal Seedance reference-to-video, fal OmniHuman) but produced poor results
-on music-vocal audio and were removed. The song's audio is muxed in
-verbatim at the assembly stage.
+1) OpenRouter image-to-video (default) — most scenes. Sends a first_frame
+   (the scene's reference still or, when chained, the prev scene's
+   extracted last frame) + optional input_references (Seedance only) to
+   OpenRouter's /videos endpoint. Cheap, no audio.
+
+2) fal Seedance reference-to-video (opt-in via `scene.audio_sync_enabled`)
+   — only available when the chosen video model has
+   `supports_audio_input=True` (Seedance variants). Sends a sliced audio
+   clip + character refs to fal's R2V endpoint. No first_frame — the
+   model owns composition entirely. Costs ~6× more per second but the
+   character "performs" the audio (lipsynced when faces are present),
+   which OpenRouter's I2V route can't do.
+
+Other lipsync paths (post-process via OmniHuman / LatentSync / etc) were
+explored and removed; the song's audio is otherwise muxed verbatim at the
+assembly stage. Runs as a FastAPI BackgroundTask.
 """
 
 import json
 import os
 import re
+import subprocess
 from datetime import datetime
 from sqlmodel import Session, select
 from app.config import settings, VIDEO_MODELS
-from app.models import Scene, SceneAsset, GenerationJob, Project, Character
-from app.services import openrouter, pricing
+from app.models import Scene, SceneAsset, GenerationJob, Project, Character, Song
+from app.services import openrouter, fal_client, pricing
 from app.services.versioning import make_active
 
 
@@ -200,21 +212,29 @@ async def _run_pipeline(scene: Scene, db: Session, engine, phase: str = "all") -
         db.add(scene); db.commit()
         return
 
-    # phases "video" and "all" normally generate a reference image first —
-    # UNLESS the scene is chained from the previous, in which case the prev
-    # scene's extracted last frame replaces the planned still anyway when
-    # we submit to the video model. Generating a still here would be wasted
-    # work and waste an image-gen credit. Skip straight to video.
-    if not scene.reference_image_path and not scene.chain_from_prev:
-        await _generate_image(scene, db)
-        if _check_cancelled(engine, scene.id):
-            raise asyncio.CancelledError()
+    # Decide which video route to take BEFORE deciding whether to gen an
+    # image. The fal R2V (audio-sync) route doesn't accept a first_frame
+    # at all, so generating one would be wasted work and wasted spend.
+    use_audio_sync = (
+        scene.audio_sync_enabled
+        and bool(model_cfg.get("supports_audio_input"))
+        and bool(model_cfg.get("fal_r2v_model_id"))
+    )
 
-    # All video gen goes through OpenRouter. Pipeline is purely visual —
-    # audio-sync / lipsync features were explored (fal Seedance ref-to-video,
-    # fal OmniHuman) but didn't produce usable results on music audio, so
-    # they were removed.
-    await _generate_video_openrouter(scene, db, model_cfg, engine=engine)
+    if use_audio_sync:
+        # fal R2V path: no first_frame at all → skip image gen entirely.
+        # Character refs still go in via the model's reference_image_urls
+        # field; the model owns composition because there's no anchor frame.
+        await _generate_video_fal_seedance_audio(scene, db, model_cfg, engine=engine)
+    else:
+        # OpenRouter I2V path. Generate a reference still unless one already
+        # exists OR the scene is chained from the previous (prev's extracted
+        # last frame replaces the planned still at submit time).
+        if not scene.reference_image_path and not scene.chain_from_prev:
+            await _generate_image(scene, db)
+            if _check_cancelled(engine, scene.id):
+                raise asyncio.CancelledError()
+        await _generate_video_openrouter(scene, db, model_cfg, engine=engine)
 
     scene.status = "done"
     db.add(scene)
@@ -413,6 +433,211 @@ async def _generate_video_openrouter(scene: Scene, db: Session, model_cfg: dict,
     finally:
         job.completed_at = datetime.utcnow()
         db.add(job); db.add(scene); db.commit()
+
+
+# ---------------------------------------------------------------------------
+# fal Seedance reference-to-video (audio-sync path, per-scene opt-in)
+# ---------------------------------------------------------------------------
+
+async def _generate_video_fal_seedance_audio(
+    scene: Scene, db: Session, model_cfg: dict, engine=None,
+) -> None:
+    """Video gen via fal's Seedance reference-to-video endpoint.
+
+    Used ONLY when scene.audio_sync_enabled AND the model has both
+    supports_audio_input=True and a fal_r2v_model_id. The decision happens
+    in `_run_pipeline`; this function trusts that gate.
+
+    Submits a SHORT audio slice + character refs to fal's R2V endpoint. No
+    first_frame in this mode (the endpoint doesn't accept one). The model
+    composes the shot itself with audio as a strong driver — character
+    "performs" the audio when faces are present.
+
+    Audio constraint: fal rejects audio that's >= video duration. We slice
+    the scene's window from the song and trim ~150ms off the end to land
+    safely under. _extract_audio_segment does the slicing.
+    """
+    if not settings.fal_api_key:
+        raise RuntimeError(
+            "Audio-sync requires FAL_API_KEY in .env — the fal Seedance R2V "
+            "endpoint isn't reachable via OpenRouter. Add the key or turn "
+            "off audio-sync on this scene."
+        )
+
+    scene.status = "generating_video"
+    db.add(scene); db.commit()
+
+    fal_model_id = model_cfg["fal_r2v_model_id"]
+
+    raw_duration = int(round(scene.audio_end - scene.audio_start))
+    durations = model_cfg.get("durations") or [model_cfg.get("max_duration", 8)]
+    duration = _closest_supported(raw_duration, durations)
+
+    supported_res = model_cfg.get("resolutions") or ["720p"]
+    resolution = scene.resolution if scene.resolution in supported_res else supported_res[0]
+
+    project = db.get(Project, scene.project_id)
+    aspect_ratio = project.aspect_ratio if project else "16:9"
+    if aspect_ratio not in (model_cfg.get("aspects") or []):
+        aspect_ratio = (model_cfg.get("aspects") or ["16:9"])[0]
+
+    # Build the prompt + style suffix (same as OpenRouter route).
+    prompt = scene.video_prompt or scene.description or "Cinematic music video shot"
+    prompt = _append_style(prompt, db, scene.project_id)
+
+    # Character refs — these go into image_urls (R2V's analog of OpenRouter's
+    # input_references). Same name-match heuristic as the OpenRouter path
+    # but we don't gate on `supports_reference_images` because R2V REQUIRES
+    # at least one image_url. If no named char has a portrait, that's an
+    # error the user has to fix.
+    char_ref_paths = _find_character_references(scene, db, prompt)
+    if not char_ref_paths:
+        raise RuntimeError(
+            "Audio-sync (Seedance R2V) requires at least one character "
+            "portrait — the fal endpoint takes no first_frame, so character "
+            "refs are the ONLY visual input. Mention a cast character in "
+            "the prompt AND make sure that character has a portrait."
+        )
+
+    # Slice the scene's audio window from the song. fal needs a public URL
+    # so we upload after slicing.
+    audio_path = await _extract_audio_segment(
+        scene, db,
+        max_duration=duration - 0.15,  # leave ~150ms under video duration
+    )
+
+    # Upload audio + each char ref to fal.storage in parallel.
+    import asyncio as _asyncio
+    upload_tasks = [
+        fal_client.upload_file(audio_path),
+        *[fal_client.upload_file(p) for p in char_ref_paths],
+    ]
+    uploaded = await _asyncio.gather(*upload_tasks)
+    audio_url = uploaded[0]
+    char_ref_urls = list(uploaded[1:])
+
+    cost, detail = pricing.video_cost_fal_seedance_r2v(
+        scene.video_model, duration, resolution,
+    )
+    detail += f" + {len(char_ref_urls)} char ref(s)"
+
+    job = _create_job(db, scene, "video", "fal", cost, detail)
+    try:
+        submission = await fal_client.submit_seedance_audio_video(
+            fal_model_id=fal_model_id,
+            prompt=prompt,
+            reference_image_urls=char_ref_urls,
+            audio_url=audio_url,
+            duration=duration,
+            resolution=resolution,
+            aspect_ratio=aspect_ratio,
+        )
+        request_id = submission.get("request_id")
+        scene.openrouter_job_id = request_id  # field is now generic "external job ID"
+        job.external_id = request_id
+        job.status = "running"
+        db.add(scene); db.add(job); db.commit()
+
+        # Cancel-aware poll. fal_client.poll doesn't accept a cancel
+        # callback today; we use a long timeout and rely on the user
+        # restarting the scene rather than killing the upstream job.
+        result = await fal_client.poll(submission, timeout=900, interval=8)
+        video_url = fal_client.extract_video_url(result)
+        if not video_url:
+            raise RuntimeError(
+                f"fal Seedance R2V returned no .mp4 URL in the response. "
+                f"Full body: {str(result)[:600]}"
+            )
+
+        ts = int(datetime.utcnow().timestamp())
+        dest = _storage(scene.project_id, "videos", f"scene_{scene.id}_{ts}.mp4")
+        await fal_client.download_file(video_url, dest)
+
+        _save_asset(
+            db, scene, "video", dest,
+            model_used=scene.video_model, cost_usd=cost, cost_detail=detail,
+            metadata={
+                "duration": duration, "resolution": resolution,
+                "aspect": aspect_ratio,
+                "provider": "fal",
+                "route": "seedance-r2v",
+                "audio_synced": True,
+                "char_refs": len(char_ref_urls),
+            },
+        )
+
+        # Extract the actual last frame — same as the OpenRouter path —
+        # so downstream chaining works even when this scene used R2V.
+        last_frame_dest = _storage(
+            scene.project_id, "extracted", f"scene_{scene.order}_last.jpg",
+        )
+        if _extract_last_frame(dest, last_frame_dest):
+            scene.extracted_last_frame_path = last_frame_dest
+
+        job.status = "completed"
+        job.result_url = video_url
+        job.result_path = dest
+    except Exception as e:
+        job.status = "failed"; job.error = str(e); raise
+    finally:
+        job.completed_at = datetime.utcnow()
+        db.add(job); db.add(scene); db.commit()
+
+
+async def _extract_audio_segment(
+    scene: Scene, db: Session, max_duration: float | None = None,
+) -> str:
+    """Slice the scene's audio window from the project's song into an MP3.
+
+    Caller passes `max_duration` to cap the slice — fal's Seedance R2V
+    rejects audio that's >= the video duration, so we trim ~150ms under.
+    Idempotent per (scene_id, start, end) — same window → same filename →
+    reusable across retries.
+    """
+    song = db.exec(select(Song).where(Song.project_id == scene.project_id)).first()
+    if not song or not song.file_path:
+        raise RuntimeError(
+            "No song file on disk for this project — can't slice audio. "
+            "Re-upload or re-generate the song before using audio-sync."
+        )
+
+    start = round(scene.audio_start, 2)
+    end = round(scene.audio_end, 2)
+    natural_dur = max(0.0, end - start)
+    duration = min(natural_dur, max_duration) if max_duration is not None else natural_dur
+    if duration <= 0:
+        raise RuntimeError(
+            f"Scene {scene.id} has audio_start={start} >= audio_end={end}; "
+            f"can't slice a non-positive duration."
+        )
+
+    dest = _storage(
+        scene.project_id, "audio_segments",
+        f"scene_{scene.id}_{start}-{end}_d{duration:.3f}.mp3",
+    )
+    # Skip re-running ffmpeg if the file's already on disk for this exact window.
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        print(f"[audio slice] scene {scene.id}: reusing cached {dest}")
+        return dest
+
+    cmd = [
+        "ffmpeg", "-y", "-v", "error",
+        "-ss", f"{start}",
+        "-t", f"{duration}",
+        "-i", song.file_path,
+        "-acodec", "libmp3lame", "-q:a", "2",
+        dest,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if proc.returncode != 0 or not os.path.exists(dest):
+        raise RuntimeError(
+            f"ffmpeg failed to slice scene audio: {(proc.stderr or '')[-400:]}"
+        )
+    print(
+        f"[audio slice] scene {scene.id}: {duration:.2f}s from {start:.2f}s → {end:.2f}s "
+        f"out of song={song.file_path} → {dest}"
+    )
+    return dest
 
 
 def _closest_supported(value: int, options: list[int]) -> int:

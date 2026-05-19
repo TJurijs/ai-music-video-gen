@@ -143,6 +143,12 @@ export interface Scene {
   resolution: string;
   align_to_beats: boolean;
   prompts_expanded: boolean;
+  // Audio-sync (fal Seedance reference-to-video). When true AND the
+  // chosen video_model has supports_audio_input=true, the backend
+  // routes through fal R2V instead of OpenRouter I2V: scene's audio
+  // window is sliced from the song and sent with character refs; no
+  // first_frame is used in this mode. No-op on other models.
+  audio_sync_enabled?: boolean;
   // Scene chaining: when on, video gen uses the PREVIOUS scene's extracted
   // last frame as this scene's first_frame for pixel-perfect seams.
   chain_from_prev?: boolean;
@@ -191,6 +197,11 @@ export type VideoTier = "debug" | "cheap" | "mid" | "premium";
 export interface VideoModel {
   name: string;
   model_id: string;
+  // When set, the audio-sync toggle on a scene with this model becomes
+  // available: backend routes video gen through fal's R2V endpoint (the
+  // path that accepts an audio reference + character refs and rejects
+  // first_frame). Only set on Seedance variants today.
+  fal_r2v_model_id?: string;
   tier: VideoTier;
   tagline: string;
   durations: number[];
@@ -199,9 +210,15 @@ export interface VideoModel {
   supports_first_frame: boolean;
   supports_last_frame: boolean;
   supports_reference_images: boolean;
+  // True if `audio_sync_enabled` on a scene with this model takes effect.
+  // Mirrors backend config's supports_audio_input — drives the mic toggle
+  // visibility on the scene row.
+  supports_audio_input?: boolean;
   // Pricing matrix kept as { with_audio, without_audio } for backward compat
   // with existing OpenRouter pricing_skus snapshots. We always pay the
-  // without_audio rate (the song's audio is muxed in at assembly time).
+  // without_audio rate on the OpenRouter route (audio is muxed at
+  // assembly). The fal R2V route has its own pricing — see
+  // backend/app/services/pricing.py video_cost_fal_seedance_r2v.
   pricing: Record<string, { with_audio: number; without_audio: number }>;
   max_duration: number;
   note?: string;

@@ -1,6 +1,6 @@
 "use client";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Image as ImageIcon, Video, Settings, Square, Trash2, Link2, Download, Wand2, Loader2, X } from "lucide-react";
+import { Image as ImageIcon, Video, Mic2, Settings, Square, Trash2, Link2, Download, Wand2, Loader2, X } from "lucide-react";
 import { useState } from "react";
 import { api } from "@/lib/api";
 import { useConfirm } from "@/components/ConfirmDialog";
@@ -73,7 +73,7 @@ export default function SceneGenRow({
   const [showImage, setShowImage] = useState(false);
 
   const updateModel = useMutation({
-    mutationFn: (data: { video_model?: string; image_model?: string; resolution?: string; chain_from_prev?: boolean }) =>
+    mutationFn: (data: { video_model?: string; image_model?: string; resolution?: string; chain_from_prev?: boolean; audio_sync_enabled?: boolean }) =>
       api.scenes.update(scene.id, data),
     onSuccess: onRefresh,
   });
@@ -135,11 +135,21 @@ export default function SceneGenRow({
   const canChain = scene.order >= 1;
   const chainActive = !!scene.chain_from_prev && canChain;
   const hasChainFrame = chainActive && !!prevScene?.extracted_last_frame_url;
-  const canGenerateVideo = hasImage || hasChainFrame;
 
-  // All video gen routes through OpenRouter — fal/audio-sync paths retired.
+  // Video routing — most scenes go through OpenRouter (I2V). When the
+  // chosen model has supports_audio_input AND scene.audio_sync_enabled,
+  // the backend routes through fal's R2V endpoint instead. R2V doesn't
+  // use a first_frame, so the image slot / chain frame don't matter
+  // for canGenerateVideo in audio-sync mode.
   const videoModelCfg = models?.video?.[scene.video_model];
-  const nextVideoProvider = "openrouter";
+  const modelSupportsAudio = !!videoModelCfg?.supports_audio_input;
+  const audioSyncActive = !!scene.audio_sync_enabled && modelSupportsAudio;
+  const nextVideoProvider = audioSyncActive ? "fal" : "openrouter";
+  // In audio-sync mode the model doesn't need a first_frame; the video
+  // gen button should be enabled as long as the user has picked a model.
+  // (At backend time we still require at least one named character ref;
+  // we surface that as a render-time error rather than disabling the button.)
+  const canGenerateVideo = audioSyncActive ? true : (hasImage || hasChainFrame);
 
   const activeVideoAsset = videoAssets.find((a) => a.is_active);
   // Pull the recorded provider from the active video asset's metadata_json.
@@ -192,6 +202,7 @@ export default function SceneGenRow({
           characters={project?.characters}
           videoModelLabel={models?.video?.[scene.video_model]?.name || scene.video_model}
           videoModelUsesRefs={!!models?.video?.[scene.video_model]?.supports_reference_images}
+          audioSyncActive={audioSyncActive}
         />
         {/* "Chain to next" icon. Click meanings:
               - No next scene exists → creates scene N+1 (empty prompts,
@@ -251,6 +262,34 @@ export default function SceneGenRow({
             {continuationPrompt.isPending
               ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
               : <Wand2 className="w-3.5 h-3.5" />}
+          </button>
+        )}
+        {/* Audio-sync toggle — Seedance reference-to-video path. Visible
+            only when the chosen video model has supports_audio_input
+            (Seedance variants on the OpenRouter route).
+            When ON:
+              - Backend routes video gen through fal R2V (NOT OpenRouter).
+              - first_frame is NOT used (Seedance R2V doesn't accept one),
+                so the image slot becomes informational only.
+              - At least one named cast character must have a portrait;
+                the model uses those as image_urls + audio as audio_url.
+              - Per-second cost is ~6× the OpenRouter rate. */}
+        {modelSupportsAudio && (
+          <button
+            onClick={() => updateModel.mutate({ audio_sync_enabled: !audioSyncActive })}
+            disabled={updateModel.isPending}
+            className={`shrink-0 p-1 rounded transition-colors ${
+              audioSyncActive
+                ? "bg-fuchsia-500/20 text-fuchsia-300 hover:bg-fuchsia-500/30 ring-1 ring-fuchsia-500/40"
+                : "text-zinc-500 hover:text-fuchsia-300"
+            } disabled:opacity-50`}
+            title={
+              audioSyncActive
+                ? `Audio sync ON. Video gen routes through fal Seedance reference-to-video: this scene's audio is sliced from the song and passed as audio reference; character portraits are passed as visual refs. NO first_frame is used (Seedance R2V doesn't accept one). Click to disable.`
+                : `Audio sync OFF. Click to enable — video gen routes through fal Seedance R2V instead of OpenRouter I2V. The scene's audio window becomes the model's audio reference (character "performs" the audio with lipsync when faces are visible). first_frame is skipped; identity comes from character portraits alone. Costs ~6× the OpenRouter rate.`
+            }
+          >
+            <Mic2 className="w-3.5 h-3.5" />
           </button>
         )}
         {song && (
@@ -426,15 +465,17 @@ export default function SceneGenRow({
               label={imageAssets.length > 0 ? "+ Img" : "Img"}
               icon={<ImageIcon className="w-3 h-3" />}
               running={scene.status === "generating_image"}
-              disabled={generate.isPending || isRunning}
+              disabled={generate.isPending || isRunning || audioSyncActive}
               currentModel={scene.image_model}
               options={models?.image ? Object.entries(models.image).map(([k, m]) => ({ key: k, label: m.name })) : []}
               onClickMain={() => generate.mutate({ phase: "image", force: hasImage })}
               onPickModel={(key) => updateModel.mutate({ image_model: key })}
               colorClasses="bg-blue-500/15 hover:bg-blue-500/30 text-blue-300 border-blue-500/30"
-              title={imageAssets.length > 0
-                ? "Generate another image variant — keeps prior versions"
-                : "Generate reference still"}
+              title={audioSyncActive
+                ? "Disabled — audio-sync mode (fal Seedance R2V) doesn't use a first_frame. Disable the mic toggle to enable image generation."
+                : imageAssets.length > 0
+                  ? "Generate another image variant — keeps prior versions"
+                  : "Generate reference still"}
             />
           }
         />
