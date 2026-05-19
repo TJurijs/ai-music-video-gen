@@ -204,33 +204,39 @@ def _find_first_url(obj, suffixes: tuple[str, ...]) -> Optional[str]:
 # Seedance reference-to-video (audio + character refs → video)
 # ---------------------------------------------------------------------------
 #
-# Endpoint shape (verified on fal.ai):
+# Endpoint shape (verified on fal.ai 2026-05):
 #   POST https://queue.fal.run/{model_id}
 #   {
 #     "prompt": "<text>",
-#     "reference_image_urls": ["<character portrait>", ...],   # 1-9
-#     "audio_url": "<scene audio slice>",
-#     "duration": "<int seconds>",
-#     "resolution": "480p" | "720p" | "1080p",
-#     "aspect_ratio": "16:9" | "9:16" | ...,
+#     "image_urls": ["<character portrait>", ...],   # 1-9
+#     "audio_urls": ["<scene audio slice>"],         # up to 3
+#     "duration": "<int seconds as string>" | "auto",
+#     "resolution": "480p" | "720p" | "1080p" | "auto",
+#     "aspect_ratio": "16:9" | "9:16" | ... | "auto",
+#     "generate_audio": false,  # we supply our own audio; don't synthesize more
 #   }
 #
-# Critical constraint: audio MUST be shorter than the requested video
-# duration. fal will 422 with "Audio cannot be longer than the duration of
-# the video" if it isn't. We slice the song's audio window then trim
-# ~150ms off the end to stay safely under. See _extract_audio_segment in
-# generation_service.py.
+# Path note: the model_id path uses `/fast/` (not `-fast`) for the cheap
+# variant. Live slugs:
+#   bytedance/seedance-2.0/reference-to-video
+#   bytedance/seedance-2.0/fast/reference-to-video
+# Collapsing to `seedance-2.0-fast/reference-to-video` 404s with
+# "Application 'seedance-2.0-fast' not found".
 #
-# This endpoint does NOT accept a first_frame — that's the entire trade-off
-# of taking the R2V (reference-to-video) route instead of I2V. Identity
-# anchoring comes from the character refs at ~70% weight per ByteDance's
-# own docs (much stronger than the soft-hint ~30% in I2V mode).
+# Audio constraint: audio MUST be shorter than the requested video
+# duration. fal 422s with "Audio cannot be longer than the duration of
+# the video" otherwise. We trim ~150ms in _extract_audio_segment.
+#
+# This endpoint does NOT accept a first_frame — that's the trade-off vs
+# OpenRouter I2V. Identity anchoring comes from image_urls (~70% weight
+# per ByteDance R2V docs), much stronger than the ~30% soft hint refs
+# get in I2V mode.
 
 async def submit_seedance_audio_video(
     fal_model_id: str,
     prompt: str,
-    reference_image_urls: list[str],
-    audio_url: str,
+    image_urls: list[str],
+    audio_urls: list[str],
     duration: int,
     resolution: str = "720p",
     aspect_ratio: str = "16:9",
@@ -240,19 +246,29 @@ async def submit_seedance_audio_video(
     `fal_model_id` is the FULL queue path
     (e.g. "bytedance/seedance-2.0/reference-to-video") — comes from the
     VIDEO_MODELS entry's `fal_r2v_model_id` field.
+
+    `image_urls` / `audio_urls` are plural by design: Seedance R2V takes
+    up to 9 reference images and up to 3 audio clips. We pass one audio
+    clip (the scene's window) and one or more character portraits.
     """
     payload = {
         "prompt": prompt,
-        "reference_image_urls": reference_image_urls,
-        "audio_url": audio_url,
-        "duration": str(duration),  # fal expects string for this field
+        "image_urls": image_urls,
+        "audio_urls": audio_urls,
+        # duration goes as a numeric string per fal's docs (their default
+        # "auto" is also a string, so the field is string-typed).
+        "duration": str(duration),
         "resolution": resolution,
         "aspect_ratio": aspect_ratio,
+        # We provide audio explicitly — don't let the model add MORE audio
+        # on top. The song's audio is muxed verbatim at assembly time.
+        "generate_audio": False,
     }
     print(
         f"[fal seedance r2v] submit model={fal_model_id} duration={duration}s "
         f"resolution={resolution} aspect={aspect_ratio} "
-        f"refs={len(reference_image_urls)} prompt[:120]={prompt[:120]!r}"
+        f"image_urls={len(image_urls)} audio_urls={len(audio_urls)} "
+        f"prompt[:120]={prompt[:120]!r}"
     )
     return await submit(fal_model_id, payload)
 

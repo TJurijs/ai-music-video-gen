@@ -485,11 +485,12 @@ async def _generate_video_fal_seedance_audio(
     prompt = scene.video_prompt or scene.description or "Cinematic music video shot"
     prompt = _append_style(prompt, db, scene.project_id)
 
-    # Character refs — these go into image_urls (R2V's analog of OpenRouter's
-    # input_references). Same name-match heuristic as the OpenRouter path
-    # but we don't gate on `supports_reference_images` because R2V REQUIRES
-    # at least one image_url. If no named char has a portrait, that's an
-    # error the user has to fix.
+    # Character refs go into Seedance R2V's `image_urls` field (analog of
+    # OpenRouter's input_references). Same name-match heuristic as the
+    # OpenRouter path. We don't gate on `supports_reference_images` because
+    # R2V REQUIRES at least one image_url — there's no first_frame to fall
+    # back on. If no named character has a portrait, that's an error the
+    # user has to fix.
     char_ref_paths = _find_character_references(scene, db, prompt)
     if not char_ref_paths:
         raise RuntimeError(
@@ -526,8 +527,8 @@ async def _generate_video_fal_seedance_audio(
         submission = await fal_client.submit_seedance_audio_video(
             fal_model_id=fal_model_id,
             prompt=prompt,
-            reference_image_urls=char_ref_urls,
-            audio_url=audio_url,
+            image_urls=char_ref_urls,
+            audio_urls=[audio_url],
             duration=duration,
             resolution=resolution,
             aspect_ratio=aspect_ratio,

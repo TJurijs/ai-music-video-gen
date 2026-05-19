@@ -49,7 +49,9 @@ VIDEO_MODELS = {
     "seedance-1.5-pro": {
         "name": "Seedance 1.5 Pro (Debug)",
         "model_id": "bytedance/seedance-1-5-pro",
-        "fal_r2v_model_id": "bytedance/seedance-1.5-pro/reference-to-video",
+        # No fal R2V endpoint exists for Seedance 1.5 — fal only publishes
+        # the 2.0 family (plus its fast variant). The OpenRouter I2V path
+        # for 1.5 still works as a draft model.
         "tier": "debug",
         "tagline": "Pipeline testing — pennies per clip",
         "durations": list(range(4, 13)),  # 4 through 12
@@ -58,10 +60,6 @@ VIDEO_MODELS = {
         "supports_first_frame": True,
         "supports_last_frame": True,
         "supports_reference_images": True,
-        # When True, the user can flip audio_sync_enabled on this scene to
-        # route video gen through fal's reference-to-video endpoint (with
-        # the scene's audio slice + character refs, no first_frame).
-        "supports_audio_input": True,
         # Token-priced at $0.0000012 (no audio) / $0.0000024 (with audio) per token.
         # Approximate per-second rates assuming ~24fps and typical token density.
         "pricing": {
@@ -98,7 +96,14 @@ VIDEO_MODELS = {
     "seedance-2.0": {
         "name": "Seedance 2.0",
         "model_id": "bytedance/seedance-2.0",
+        # fal app slug — note the path uses `/fast/` and `/reference-to-video`
+        # as SEPARATE segments after the app id. Don't collapse to
+        # `seedance-2.0-fast/...` (that 404s with "Application not found").
         "fal_r2v_model_id": "bytedance/seedance-2.0/reference-to-video",
+        # When True, the user can flip audio_sync_enabled on this scene to
+        # route video gen through fal's reference-to-video endpoint (with
+        # the scene's audio slice + character refs, no first_frame).
+        "supports_audio_input": True,
         "tier": "cheap",
         "tagline": "Strong character consistency, all 7 aspect ratios",
         "durations": list(range(4, 16)),  # 4 through 15
@@ -107,7 +112,6 @@ VIDEO_MODELS = {
         "supports_first_frame": True,
         "supports_last_frame": True,
         "supports_reference_images": True,
-        "supports_audio_input": True,
         # Token-priced; approximate per-second rates based on typical 24fps render.
         # (OpenRouter charges $0.000007 per video token; tokens scale with res×duration.)
         "pricing": {
@@ -121,7 +125,10 @@ VIDEO_MODELS = {
     "seedance-2.0-fast": {
         "name": "Seedance 2.0 Fast",
         "model_id": "bytedance/seedance-2.0-fast",
-        "fal_r2v_model_id": "bytedance/seedance-2.0-fast/reference-to-video",
+        # fal slug: the model lives under the 2.0 app namespace with /fast/
+        # as a sub-segment, NOT as `seedance-2.0-fast` (that 404s).
+        "fal_r2v_model_id": "bytedance/seedance-2.0/fast/reference-to-video",
+        "supports_audio_input": True,
         "tier": "cheap",
         "tagline": "Same look as Seedance 2.0, half the price — for drafting",
         "durations": list(range(4, 11)),  # 4 through 10
@@ -130,7 +137,6 @@ VIDEO_MODELS = {
         "supports_first_frame": True,
         "supports_last_frame": True,
         "supports_reference_images": True,
-        "supports_audio_input": True,
         "pricing": {
             "480p": {"with_audio": 0.012, "without_audio": 0.012},
             "720p": {"with_audio": 0.025, "without_audio": 0.025},
