@@ -22,11 +22,24 @@ async def lifespan(app: FastAPI):
 
 
 def _apply_schema_migrations():
-    """Add columns that the current model defines but the existing SQLite
-    database is missing. `SQLModel.metadata.create_all()` only creates new
-    tables — it doesn't ALTER existing ones to add new fields. Without this
-    hook, adding a new field to a SQLModel class would silently fail until
-    you nuke the database.
+    """Reconcile the existing SQLite schema with the current SQLModel classes.
+
+    Two directions:
+
+    1) ADDITIONS: columns the current model defines but the DB is missing.
+       SQLModel's `create_all()` only creates new TABLES, not new columns
+       on existing ones. We `ALTER TABLE ADD COLUMN` for the gap.
+
+    2) REMOVALS: columns that EXIST in the DB but were dropped from the
+       model. SQLite tolerates orphan columns on SELECT, but enforces any
+       NOT NULL constraint on INSERT — so an old NOT NULL column the
+       application no longer supplies a value for will 500 every insert.
+       For SQLite >= 3.35 (March 2021) we can `ALTER TABLE DROP COLUMN`
+       directly; the bundled sqlite3 module ships >= 3.40 on Python 3.11+.
+
+    Removals are conservative — only drop columns we KNOW were retired
+    (i.e. listed here explicitly), never inferred. Adding the wrong name
+    here would silently delete a user's data.
     """
     from sqlalchemy import inspect, text
     from app.database import engine as _engine
@@ -43,9 +56,23 @@ def _apply_schema_migrations():
             "description": "VARCHAR",
         },
     }
+    # Columns retired in v1. Old DBs may have them as NOT NULL, which
+    # breaks INSERTs because the application no longer writes a value.
+    # Drop them on startup. Listed explicitly per-table — no auto-inference.
+    retired = {
+        "scene": [
+            "lipsync_model",
+            "lipsync_path",
+            "lipsync_enabled",
+            "audio_sync_enabled",
+            "generate_audio",
+        ],
+    }
     insp = inspect(_engine)
     added: list[str] = []
+    dropped: list[str] = []
     with _engine.begin() as conn:
+        # ─── Additions ────────────────────────────────────────────────
         for table, cols in expected.items():
             if not insp.has_table(table):
                 continue
@@ -54,8 +81,31 @@ def _apply_schema_migrations():
                 if col_name not in existing:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def}"))
                     added.append(f"{table}.{col_name}")
+        # ─── Removals (DROP COLUMN, SQLite 3.35+) ─────────────────────
+        for table, cols in retired.items():
+            if not insp.has_table(table):
+                continue
+            existing = {c["name"] for c in insp.get_columns(table)}
+            for col_name in cols:
+                if col_name in existing:
+                    try:
+                        conn.execute(text(f'ALTER TABLE {table} DROP COLUMN "{col_name}"'))
+                        dropped.append(f"{table}.{col_name}")
+                    except Exception as e:
+                        # If we're on a pre-3.35 SQLite the DROP fails; the
+                        # NOT NULL constraint on the orphan column will then
+                        # break INSERTs. Surface the failure loudly so the
+                        # user knows to upgrade Python (which bundles sqlite).
+                        print(
+                            f"[startup] WARNING: couldn't drop retired column "
+                            f"{table}.{col_name}: {e}. Existing INSERTs may "
+                            f"fail with NOT NULL constraint errors. Update "
+                            f"Python (or sqlite3) to >= 3.35."
+                        )
     if added:
         print(f"[startup] schema migration added: {', '.join(added)}")
+    if dropped:
+        print(f"[startup] schema migration dropped retired columns: {', '.join(dropped)}")
 
 
 def _backfill_portrait_descriptions():
