@@ -465,14 +465,16 @@ export default function SceneGenRow({
               label={imageAssets.length > 0 ? "+ Img" : "Img"}
               icon={<ImageIcon className="w-3 h-3" />}
               running={scene.status === "generating_image"}
-              disabled={generate.isPending || isRunning || audioSyncActive}
+              disabled={generate.isPending || isRunning}
               currentModel={scene.image_model}
               options={models?.image ? Object.entries(models.image).map(([k, m]) => ({ key: k, label: m.name })) : []}
               onClickMain={() => generate.mutate({ phase: "image", force: hasImage })}
               onPickModel={(key) => updateModel.mutate({ image_model: key })}
               colorClasses="bg-blue-500/15 hover:bg-blue-500/30 text-blue-300 border-blue-500/30"
               title={audioSyncActive
-                ? "Disabled — audio-sync mode (fal Seedance R2V) doesn't use a first_frame. Disable the mic toggle to enable image generation."
+                ? imageAssets.length > 0
+                  ? "Generate another image variant — passed to fal Seedance R2V as one of the reference images (along with character portraits)."
+                  : "Generate a reference still — in audio-sync mode it goes into Seedance R2V's image_urls as a compositional reference (not a strict first_frame)."
                 : imageAssets.length > 0
                   ? "Generate another image variant — keeps prior versions"
                   : "Generate reference still"}

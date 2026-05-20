@@ -212,28 +212,28 @@ async def _run_pipeline(scene: Scene, db: Session, engine, phase: str = "all") -
         db.add(scene); db.commit()
         return
 
-    # Decide which video route to take BEFORE deciding whether to gen an
-    # image. The fal R2V (audio-sync) route doesn't accept a first_frame
-    # at all, so generating one would be wasted work and wasted spend.
+    # Decide which video route to take.
     use_audio_sync = (
         scene.audio_sync_enabled
         and bool(model_cfg.get("supports_audio_input"))
         and bool(model_cfg.get("fal_r2v_model_id"))
     )
 
+    # Gen the reference still in BOTH routes (unless one already exists, or
+    # we're chaining from the prev scene). In OpenRouter I2V it becomes the
+    # first_frame; in fal Seedance R2V it goes into image_urls as another
+    # reference image alongside the character portraits. R2V doesn't treat
+    # it specially — Seedance gets up to 9 reference images and the planned
+    # still is one of them, giving the model compositional/style anchoring
+    # on top of the character identity refs.
+    if not scene.reference_image_path and not scene.chain_from_prev:
+        await _generate_image(scene, db)
+        if _check_cancelled(engine, scene.id):
+            raise asyncio.CancelledError()
+
     if use_audio_sync:
-        # fal R2V path: no first_frame at all → skip image gen entirely.
-        # Character refs still go in via the model's reference_image_urls
-        # field; the model owns composition because there's no anchor frame.
         await _generate_video_fal_seedance_audio(scene, db, model_cfg, engine=engine)
     else:
-        # OpenRouter I2V path. Generate a reference still unless one already
-        # exists OR the scene is chained from the previous (prev's extracted
-        # last frame replaces the planned still at submit time).
-        if not scene.reference_image_path and not scene.chain_from_prev:
-            await _generate_image(scene, db)
-            if _check_cancelled(engine, scene.id):
-                raise asyncio.CancelledError()
         await _generate_video_openrouter(scene, db, model_cfg, engine=engine)
 
     scene.status = "done"
@@ -485,20 +485,58 @@ async def _generate_video_fal_seedance_audio(
     prompt = scene.video_prompt or scene.description or "Cinematic music video shot"
     prompt = _append_style(prompt, db, scene.project_id)
 
-    # Character refs go into Seedance R2V's `image_urls` field (analog of
-    # OpenRouter's input_references). Same name-match heuristic as the
-    # OpenRouter path. We don't gate on `supports_reference_images` because
-    # R2V REQUIRES at least one image_url — there's no first_frame to fall
-    # back on. If no named character has a portrait, that's an error the
-    # user has to fix.
+    # Build the list of reference images Seedance R2V will see. The model
+    # accepts up to 9 image_urls and treats them all as references with no
+    # "first frame" semantics — it composes the shot itself, biased by
+    # whichever images it sees. We pack the list in this order:
+    #
+    #   1. Scene first-frame source (chained prev's last frame, OR this
+    #      scene's planned still). Gives compositional + setting anchor.
+    #   2. Character portraits for any cast member named in the prompt.
+    #      Provides identity anchor (~70% weight per ByteDance docs).
+    #
+    # At least ONE image is required by fal — if no first-frame source AND
+    # no named character with a portrait, we surface an actionable error.
+    image_ref_paths: list[str] = []
+
+    # 1) First-frame source
+    if scene.chain_from_prev:
+        prev_scene = db.exec(select(Scene).where(
+            Scene.project_id == scene.project_id,
+            Scene.order == scene.order - 1,
+        )).first()
+        if prev_scene and prev_scene.extracted_last_frame_path and os.path.exists(
+            prev_scene.extracted_last_frame_path
+        ):
+            image_ref_paths.append(prev_scene.extracted_last_frame_path)
+    elif scene.reference_image_path and os.path.exists(scene.reference_image_path):
+        image_ref_paths.append(scene.reference_image_path)
+
+    # 2) Character portraits
     char_ref_paths = _find_character_references(scene, db, prompt)
-    if not char_ref_paths:
+    image_ref_paths.extend(char_ref_paths)
+
+    if not image_ref_paths:
         raise RuntimeError(
-            "Audio-sync (Seedance R2V) requires at least one character "
-            "portrait — the fal endpoint takes no first_frame, so character "
-            "refs are the ONLY visual input. Mention a cast character in "
-            "the prompt AND make sure that character has a portrait."
+            "Audio-sync (Seedance R2V) needs at least one reference image. "
+            "Either generate this scene's reference still (click Img), or "
+            "mention a cast character with a portrait in the prompt. The "
+            "fal endpoint doesn't accept a first_frame, but it does take "
+            "up to 9 image_urls — your still and character portraits both "
+            "go in there as references."
         )
+
+    # fal caps image_urls at 9 — if we'd exceed it, drop excess character
+    # refs (the first-frame source and the FIRST few characters are most
+    # important). Realistically this never trips with our 1-frame + ~3
+    # characters projects.
+    if len(image_ref_paths) > 9:
+        print(
+            f"[fal seedance r2v] capping image_urls at 9 (had "
+            f"{len(image_ref_paths)}); dropping the last "
+            f"{len(image_ref_paths) - 9}"
+        )
+        image_ref_paths = image_ref_paths[:9]
 
     # Slice the scene's audio window from the song. fal needs a public URL
     # so we upload after slicing.
@@ -507,27 +545,28 @@ async def _generate_video_fal_seedance_audio(
         max_duration=duration - 0.15,  # leave ~150ms under video duration
     )
 
-    # Upload audio + each char ref to fal.storage in parallel.
+    # Upload audio + each image ref to fal.storage in parallel.
     import asyncio as _asyncio
     upload_tasks = [
         fal_client.upload_file(audio_path),
-        *[fal_client.upload_file(p) for p in char_ref_paths],
+        *[fal_client.upload_file(p) for p in image_ref_paths],
     ]
     uploaded = await _asyncio.gather(*upload_tasks)
     audio_url = uploaded[0]
-    char_ref_urls = list(uploaded[1:])
+    image_ref_urls = list(uploaded[1:])
 
     cost, detail = pricing.video_cost_fal_seedance_r2v(
         scene.video_model, duration, resolution,
     )
-    detail += f" + {len(char_ref_urls)} char ref(s)"
+    n_frame = 1 if (scene.chain_from_prev or scene.reference_image_path) and len(image_ref_paths) > len(char_ref_paths) else 0
+    detail += f" + {n_frame} still + {len(char_ref_paths)} char ref(s)"
 
     job = _create_job(db, scene, "video", "fal", cost, detail)
     try:
         submission = await fal_client.submit_seedance_audio_video(
             fal_model_id=fal_model_id,
             prompt=prompt,
-            image_urls=char_ref_urls,
+            image_urls=image_ref_urls,
             audio_urls=[audio_url],
             duration=duration,
             resolution=resolution,
@@ -563,7 +602,9 @@ async def _generate_video_fal_seedance_audio(
                 "provider": "fal",
                 "route": "seedance-r2v",
                 "audio_synced": True,
-                "char_refs": len(char_ref_urls),
+                "image_refs": len(image_ref_urls),
+                "char_refs": len(char_ref_paths),
+                "frame_ref_included": len(image_ref_paths) > len(char_ref_paths),
             },
         )
 

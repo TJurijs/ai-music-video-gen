@@ -154,25 +154,41 @@ export default function DescriptionWithPromptTooltip({
               {audioSyncActive ? (
                 <>
                   <li>
-                    · audio_url ={" "}
+                    · audio_urls[0] ={" "}
                     <span className="text-fuchsia-200">
                       song slice {fmt(scene.audio_start)}–{fmt(scene.audio_end)} (trimmed ~150ms under video duration)
                     </span>
                   </li>
                   <li>
-                    · first_frame ={" "}
-                    <span className="text-zinc-500 italic">none — Seedance R2V doesn't accept one</span>
+                    · image_urls ={" "}
+                    {(() => {
+                      const frameSource = scene.chain_from_prev
+                        ? "prev scene's extracted last frame"
+                        : scene.reference_image_url
+                          ? "this scene's generated still"
+                          : null;
+                      const items: React.ReactNode[] = [];
+                      if (frameSource) {
+                        items.push(<span key="f" className="text-fuchsia-100">{frameSource}</span>);
+                      }
+                      if (charsActuallyPassed.length > 0) {
+                        items.push(
+                          <span key="c" className="text-fuchsia-100">
+                            {charsActuallyPassed.map((c) => c.name).join(", ")}
+                            {" "}({charsActuallyPassed.length} portrait{charsActuallyPassed.length === 1 ? "" : "s"})
+                          </span>
+                        );
+                      }
+                      if (items.length === 0) {
+                        return <span className="text-red-300">none — REQUIRED. Generate a still (click Img) or mention a cast character with a portrait.</span>;
+                      }
+                      // Render items separated by " + "
+                      return items.reduce((acc, el, i) => i === 0 ? [el] : [...acc as any, <span key={`s${i}`} className="text-zinc-500"> + </span>, el], [] as React.ReactNode[]);
+                    })()}
                   </li>
-                  <li>
-                    · reference_image_urls ={" "}
-                    {charsActuallyPassed.length === 0
-                      ? <span className="text-red-300">none — REQUIRED in R2V mode (mention a cast character with a portrait)</span>
-                      : (
-                        <span className="text-fuchsia-100">
-                          {charsActuallyPassed.map((c) => c.name).join(", ")}
-                          {" "}({charsActuallyPassed.length} portrait{charsActuallyPassed.length === 1 ? "" : "s"})
-                        </span>
-                      )}
+                  <li className="text-zinc-500 italic">
+                    · no first_frame — Seedance R2V doesn't have that concept;
+                    all images above are treated as compositional/style/identity references.
                   </li>
                 </>
               ) : (
@@ -203,7 +219,7 @@ export default function DescriptionWithPromptTooltip({
             </ul>
             <div className="mt-1 text-zinc-500">
               {audioSyncActive
-                ? "Audio-sync route: character refs are the model's ONLY visual anchor (~70% identity weight per ByteDance R2V). The model composes the shot from scratch and lipsyncs the character to the audio when faces are visible. Costs ~6× the OpenRouter rate — use sparingly."
+                ? "Audio-sync route: Seedance R2V composes the shot using the audio + all image_urls as combined references. Character portraits give the ~70% identity anchor per ByteDance docs; the scene's still (when present) adds compositional / setting anchor without being a strict first_frame. The model lipsyncs the character to the audio when faces are visible. Costs ~6× the OpenRouter rate."
                 : videoModelUsesRefs === false
                   ? `${videoModelLabel || "This model"} doesn't accept input_references on the OpenRouter route — character identity comes entirely from the first_frame. Switch to a Seedance variant if you need character-portrait identity anchoring.`
                   : scene.chain_from_prev || scene.reference_image_url

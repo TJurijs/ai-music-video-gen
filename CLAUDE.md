@@ -17,8 +17,11 @@ song muxed in.
 - **OpenRouter image-to-video** (default) — sends a first_frame + optional
   character refs. Cheap, no audio.
 - **fal Seedance reference-to-video** (opt-in via the mic toggle on scenes
-  that use Seedance variants) — sends a sliced audio clip + character refs.
-  No first_frame. Character "performs" the audio with lipsync. ~6× cost.
+  that use Seedance variants) — sends a sliced audio clip + up to 9
+  reference images (the scene's planned still / chained last frame +
+  character portraits — all bundled into `image_urls`). No first_frame
+  concept; Seedance treats every image_url as a reference, no anchor
+  semantics. Character "performs" the audio with lipsync. ~6× cost.
 
 **Stack:**
 - **Backend:** FastAPI + SQLModel + SQLite (one .db file in repo root)
@@ -379,9 +382,13 @@ User clicks "Vid" on a scene
           ├─→ Pick route based on scene.audio_sync_enabled + model caps:
           │
           │   AUDIO-SYNC route (audio_sync_enabled + supports_audio_input):
-          │     ├─→ Skip image gen (Seedance R2V doesn't accept first_frame)
+          │     ├─→ Gen image if missing (becomes one of the R2V reference
+          │     │   images — Seedance has no first_frame concept, so the
+          │     │   still goes into image_urls alongside character portraits)
+          │     ├─→ Build image_urls: [first-frame-source, ...char portraits]
+          │     │   capped at 9 (fal limit)
           │     ├─→ _extract_audio_segment: slice song[start..end], trim ~150ms
-          │     ├─→ Upload audio + char ref images to fal.storage
+          │     ├─→ Upload audio + all image refs to fal.storage
           │     ├─→ fal Seedance R2V submit + poll + download .mp4
           │     └─→ _extract_last_frame() → scene.extracted_last_frame_path
           │
