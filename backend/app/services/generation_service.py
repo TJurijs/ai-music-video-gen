@@ -98,6 +98,30 @@ def _storage(project_id: int, *parts) -> str:
     return path
 
 
+def _probe_duration(path: str) -> float | None:
+    """Return the exact duration of an audio/video file in seconds (via
+    ffprobe), or None if ffprobe isn't available or the file is unreadable.
+
+    Used by the audio-sync route to diagnose duration drift — e.g. when
+    fal returns a 9s clip after we asked for 15s, the audio file's actual
+    length explains it (the song ended before the requested window did)."""
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode != 0:
+            return None
+        return float(proc.stdout.strip())
+    except Exception:
+        return None
+
+
 def _extract_last_frame(video_path: str, dest_path: str) -> bool:
     """Extract the last frame of `video_path` to `dest_path` as a JPG.
 
@@ -545,6 +569,21 @@ async def _generate_video_fal_seedance_audio(
         max_duration=duration - 0.15,  # leave ~150ms under video duration
     )
 
+    # Probe the actual on-disk audio duration. This is the most common
+    # cause of "I asked for 15s but got 9s out of Seedance R2V": the song
+    # ended before the scene window did, so ffmpeg's slice is shorter than
+    # requested, and the model caps the video to match the audio.
+    audio_actual_dur = _probe_duration(audio_path)
+    if audio_actual_dur is not None and audio_actual_dur < (duration - 0.3):
+        # The slice is meaningfully shorter than we asked for — log a
+        # warning so the user sees the cap reason in the backend output.
+        print(
+            f"[fal seedance r2v] WARNING scene {scene.id}: requested duration "
+            f"{duration}s but audio slice is only {audio_actual_dur:.2f}s long. "
+            f"The song probably ended before the scene window did. fal will "
+            f"likely cap the rendered video to ~{audio_actual_dur:.1f}s."
+        )
+
     # Upload audio + each image ref to fal.storage in parallel.
     import asyncio as _asyncio
     upload_tasks = [
@@ -593,11 +632,28 @@ async def _generate_video_fal_seedance_audio(
         dest = _storage(scene.project_id, "videos", f"scene_{scene.id}_{ts}.mp4")
         await fal_client.download_file(video_url, dest)
 
+        # Probe the actual rendered duration. If it's noticeably shorter
+        # than what we requested, the metadata makes the cause obvious in
+        # the UI (and the backend log surfaces it on the spot).
+        rendered_dur = _probe_duration(dest)
+        if rendered_dur is not None and rendered_dur < (duration - 0.3):
+            print(
+                f"[fal seedance r2v] scene {scene.id}: requested {duration}s, "
+                f"got {rendered_dur:.2f}s rendered. "
+                f"Audio slice was {audio_actual_dur or '?'}s — likely the cap."
+            )
+
         _save_asset(
             db, scene, "video", dest,
             model_used=scene.video_model, cost_usd=cost, cost_detail=detail,
             metadata={
-                "duration": duration, "resolution": resolution,
+                "duration": duration,
+                # Actual on-disk duration of the rendered video. When this
+                # is < `duration`, audio was the limiting factor (fal caps
+                # video to audio length when audio is provided).
+                "rendered_duration": round(rendered_dur, 2) if rendered_dur else None,
+                "audio_duration": round(audio_actual_dur, 2) if audio_actual_dur else None,
+                "resolution": resolution,
                 "aspect": aspect_ratio,
                 "provider": "fal",
                 "route": "seedance-r2v",
