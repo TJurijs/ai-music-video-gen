@@ -1,6 +1,6 @@
 "use client";
 import { useMutation } from "@tanstack/react-query";
-import { Loader2, Image as ImageIcon, AlertCircle, Check, Square, Wand2 } from "lucide-react";
+import { Loader2, Image as ImageIcon, AlertCircle, Check, Square, Wand2, X } from "lucide-react";
 import { useState } from "react";
 import { api } from "@/lib/api";
 import type { Scene } from "@/lib/types";
@@ -14,7 +14,18 @@ export function Badge({ children, tone = "default" }: { children: React.ReactNod
   return <span className={`text-[9px] px-1.5 py-0.5 rounded ${cls}`}>{children}</span>;
 }
 
-export function SceneErrorBanner({ scene, onSoftened }: { scene: Scene; onSoftened: () => void }) {
+export function SceneErrorBanner({
+  scene,
+  onSoftened,
+  onDismissed,
+}: {
+  scene: Scene;
+  onSoftened: () => void;
+  // Fired after the user dismisses the error banner. Parent should
+  // refresh so the row's red border + banner disappear once the
+  // backend resets scene.status / scene.error_message.
+  onDismissed?: () => void;
+}) {
   const [expanded, setExpanded] = useState(false);
   const err = scene.error_message || "";
   // Heuristic: did the model reject for content-policy reasons?
@@ -31,6 +42,20 @@ export function SceneErrorBanner({ scene, onSoftened }: { scene: Scene; onSoften
     onSuccess: onSoftened,
   });
   const softenErr = soften.error instanceof Error ? soften.error.message : null;
+
+  // Dismiss = "I've read this, clear the banner so I can move on."
+  // Doesn't touch assets — just resets scene.status (from "error" to
+  // whatever the on-disk state warrants) and clears error_message.
+  // Other scenes were never blocked by this row, so the user can
+  // continue generating elsewhere immediately. The only caveat is
+  // downstream chained scenes that need THIS scene's last frame —
+  // those still need a successful render here, dismissing won't
+  // unblock them.
+  const dismiss = useMutation({
+    mutationFn: () => api.scenes.dismissError(scene.id),
+    onSuccess: () => onDismissed?.(),
+  });
+  const dismissErr = dismiss.error instanceof Error ? dismiss.error.message : null;
 
   return (
     <div className="px-3 py-2 bg-red-900/15 border-b border-red-900/40 space-y-1">
@@ -49,7 +74,20 @@ export function SceneErrorBanner({ scene, onSoftened }: { scene: Scene; onSoften
             </button>
           )}
         </div>
+        <button
+          onClick={() => dismiss.mutate()}
+          disabled={dismiss.isPending}
+          className="text-red-400/60 hover:text-red-200 shrink-0 disabled:opacity-50"
+          title="Dismiss this error and reset the row. Doesn't delete any assets — just clears the red banner so you can retry or move on. (Downstream chained scenes still need this scene to render successfully; dismissing won't unblock them.)"
+        >
+          {dismiss.isPending
+            ? <Loader2 className="w-3 h-3 animate-spin" />
+            : <X className="w-3 h-3" />}
+        </button>
       </div>
+      {dismissErr && (
+        <p className="text-red-300 text-[9px]">Dismiss failed: {dismissErr.slice(0, 200)}</p>
+      )}
       {isContentFilter && (
         <div className="bg-amber-900/20 border border-amber-700/40 rounded px-2 py-1.5 text-[10px] text-amber-200/90 space-y-1.5">
           <p>

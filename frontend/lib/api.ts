@@ -206,6 +206,13 @@ export const api = {
         `/scenes/${id}/clear`,
         { method: "POST" },
       ),
+    // Clear the red error banner on a scene WITHOUT touching its assets.
+    // Resets scene.status based on what's actually on disk (done if there's
+    // a video, image_ready if just a still, pending otherwise). Use when
+    // the user wants to acknowledge an error and move on — other scenes are
+    // never blocked by an errored sibling, but the visual noise can be.
+    dismissError: (id: number) =>
+      request<Scene>(`/scenes/${id}/dismiss-error`, { method: "POST" }),
     softenPrompt: (id: number, field: "video_prompt" | "image_prompt", llm_model?: string) =>
       request<Scene>(`/scenes/${id}/soften-prompt`, {
         method: "POST",

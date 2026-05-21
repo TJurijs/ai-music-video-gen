@@ -384,6 +384,7 @@ export default function SceneGenRow({
         <SceneErrorBanner
           scene={scene}
           onSoftened={onRefresh}
+          onDismissed={onRefresh}
         />
       )}
       {continuationErr && (

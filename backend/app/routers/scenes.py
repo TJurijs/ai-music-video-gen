@@ -900,6 +900,42 @@ async def soften_scene_prompt(
     return _scene_with_urls(scene, db)
 
 
+@router.post("/{scene_id}/dismiss-error")
+def dismiss_scene_error(scene_id: int, db: Session = Depends(get_session)):
+    """Clear a scene's error banner without touching its assets.
+
+    Sets `scene.error_message=None` and resets `scene.status` to whatever
+    the scene's on-disk state actually warrants:
+      - has video → "done"  (the error was on a retry after success — the
+        clip is still there, the error is from a later attempt)
+      - has only image → "image_ready"
+      - nothing on disk → "pending"
+
+    Doesn't delete assets, doesn't touch prompts. Just stops the row from
+    shouting red — the user can retry generation independently. Other
+    scenes were never blocked by this scene's error (they can still
+    generate); this is purely a UI/state cleanup. (Exception: scenes
+    chained from THIS one still need this scene's `extracted_last_frame_path`
+    to exist — dismissing the error doesn't change that, the user would
+    have to either retry-and-succeed here, or disable chain on the
+    downstream scene.)
+    """
+    scene = db.get(Scene, scene_id)
+    if not scene:
+        raise HTTPException(404, "Scene not found")
+    import os as _os
+    if scene.video_path and _os.path.exists(scene.video_path):
+        scene.status = "done"
+    elif scene.reference_image_path and _os.path.exists(scene.reference_image_path):
+        scene.status = "image_ready"
+    else:
+        scene.status = "pending"
+    scene.error_message = None
+    scene.cancel_requested = False  # also clear any stale cancel flag
+    db.add(scene); db.commit(); db.refresh(scene)
+    return _scene_with_urls(scene, db)
+
+
 @router.post("/{scene_id}/clear")
 def clear_scene(scene_id: int, db: Session = Depends(get_session)):
     """Wipe all generated assets for a scene (images, videos + files on disk)
