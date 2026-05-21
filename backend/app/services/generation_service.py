@@ -315,16 +315,46 @@ async def _generate_image(scene: Scene, db: Session) -> None:
 
 
 def _find_character_references(scene: Scene, db: Session, prompt: str) -> list[str]:
-    """Return reference image paths for any characters whose name appears in the prompt."""
+    """Return reference image paths for any characters whose name appears in
+    ANY of: the supplied prompt (usually video_prompt), the scene's
+    image_prompt, or its description.
+
+    Why all three: when a scene is rewritten to use "they" / "the trio" /
+    "she" in the motion prompt (video_prompt) but still names characters
+    in the still composition (image_prompt), the names exist in the scene
+    record — just not in the field we'd otherwise inspect. Without
+    matching against all three, a user who writes pronoun-heavy video
+    prompts gets ZERO character refs passed, which on the audio-sync
+    (R2V) route means the model has no identity anchor at all.
+
+    Also matches single tokens of multi-word names (e.g. "Elias" matches
+    a character named "Elias Thorne"), since people commonly drop surnames
+    in dialogue-style prompts.
+    """
     chars = db.exec(
         select(Character).where(Character.project_id == scene.project_id)
     ).all()
-    haystack = f"{prompt} {scene.description or ''}".lower()
+    haystack = " ".join([
+        prompt or "",
+        scene.image_prompt or "",
+        scene.description or "",
+    ]).lower()
     refs: list[str] = []
     for c in chars:
-        if c.reference_image_path and os.path.exists(c.reference_image_path):
-            if c.name.lower() in haystack:
-                refs.append(c.reference_image_path)
+        if not c.reference_image_path or not os.path.exists(c.reference_image_path):
+            continue
+        name = (c.name or "").lower().strip()
+        if not name:
+            continue
+        # Match full name OR any individual token (single-word names match
+        # themselves; multi-word names like "Elias Thorne" also match
+        # bare "Elias").
+        matched = (
+            name in haystack
+            or any(tok and tok in haystack for tok in name.split())
+        )
+        if matched:
+            refs.append(c.reference_image_path)
     return refs
 
 

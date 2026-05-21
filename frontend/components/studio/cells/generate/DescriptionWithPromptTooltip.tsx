@@ -99,19 +99,27 @@ export default function DescriptionWithPromptTooltip({
 
   const hasPrompts = !!(scene.video_prompt || scene.image_prompt);
 
-  // Compute which characters will actually be passed to the video model as
-  // `input_references` (OpenRouter's name for subject references). Mirror
-  // backend's `_find_character_references` exactly: name (case-insensitive
-  // substring) appears in the scene's prompt or description, AND the
-  // character has an active portrait. The model receives these images as
-  // visual references — NOT a hard identity lock, NOT addressed via tokens
-  // (Seedance / Kling / Veo on OpenRouter don't use @Image tokens — that
-  // convention was fal-only). They influence the output but don't override
-  // what's in the first_frame.
-  const haystack = `${scene.video_prompt || ""} ${scene.description || ""}`.toLowerCase();
+  // Compute which characters will actually be passed to the video model.
+  // Mirror backend's `_find_character_references` EXACTLY — checking all
+  // three fields (video_prompt + image_prompt + description) and matching
+  // either the full name or any single-token of a multi-word name.
+  //
+  // Why this matters: when a user (or our own prompt rewrites) replaces
+  // names with "the trio" / "they" / "she" in the motion prompt, the
+  // image_prompt usually still names the characters in the still
+  // composition. Matching only against video_prompt would drop those
+  // refs and the audio-sync (R2V) route would have no identity anchor.
+  const haystack = [
+    scene.video_prompt || "",
+    scene.image_prompt || "",
+    scene.description || "",
+  ].join(" ").toLowerCase();
   const charsActuallyPassed = (characters || []).filter((c) => {
     if (!c.reference_image_url) return false;
-    return c.name.toLowerCase().split(/\s+/).some((part) => part && haystack.includes(part));
+    const name = (c.name || "").toLowerCase().trim();
+    if (!name) return false;
+    if (haystack.includes(name)) return true;
+    return name.split(/\s+/).some((part) => part && haystack.includes(part));
   });
 
   const swappedVideo = scene.video_prompt;

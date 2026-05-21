@@ -27,8 +27,15 @@ export default function CharacterRefsBadge({ scene }: { scene: Scene }) {
   if (allChars.length === 0) return null;
 
   const haystack = `${scene.video_prompt || ""} ${scene.image_prompt || ""} ${scene.description || ""}`.toLowerCase();
-  const isNamed = (c: Character) =>
-    !!c.name && haystack.includes(c.name.toLowerCase());
+  // Match the full name OR any single-word token (so "Elias" matches a
+  // character named "Elias Thorne"). Mirrors the backend's
+  // _find_character_references in generation_service.py.
+  const isNamed = (c: Character) => {
+    const name = (c.name || "").toLowerCase().trim();
+    if (!name) return false;
+    if (haystack.includes(name)) return true;
+    return name.split(/\s+/).some((part) => part && haystack.includes(part));
+  };
   // Final "actually passed to model" requires all three conditions —
   // including that the model uses refs at all on this route.
   const willBePassed = (c: Character) =>
