@@ -57,6 +57,48 @@ Hard rules — non-negotiable:
 5. Video_prompt = observable verbs only. Body verbs, camera moves, environment shifts. NO emotion words.
 6. Always name characters in BOTH prompts — never "she" / "the singer" / "the figure".
 
+CRITICAL — image_prompt and video_prompt MUST AGREE within a single scene.
+The image is rendered FIRST and becomes the literal first_frame of the
+video. The video model then animates the motion described in video_prompt
+STARTING FROM THOSE PIXELS. Contradictions between the two get rendered
+as visible glitches (the image shows day, the video describes night —
+the model either ignores half the video_prompt or morphs jarringly).
+
+Before emitting each scene, verify these match between the two prompts:
+- **Setting**: same place, same architecture, same key props. If video
+  says "walks through the corridor", image must show a corridor.
+- **Time of day + weather**: same. Day + sunny image / night + rain video
+  is a contradiction. Pick one and put it in both.
+- **Cast on screen**: every character the video_prompt names doing
+  something must be PRESENT in the image_prompt's composition. Don't
+  introduce a new character mid-video.
+- **Wardrobe**: same outfit / hair / accessories described in both. If
+  image says "auburn hair, leather jacket", video says the same.
+- **Starting pose**: image shows the pose the video's first action will
+  flow FROM. If video says "Lena turns her head", image shows Lena's
+  head in the pre-turn position (e.g. facing away). If video says
+  "kneels down", image shows standing (not already kneeling).
+- **Framing**: image's camera framing matches the video's STARTING
+  framing. If video says "the camera dollies in from wide to close",
+  image is a wide shot. If video opens on close-up, image is close-up.
+- **Props the video uses**: any object the video mentions (gun, glass,
+  cigarette, photograph) must be VISIBLE in the image.
+
+If the lyric pulls in two different concrete images (e.g. "fire" and
+"rain"), pick ONE for this scene's image — the one the on-screen action
+will interact with — and put the other in the next scene. Don't split
+within a single scene.
+
+GOOD vs BAD alignment:
+  ✗ BAD: image_prompt "Lena sits at a sunlit cafe table"
+         video_prompt "Lena walks through neon-lit rain at night"
+         (different place + time + weather + pose — model can't render this)
+  ✓ GOOD: image_prompt "Lena (auburn, leather jacket) stands at the
+          alley's mouth, facing into magenta neon and slanting rain"
+          video_prompt "Lena steps forward into the alley as the rain
+          intensifies; camera pushes in slowly"
+          (same place, weather, time, framing — motion flows from the pose)
+
 Respond ONLY with a valid JSON array of scene objects."""
 
 SCENE_PLAN_USER = """Song: "{title}" {artist_line}
@@ -934,6 +976,27 @@ video_prompt — the MOTION within this single shot:
 - Camera movement + body action + environment shift, paced to {duration_seconds or "the scene's"}s
 - Resolve within the shot — don't try to land on the next scene's pose
 - NO emotional or internal descriptions — just what the camera sees
+
+CRITICAL — image_prompt and video_prompt MUST AGREE.
+The image is rendered first and becomes the literal first_frame of the
+video. Contradictions get rendered as visible glitches (model either
+ignores half the video_prompt or morphs jarringly between the two).
+
+Verify these match between the two prompts before you emit:
+- Setting / location / architecture: same.
+- Time of day + weather: same. Don't pair sunny image with rainy video.
+- Cast on screen: every character the video_prompt names doing
+  something must be present in the image_prompt's composition.
+- Wardrobe / hair / accessories: same details described in both.
+- Starting pose: image shows the pose the video's first action flows
+  FROM (not the pose at the end of the motion). "Video: walks toward
+  camera" → image: standing still, facing camera, in the starting
+  position. "Video: turns head and looks toward camera" → image:
+  head facing away (the pre-turn state).
+- Framing: image's framing matches the video's STARTING framing. If
+  video opens wide then dollies in, image is wide.
+- Props the video interacts with (gun, glass, cigarette, photograph)
+  must be visible in the image.
 
 Example output (single-beat scene):
 {{
