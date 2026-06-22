@@ -60,12 +60,13 @@ VIDEO_MODELS = {
         "supports_first_frame": True,
         "supports_last_frame": True,
         "supports_reference_images": True,
-        # Token-priced at $0.0000012 (no audio) / $0.0000024 (with audio) per token.
-        # Approximate per-second rates assuming ~24fps and typical token density.
+        # Token-priced at $0.0000024/token (audio included in token count).
+        # Formula: (height × width × duration × 24) / 1024 tokens.
+        # 480p(854×480)=9607.5 t/s, 720p(1280×720)=21600 t/s, 1080p(1920×1080)=48600 t/s.
         "pricing": {
-            "480p":  {"with_audio": 0.010, "without_audio": 0.005},
-            "720p":  {"with_audio": 0.024, "without_audio": 0.012},
-            "1080p": {"with_audio": 0.050, "without_audio": 0.025},
+            "480p":  {"with_audio": 0.023, "without_audio": 0.023},
+            "720p":  {"with_audio": 0.052, "without_audio": 0.052},
+            "1080p": {"with_audio": 0.117, "without_audio": 0.117},
         },
         "max_duration": 12,
         "note": "Cheapest option. Use 480p × 4s for end-to-end pipeline tests (~$0.02/clip). Same Seedance image-input filter applies — may refuse photoreal portrait refs.",
@@ -112,12 +113,13 @@ VIDEO_MODELS = {
         "supports_first_frame": True,
         "supports_last_frame": True,
         "supports_reference_images": True,
-        # Token-priced; approximate per-second rates based on typical 24fps render.
-        # (OpenRouter charges $0.000007 per video token; tokens scale with res×duration.)
+        # Token-priced at $0.000007/token (audio included in token count).
+        # Formula: (height × width × duration × 24) / 1024 tokens.
+        # 480p(854×480)=9607.5 t/s → $0.067, 720p(1280×720)=21600 → $0.151, 1080p(1920×1080)=48600 → $0.340.
         "pricing": {
-            "480p":  {"with_audio": 0.025, "without_audio": 0.025},
-            "720p":  {"with_audio": 0.05,  "without_audio": 0.05},
-            "1080p": {"with_audio": 0.10,  "without_audio": 0.10},
+            "480p":  {"with_audio": 0.067, "without_audio": 0.067},
+            "720p":  {"with_audio": 0.151, "without_audio": 0.151},
+            "1080p": {"with_audio": 0.340, "without_audio": 0.340},
         },
         "max_duration": 15,
         "note": "ByteDance's character-consistency specialist. NOTE: stricter image-input filter than Veo/Kling — refuses photoreal portraits via input_references. Use Veo/Kling for scenes that need photoreal character anchors.",
@@ -137,9 +139,12 @@ VIDEO_MODELS = {
         "supports_first_frame": True,
         "supports_last_frame": True,
         "supports_reference_images": True,
+        # Token-priced at ~$0.0000056/token (audio included).
+        # Formula: (height × width × duration × 24) / 1024 tokens.
+        # 480p=9607.5 t/s → $0.054, 720p=21600 t/s → $0.121.
         "pricing": {
-            "480p": {"with_audio": 0.012, "without_audio": 0.012},
-            "720p": {"with_audio": 0.025, "without_audio": 0.025},
+            "480p": {"with_audio": 0.054, "without_audio": 0.054},
+            "720p": {"with_audio": 0.121, "without_audio": 0.121},
         },
         "max_duration": 10,
         "note": "Faster, cheaper Seedance 2.0 variant. Capped at 720p / 10s. Use for iteration; promote to full Seedance 2.0 for finals.",
@@ -201,9 +206,9 @@ VIDEO_MODELS = {
         # Same as Kling Pro: OpenRouter doesn't forward `input_references`
         # to the Kling API. Identity comes from `first_frame` only.
         "supports_reference_images": False,
-        # Standard is roughly 2/3 the price of Pro for comparable behaviour.
+        # OpenRouter verified 2026-06-19: $0.084/s without audio, $0.126/s with audio.
         "pricing": {
-            "720p": {"with_audio": 0.075, "without_audio": 0.075},
+            "720p": {"with_audio": 0.126, "without_audio": 0.084},
         },
         "max_duration": 15,
         "note": "Cheaper Kling — same lenient face filter as the Pro variant. Reliable identity anchor for photoreal portraits.",
