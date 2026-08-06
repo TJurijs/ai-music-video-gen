@@ -1,8 +1,35 @@
 import type {
-  Project, Song, Scene, SceneAsset, Character, GenerationJob, ModelsConfig, ProjectCosts,
+  Project, Song, Scene, SceneAsset, Character, GenerationJob, ModelsConfig,
+  ProjectCosts, GenerationPhase, GenerationPreflight,
 } from "./types";
 
 const BASE = "/api";
+
+async function responseError(res: Response): Promise<Error> {
+  const raw = await res.text();
+  let msg = raw || res.statusText || "Request failed";
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed?.detail === "string") {
+      msg = parsed.detail;
+    } else if (Array.isArray(parsed?.detail)) {
+      msg = parsed.detail
+        .map((issue: { msg?: string }) => issue.msg || JSON.stringify(issue))
+        .join("; ");
+    } else if (parsed?.detail) {
+      msg = JSON.stringify(parsed.detail);
+    }
+  } catch {
+    // Keep the raw response for non-JSON errors.
+  }
+  if (res.status === 500 && /^internal server error$/i.test(msg.trim())) {
+    return new Error(
+      "Backend unreachable (likely restarting). Your request did not reach " +
+      "the server, so nothing changed. Try again in a moment."
+    );
+  }
+  return new Error(`${res.status}: ${msg}`);
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
@@ -20,33 +47,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     );
   }
   if (!res.ok) {
-    // FastAPI returns errors as `{"detail": "..."}` — extract that so toasts
-    // show the actionable message instead of the raw JSON wrapper. Falls
-    // back to the body as-is for non-JSON / non-standard error shapes.
-    const raw = await res.text();
-    let msg = raw;
-    try {
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed.detail === "string") {
-        msg = parsed.detail;
-      } else if (parsed && Array.isArray(parsed.detail)) {
-        // FastAPI validation errors come as an array of issue objects.
-        msg = parsed.detail.map((d: any) => d.msg || JSON.stringify(d)).join("; ");
-      }
-    } catch {
-      // raw wasn't JSON — leave msg as the raw text
-    }
-    // The Next.js dev proxy returns a generic "Internal Server Error" body
-    // when upstream (FastAPI on :8010) is unreachable — typically during a
-    // backend restart. The opaque "500: Internal Server Error" toast that
-    // surfaces from that case is the most-confused-about UX in the studio,
-    // so translate it into something actionable.
-    if (res.status === 500 && /^internal server error$/i.test(msg.trim())) {
-      throw new Error(
-        "Backend unreachable (likely restarting). Your request didn't reach the server, so nothing changed. Try again in a moment."
-      );
-    }
-    throw new Error(`${res.status}: ${msg}`);
+    throw await responseError(res);
   }
   if (res.status === 204) return undefined as T;
   return res.json();
@@ -79,7 +80,7 @@ export const api = {
       const form = new FormData();
       form.append("file", file);
       const res = await fetch(`${BASE}/projects/${projectId}/characters/${charId}/image`, { method: "POST", body: form });
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) throw await responseError(res);
       return res.json();
     },
     generateCharacterPortrait: (projectId: number, charId: number, image_model = "gemini-flash-image") =>
@@ -129,12 +130,17 @@ export const api = {
   songs: {
     get: (id: number) => request<Song>(`/songs/${id}`),
     delete: (id: number) => request<void>(`/songs/${id}`, { method: "DELETE" }),
+    analyze: (id: number) =>
+      request<{ message: string; song_id: number; song: Song }>(
+        `/songs/${id}/analyze`,
+        { method: "POST" },
+      ),
     upload: async (projectId: number, title: string, artist: string, file: File): Promise<Song> => {
       const form = new FormData();
       form.append("file", file);
       const params = new URLSearchParams({ project_id: String(projectId), title, artist });
       const res = await fetch(`${BASE}/songs/upload?${params}`, { method: "POST", body: form });
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) throw await responseError(res);
       return res.json();
     },
     generate: (data: {
@@ -145,7 +151,7 @@ export const api = {
       style_tags?: string;
       lyrics?: string;
       instrumental?: boolean;
-      source: "lyria" | "suno";
+      source: "suno";
     }) => request<Song>("/songs/generate", { method: "POST", body: JSON.stringify(data) }),
   },
 
@@ -243,13 +249,7 @@ export const api = {
         body: fd,
       });
       if (!res.ok) {
-        const raw = await res.text();
-        let msg = raw;
-        try {
-          const parsed = JSON.parse(raw);
-          if (parsed?.detail) msg = parsed.detail;
-        } catch {}
-        throw new Error(`${res.status}: ${msg}`);
+        throw await responseError(res);
       }
       return res.json() as Promise<{ scene_id: number; asset_id: number; file_path: string }>;
     },
@@ -259,6 +259,20 @@ export const api = {
   // Generation
   // ---------------------------------------------------------------------------
   generation: {
+    preflight: (
+      projectId: number,
+      phase: GenerationPhase,
+      sceneIds?: number[],
+      force = false,
+    ) => request<GenerationPreflight>("/generation/preflight", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: projectId,
+        scene_ids: sceneIds,
+        force,
+        phase,
+      }),
+    }),
     generateScene: (sceneId: number, force = false, phase: "image" | "video" | "all" = "all") =>
       request<{ message: string; scene_id: number; phase: string }>("/generation/scene", {
         method: "POST",

@@ -14,7 +14,7 @@ export default function ProjectsPage() {
   const [showNew, setShowNew] = useState(false);
   const [form, setForm] = useState({ name: "", description: "", style: "", aspect_ratio: "16:9" });
 
-  const { data: projects = [], isLoading } = useQuery({
+  const { data: projects = [], isLoading, error: projectsError } = useQuery({
     queryKey: ["projects"],
     queryFn: api.projects.list,
   });
@@ -46,7 +46,7 @@ export default function ProjectsPage() {
   return (
     <div className="min-h-screen bg-surface text-white">
       {/* Header */}
-      <header className="border-b border-white/5 px-8 py-4 flex items-center justify-between">
+      <header className="border-b border-white/5 px-4 sm:px-8 py-4 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <Film className="w-6 h-6 text-accent" />
           <span className="font-semibold text-lg tracking-tight">Music Video Studio</span>
@@ -59,10 +59,12 @@ export default function ProjectsPage() {
         </button>
       </header>
 
-      <main className="max-w-5xl mx-auto px-8 py-10">
+      <main className="max-w-5xl mx-auto px-4 sm:px-8 py-8 sm:py-10">
         <h1 className="text-2xl font-bold mb-6">Projects</h1>
 
-        {isLoading ? (
+        {projectsError ? (
+          <ErrorMessage error={projectsError as Error} />
+        ) : isLoading ? (
           <div className="text-zinc-500 text-sm">Loading...</div>
         ) : projects.length === 0 ? (
           <div className="border border-dashed border-white/10 rounded-xl p-16 text-center">
@@ -96,6 +98,9 @@ export default function ProjectsPage() {
             ))}
           </div>
         )}
+        {deleteMutation.error && (
+          <div className="mt-4"><ErrorMessage error={deleteMutation.error as Error} /></div>
+        )}
       </main>
 
       {/* New project modal — only close on backdrop press (not click-drag from inside) */}
@@ -103,9 +108,13 @@ export default function ProjectsPage() {
         <div
           className="fixed inset-0 bg-black/60 flex items-center justify-center z-50"
           onMouseDown={(e) => { if (e.target === e.currentTarget) setShowNew(false); }}
+          onKeyDown={(e) => { if (e.key === "Escape") setShowNew(false); }}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="new-project-title"
         >
           <div className="bg-surface-2 border border-white/10 rounded-xl p-6 w-full max-w-md shadow-2xl" onMouseDown={(e) => e.stopPropagation()}>
-            <h2 className="font-semibold text-lg mb-5">New Project</h2>
+            <h2 id="new-project-title" className="font-semibold text-lg mb-5">New Project</h2>
             <form onSubmit={handleCreate} className="space-y-4">
               <div>
                 <label className="block text-xs text-zinc-400 mb-1">Project Name *</label>
@@ -144,6 +153,7 @@ export default function ProjectsPage() {
                 <p className="text-[10px] text-zinc-600 mt-0.5">
                   Appended to every image and video render to keep look consistent. Click AI Expand to turn a short hint into a detailed style guide.
                 </p>
+                {expandStyle.error && <ErrorMessage error={expandStyle.error as Error} />}
               </div>
               <div>
                 <label className="block text-xs text-zinc-400 mb-1">Aspect Ratio</label>
@@ -157,6 +167,7 @@ export default function ProjectsPage() {
                   <option value="1:1">1:1 (Square)</option>
                 </select>
               </div>
+              {createMutation.error && <ErrorMessage error={createMutation.error as Error} />}
               <div className="flex gap-3 pt-2">
                 <button type="button" onClick={() => setShowNew(false)} className="flex-1 bg-surface-3 hover:bg-surface border border-white/10 text-sm py-2 rounded-lg transition-colors">
                   Cancel
@@ -183,38 +194,53 @@ function ProjectCard({ project, onOpen, onDelete }: {
     : 0;
 
   return (
-    <div
-      className="bg-surface-1 border border-white/5 hover:border-accent/40 rounded-xl p-5 cursor-pointer group transition-all"
-      onClick={onOpen}
-    >
-      <div className="flex items-start justify-between mb-3">
-        <h3 className="font-semibold text-sm truncate flex-1">{project.name}</h3>
-        <button
-          className="opacity-0 group-hover:opacity-100 text-zinc-500 hover:text-error transition-all ml-2"
-          onClick={(e) => { e.stopPropagation(); onDelete(); }}
-        >
-          <Trash2 className="w-4 h-4" />
-        </button>
-      </div>
-      {project.style && <p className="text-xs text-zinc-500 mb-3 truncate">{project.style}</p>}
-      <div className="flex items-center gap-4 text-xs text-zinc-500 mb-3">
-        <span className="flex items-center gap-1"><Music className="w-3 h-3" /> {project.song_count ?? 0} song</span>
-        <span className="flex items-center gap-1"><Layers className="w-3 h-3" /> {project.scene_count ?? 0} scenes</span>
-      </div>
-      {(project.scene_count ?? 0) > 0 && (
-        <div>
-          <div className="flex justify-between text-xs text-zinc-500 mb-1">
-            <span>Progress</span><span>{pct}%</span>
-          </div>
-          <div className="h-1 bg-surface-3 rounded-full">
-            <div className="h-1 bg-accent rounded-full transition-all" style={{ width: `${pct}%` }} />
-          </div>
+    <div className="group relative">
+      <button
+        type="button"
+        className="w-full bg-surface-1 border border-white/5 hover:border-accent/40 focus:border-accent/60 focus:outline-none rounded-xl p-5 cursor-pointer text-left transition-all"
+        onClick={onOpen}
+        aria-label={`Open project ${project.name}`}
+      >
+        <div className="flex items-start justify-between mb-3 pr-6">
+          <h3 className="font-semibold text-sm truncate flex-1">{project.name}</h3>
         </div>
-      )}
-      <p className="text-xs text-zinc-600 mt-3">
-        {new Date(project.created_at).toLocaleDateString()}
-        {" · "}{project.aspect_ratio}
-      </p>
+        {project.style && <p className="text-xs text-zinc-500 mb-3 truncate">{project.style}</p>}
+        <div className="flex items-center gap-4 text-xs text-zinc-500 mb-3">
+          <span className="flex items-center gap-1"><Music className="w-3 h-3" /> {project.song_count ?? 0} song</span>
+          <span className="flex items-center gap-1"><Layers className="w-3 h-3" /> {project.scene_count ?? 0} scenes</span>
+        </div>
+        {(project.scene_count ?? 0) > 0 && (
+          <div>
+            <div className="flex justify-between text-xs text-zinc-500 mb-1">
+              <span>Progress</span><span>{pct}%</span>
+            </div>
+            <div className="h-1 bg-surface-3 rounded-full">
+              <div className="h-1 bg-accent rounded-full transition-all" style={{ width: `${pct}%` }} />
+            </div>
+          </div>
+        )}
+        <p className="text-xs text-zinc-600 mt-3">
+          {new Date(project.created_at).toLocaleDateString()}
+          {" · "}{project.aspect_ratio}
+        </p>
+      </button>
+      <button
+        type="button"
+        className="absolute right-4 top-4 text-zinc-500 hover:text-error transition-all opacity-60 sm:opacity-0 sm:group-hover:opacity-100 focus:opacity-100"
+        onClick={onDelete}
+        aria-label={`Delete project ${project.name}`}
+        title={`Delete ${project.name}`}
+      >
+        <Trash2 className="w-4 h-4" />
+      </button>
     </div>
+  );
+}
+
+function ErrorMessage({ error }: { error: Error }) {
+  return (
+    <p className="rounded-lg border border-red-800/40 bg-red-900/20 p-3 text-xs text-red-300 break-words">
+      {error.message}
+    </p>
   );
 }

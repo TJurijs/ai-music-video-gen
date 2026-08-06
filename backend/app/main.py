@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 import os
 import re
+import sys
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,11 +12,32 @@ from app.config import settings
 from app.routers import projects, songs, scenes, generation
 
 
+def _configure_stdio_utf8() -> None:
+    """Keep Windows console/log encoding from crashing background jobs.
+
+    Python may inherit a legacy cp1252-style encoding when uvicorn is started
+    in a hidden redirected process. Prompts, paths, and diagnostic messages
+    legitimately contain Unicode; logging them must never abort generation.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            try:
+                reconfigure(encoding="utf-8", errors="backslashreplace")
+            except (OSError, ValueError):
+                pass
+
+
+_configure_stdio_utf8()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     create_db_and_tables()
     os.makedirs(settings.storage_dir, exist_ok=True)
     _apply_schema_migrations()
+    from app.database import ensure_integrity_indexes
+    ensure_integrity_indexes()
     _backfill_portrait_descriptions()
     _reset_zombie_scenes()
     yield
@@ -53,12 +75,22 @@ def _apply_schema_migrations():
             # DBs that went through the v1 cleanup it was dropped, so this
             # entry re-creates it. DEFAULT 0 keeps existing rows valid.
             "audio_sync_enabled": "BOOLEAN NOT NULL DEFAULT 0",
+            "video_reference_mode": "VARCHAR NOT NULL DEFAULT 'frame'",
+            "generation_run_id": "VARCHAR",
+            "generation_phase": "VARCHAR",
+            "generation_requested_at": "TIMESTAMP",
         },
         "project": {
             "story_seed": "VARCHAR",
         },
         "characterasset": {
             "description": "VARCHAR",
+        },
+        "song": {
+            "error_message": "TEXT",
+        },
+        "generationjob": {
+            "request_json": "TEXT",
         },
     }
     # Columns retired in v1. Old DBs may have them as NOT NULL, which
@@ -75,6 +107,22 @@ def _apply_schema_migrations():
         ],
     }
     insp = inspect(_engine)
+    pending_schema_change = False
+    for table, cols in expected.items():
+        if insp.has_table(table):
+            existing = {column["name"] for column in insp.get_columns(table)}
+            pending_schema_change = pending_schema_change or any(
+                column not in existing for column in cols
+            )
+    for table, cols in retired.items():
+        if insp.has_table(table):
+            existing = {column["name"] for column in insp.get_columns(table)}
+            pending_schema_change = pending_schema_change or any(
+                column in existing for column in cols
+            )
+    if pending_schema_change:
+        from app.database import backup_database
+        backup_database("compatibility schema migration")
     added: list[str] = []
     dropped: list[str] = []
     with _engine.begin() as conn:
@@ -87,6 +135,24 @@ def _apply_schema_migrations():
                 if col_name not in existing:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def}"))
                     added.append(f"{table}.{col_name}")
+
+        # The generic auto-migrator runs before this compatibility migration
+        # and adds new columns as nullable. Backfill rows created before the
+        # reference-mode feature so the API and UI always receive a real mode.
+        if insp.has_table("scene"):
+            conn.execute(text(
+                "UPDATE scene SET video_reference_mode = 'frame' "
+                "WHERE video_reference_mode IS NULL "
+                "OR video_reference_mode NOT IN ('frame', 'character')"
+            ))
+            conn.execute(text(
+                "UPDATE scene SET audio_sync_enabled = 0 "
+                "WHERE audio_sync_enabled IS NULL"
+            ))
+            conn.execute(text(
+                "UPDATE scene SET chain_from_prev = 0 "
+                "WHERE chain_from_prev IS NULL"
+            ))
         # ─── Removals (DROP COLUMN, SQLite 3.35+) ─────────────────────
         for table, cols in retired.items():
             if not insp.has_table(table):
@@ -161,9 +227,10 @@ def _reset_zombie_scenes():
        row). Auto-promote to "done" — the assets exist, we just need to
        reflect that.
     """
+    from datetime import datetime
     from sqlmodel import Session, select
     from app.database import engine as _engine
-    from app.models import Scene
+    from app.models import Character, GenerationJob, Scene, Song
 
     transient = {"generating_image", "generating_video"}
     with Session(_engine) as db:
@@ -171,8 +238,26 @@ def _reset_zombie_scenes():
         stuck = db.exec(
             select(Scene).where(Scene.status.in_(transient))
         ).all()
+        stuck_ids = {scene.id for scene in stuck}
         for s in stuck:
-            if s.cancel_requested:
+            remote_job = db.exec(
+                select(GenerationJob)
+                .where(
+                    GenerationJob.scene_id == s.id,
+                    GenerationJob.job_type == "video",
+                    GenerationJob.status == "running",
+                    GenerationJob.external_id.isnot(None),
+                )
+                .order_by(GenerationJob.id.desc())
+            ).first()
+            if remote_job:
+                s.status = "error"
+                s.error_message = (
+                    "Backend restarted while the provider job was active. "
+                    "Retry this scene to resume the saved job without another "
+                    "paid submission."
+                )
+            elif s.cancel_requested:
                 s.status = "cancelled"
             else:
                 # Pick the most-conservative recoverable state. If a still
@@ -180,7 +265,85 @@ def _reset_zombie_scenes():
                 s.status = "image_ready" if s.reference_image_path else "pending"
                 s.error_message = "Backend restarted mid-generation. Please retry."
             s.cancel_requested = False
+            s.generation_run_id = None
+            s.generation_phase = None
+            s.generation_requested_at = None
             db.add(s)
+
+        # Clear orphaned ownership tokens even if the visible status had
+        # already moved away from a transient state before the process died.
+        claimed = db.exec(
+            select(Scene).where(Scene.generation_run_id.isnot(None))
+        ).all()
+        for s in claimed:
+            if s.id in stuck_ids:
+                continue
+            s.generation_run_id = None
+            s.generation_phase = None
+            s.generation_requested_at = None
+            s.cancel_requested = False
+            db.add(s)
+
+        # In-process tasks cannot survive a restart. Preserve provider jobs
+        # that expose a resumable external handle; every other active job is
+        # terminally failed so unique locks and UI spinners are released.
+        active_jobs = db.exec(
+            select(GenerationJob).where(
+                GenerationJob.status.in_(["pending", "running"])
+            )
+        ).all()
+        failed_jobs = 0
+        for job in active_jobs:
+            resumable_remote = bool(
+                job.external_id
+                and job.status == "running"
+                and (
+                    (
+                        job.job_type == "video"
+                        and job.provider in ("openrouter", "fal")
+                    )
+                    or (job.job_type == "music" and job.provider == "suno")
+                )
+            )
+            if resumable_remote:
+                continue
+            job.status = "failed"
+            job.error = "Backend restarted before this local task completed. Please retry."
+            job.completed_at = datetime.utcnow()
+            db.add(job)
+            failed_jobs += 1
+
+        interrupted_songs = db.exec(
+            select(Song).where(
+                Song.status.in_(["pending", "generating", "analyzing"])
+            )
+        ).all()
+        from app.routers.songs import _find_recoverable_music_job
+        for song in interrupted_songs:
+            song.status = "error"
+            recoverable_music = _find_recoverable_music_job(db, song)
+            if recoverable_music and recoverable_music.status == "running":
+                song.error_message = (
+                    "Backend restarted while Suno task "
+                    f"{recoverable_music.external_id} was active. Use Retry to "
+                    "resume it without another paid submission."
+                )
+            else:
+                song.error_message = (
+                    "Backend restarted during song generation or analysis. "
+                    "Please retry."
+                )
+            db.add(song)
+
+        interrupted_characters = db.exec(
+            select(Character).where(Character.portrait_status == "generating")
+        ).all()
+        for character in interrupted_characters:
+            character.portrait_status = "error"
+            character.portrait_error = (
+                "Backend restarted during portrait generation. Please retry."
+            )
+            db.add(character)
 
         # (2) Heal scenes whose assets are on disk but status never advanced
         # to "done". Limited to image+video both present — we don't want to
@@ -190,7 +353,7 @@ def _reset_zombie_scenes():
         ).all()
         healed = 0
         for s in not_done:
-            if s.id in {z.id for z in stuck}:
+            if s.id in stuck_ids:
                 continue  # already handled above
             has_img = bool(s.reference_image_path and os.path.exists(s.reference_image_path))
             has_vid = bool(s.video_path and os.path.exists(s.video_path))
@@ -200,10 +363,20 @@ def _reset_zombie_scenes():
                 db.add(s)
                 healed += 1
 
-        if stuck or healed:
+        if (
+            stuck
+            or claimed
+            or failed_jobs
+            or interrupted_songs
+            or interrupted_characters
+            or healed
+        ):
             db.commit()
             msg = []
             if stuck:  msg.append(f"reset {len(stuck)} zombie scene(s)")
+            if failed_jobs: msg.append(f"failed {failed_jobs} interrupted local job(s)")
+            if interrupted_songs: msg.append(f"reset {len(interrupted_songs)} audio analysis task(s)")
+            if interrupted_characters: msg.append(f"reset {len(interrupted_characters)} portrait task(s)")
             if healed: msg.append(f"healed {healed} stuck-pending scene(s) with assets on disk")
             print(f"[startup] {', '.join(msg)}")
 
@@ -240,15 +413,38 @@ MEDIA_TYPES = {
     "txt": "text/plain", "json": "application/json",
 }
 
-_RANGE_RE = re.compile(r"bytes=(\d+)-(\d*)")
+_RANGE_RE = re.compile(r"bytes=(?:(\d+)-(\d*)|-(\d+))$")
+
+
+def _parse_byte_range(header: str, file_size: int) -> tuple[int, int] | None:
+    """Parse one RFC 7233 byte range, including suffix ranges."""
+    match = _RANGE_RE.fullmatch(header.strip())
+    if not match or file_size <= 0:
+        return None
+    if match.group(3) is not None:
+        suffix_length = int(match.group(3))
+        if suffix_length <= 0:
+            return None
+        start = max(0, file_size - suffix_length)
+        return start, file_size - 1
+    start = int(match.group(1))
+    end = int(match.group(2)) if match.group(2) else file_size - 1
+    end = min(end, file_size - 1)
+    if start > end or start >= file_size:
+        return None
+    return start, end
 
 
 def _resolve_storage_path(path: str) -> str:
     """Resolve a /storage/... path against settings.storage_dir, blocking
     any traversal outside the storage root."""
-    abs_root = os.path.abspath(settings.storage_dir)
-    target = os.path.abspath(os.path.join(settings.storage_dir, path))
-    if not target.startswith(abs_root + os.sep) and target != abs_root:
+    abs_root = os.path.realpath(settings.storage_dir)
+    target = os.path.realpath(os.path.join(settings.storage_dir, path))
+    try:
+        inside_storage = os.path.commonpath([abs_root, target]) == abs_root
+    except ValueError:
+        inside_storage = False
+    if not inside_storage:
         raise HTTPException(403, "Forbidden")
     if not os.path.isfile(target):
         raise HTTPException(404, "Not found")
@@ -269,6 +465,7 @@ async def storage_head(path: str):
             "Content-Length": str(os.path.getsize(abs_file)),
             "Content-Type": _media_type_for(abs_file),
             "Accept-Ranges": "bytes",
+            "X-Content-Type-Options": "nosniff",
         },
     )
 
@@ -286,20 +483,19 @@ async def storage_get(path: str, request: Request):
         return FileResponse(
             abs_file,
             media_type=media_type,
-            headers={"Accept-Ranges": "bytes"},
+            headers={
+                "Accept-Ranges": "bytes",
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
-    m = _RANGE_RE.match(range_header.strip())
-    if not m:
-        raise HTTPException(416, "Invalid Range header")
-    start = int(m.group(1))
-    end = int(m.group(2)) if m.group(2) else file_size - 1
-    end = min(end, file_size - 1)
-    if start > end or start >= file_size:
+    byte_range = _parse_byte_range(range_header, file_size)
+    if byte_range is None:
         return Response(
             status_code=416,
             headers={"Content-Range": f"bytes */{file_size}"},
         )
+    start, end = byte_range
 
     length = end - start + 1
     CHUNK = 1024 * 1024  # 1 MB
@@ -323,6 +519,7 @@ async def storage_get(path: str, request: Request):
             "Content-Range": f"bytes {start}-{end}/{file_size}",
             "Accept-Ranges": "bytes",
             "Content-Length": str(length),
+            "X-Content-Type-Options": "nosniff",
             # Allow JS in the page to read the response if it ever needs to
             # (the download button does fetch+blob — it benefits from CORS
             # being permissive, which our middleware already provides).

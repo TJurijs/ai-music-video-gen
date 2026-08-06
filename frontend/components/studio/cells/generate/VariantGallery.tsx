@@ -1,5 +1,6 @@
 "use client";
-import { X } from "lucide-react";
+import { Check, Loader2, X } from "lucide-react";
+import { useState } from "react";
 import { useConfirm } from "@/components/ConfirmDialog";
 import type { SceneAsset } from "@/lib/types";
 
@@ -9,11 +10,30 @@ export default function VariantGallery({
   assetType: "image" | "video";
   assets: SceneAsset[];
   modelLookup?: Record<string, any>;
-  onActivate: (id: number) => void;
+  onActivate: (id: number) => Promise<void>;
   onDelete: (id: number) => void;
   onClose: () => void;
 }) {
   const confirm = useConfirm();
+  const [activatingId, setActivatingId] = useState<number | null>(null);
+  const [activationError, setActivationError] = useState<string | null>(null);
+
+  const activate = async (asset: SceneAsset) => {
+    if (asset.is_active || activatingId !== null) return;
+    setActivationError(null);
+    setActivatingId(asset.id);
+    try {
+      await onActivate(asset.id);
+      onClose();
+    } catch (error) {
+      setActivationError(
+        error instanceof Error ? error.message : "Could not activate this variant.",
+      );
+    } finally {
+      setActivatingId(null);
+    }
+  };
+
   return (
     <div
       className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-6"
@@ -30,6 +50,11 @@ export default function VariantGallery({
         <p className="text-[10px] text-zinc-500 mb-3">
           Click a variant to make it the active one used for downstream generation. X to delete.
         </p>
+        {activationError && (
+          <p role="alert" className="text-[11px] text-red-300 bg-red-500/10 border border-red-500/30 rounded-md px-3 py-2 mb-3">
+            Activation failed: {activationError}
+          </p>
+        )}
         <div className="grid grid-cols-3 gap-3">
           {assets.map((a) => {
             const cleanLabel = modelLookup?.[a.model_used || ""]?.name?.replace(/\s*\(.*\)/, "")
@@ -38,32 +63,44 @@ export default function VariantGallery({
             return (
               <div
                 key={a.id}
-                className={`relative rounded-md overflow-hidden border-2 cursor-pointer transition-colors group ${
+                className={`relative rounded-md overflow-hidden border-2 transition-colors group ${
                   a.is_active ? "border-accent" : "border-white/10 hover:border-white/30"
                 }`}
-                onClick={() => onActivate(a.id)}
                 title={`${a.model_used} · $${a.cost_usd?.toFixed(3) || 0} · ${new Date(a.created_at).toLocaleString()}`}
               >
-                {assetType === "image" ? (
-                  <img src={a.url} className="w-full aspect-video object-cover" alt="" />
-                ) : (
-                  <video src={a.url} className="w-full aspect-video object-cover" muted
-                    onMouseEnter={(e) => e.currentTarget.play()}
-                    onMouseLeave={(e) => e.currentTarget.pause()} />
-                )}
+                <button
+                  type="button"
+                  onClick={() => activate(a)}
+                  disabled={a.is_active || activatingId !== null}
+                  className="block w-full text-left disabled:cursor-default"
+                  aria-label={a.is_active ? "Active variant" : "Make this variant active"}
+                >
+                  {assetType === "image" ? (
+                    <img src={a.url} className="w-full aspect-video object-cover" alt="" />
+                  ) : (
+                    <video src={a.url} className="w-full aspect-video object-cover" muted
+                      onMouseEnter={(e) => e.currentTarget.play()}
+                      onMouseLeave={(e) => e.currentTarget.pause()} />
+                  )}
+                </button>
                 <span
-                  className={`absolute top-1 left-1 text-[9px] px-1.5 py-0.5 rounded font-medium ${
+                  className={`pointer-events-none absolute top-1 left-1 text-[9px] px-1.5 py-0.5 rounded font-medium ${
                     assetType === "image" ? "bg-blue-500/80 text-white" : "bg-accent/80 text-white"
                   }`}
                 >
                   {cleanLabel}
                 </span>
                 {a.is_active && (
-                  <span className="absolute top-1 right-1 text-[9px] bg-emerald-500 text-white px-1.5 py-0.5 rounded font-medium">
-                    ACTIVE
+                  <span className="pointer-events-none absolute top-1 right-1 text-[9px] bg-emerald-500 text-white px-1.5 py-0.5 rounded font-medium flex items-center gap-0.5">
+                    <Check className="w-2.5 h-2.5" /> ACTIVE
                   </span>
                 )}
-                <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent px-1.5 py-0.5">
+                {activatingId === a.id && (
+                  <span className="pointer-events-none absolute inset-0 bg-black/60 text-white flex items-center justify-center gap-1 text-[11px] font-medium">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" /> Activating…
+                  </span>
+                )}
+                <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent px-1.5 py-0.5">
                   <div className="text-[10px] text-zinc-300 font-mono">
                     ${a.cost_usd?.toFixed(3) || "—"}
                   </div>

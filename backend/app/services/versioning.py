@@ -56,6 +56,13 @@ def make_active(
             continue
         p.is_active = False
         db.add(p)
+
+    # The database enforces one active row per scope with partial unique
+    # indexes. SQLAlchemy may otherwise batch the target activation before
+    # the prior deactivation, creating a momentary two-active-row state and
+    # tripping that invariant. Flush the deactivations first, then activate
+    # the target in a second statement.
+    db.flush()
     target.is_active = True
     db.add(target)
     if on_active_change is not None:

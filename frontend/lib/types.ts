@@ -22,7 +22,7 @@ export interface Song {
   project_id: number;
   title: string;
   artist?: string;
-  source: "lyria" | "suno" | "upload";
+  source: "suno" | "upload";
   file_path?: string;
   file_url?: string;
   duration?: number;
@@ -33,7 +33,8 @@ export interface Song {
   beats_json?: string;
   sections_json?: string;
   theme_analysis?: string;
-  status: "pending" | "analyzing" | "ready" | "error";
+  status: "pending" | "generating" | "analyzing" | "ready" | "error";
+  error_message?: string | null;
   created_at: string;
 }
 
@@ -149,6 +150,9 @@ export interface Scene {
   // window is sliced from the song and sent with character refs; no
   // first_frame is used in this mode. No-op on other models.
   audio_sync_enabled?: boolean;
+  // Exact first/last frame conditioning and separate character references
+  // are mutually exclusive OpenRouter modes.
+  video_reference_mode?: "frame" | "character";
   // Scene chaining: when on, video gen uses the PREVIOUS scene's extracted
   // last frame as this scene's first_frame for pixel-perfect seams.
   chain_from_prev?: boolean;
@@ -160,12 +164,15 @@ export interface Scene {
   status: SceneStatus;
   error_message?: string;
   cancel_requested?: boolean;
+  generation_run_id?: string | null;
+  generation_phase?: GenerationPhase | null;
+  generation_requested_at?: string | null;
   assets?: SceneAsset[];
   created_at: string;
 }
 
-export type JobType = "image" | "video" | "music" | "transcription";
-export type JobStatus = "pending" | "running" | "completed" | "failed";
+export type JobType = "image" | "video" | "music" | "transcription" | "assembly";
+export type JobStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
 
 export interface GenerationJob {
   id: number;
@@ -180,8 +187,31 @@ export interface GenerationJob {
   error?: string;
   cost_usd: number;
   cost_detail?: string;
+  request_json?: string;
   created_at: string;
   completed_at?: string;
+}
+
+export interface SceneGenerationPreflight {
+  scene_id: number;
+  scene_order: number;
+  ready: boolean;
+  errors: string[];
+  warnings: string[];
+  provider?: "openrouter" | "fal" | null;
+  route?: string | null;
+  will_generate_image: boolean;
+  estimated_image_cost: number;
+  estimated_video_cost: number;
+  estimated_cost: number;
+}
+
+export interface GenerationPreflight {
+  phase: GenerationPhase;
+  scene_count: number;
+  ready_count: number;
+  estimated_cost: number;
+  scenes: SceneGenerationPreflight[];
 }
 
 export interface ProjectCosts {
@@ -202,6 +232,13 @@ export interface VideoModel {
   // path that accepts an audio reference + character refs and rejects
   // first_frame). Only set on Seedance variants today.
   fal_r2v_model_id?: string;
+  // Wan uses fal image-to-video instead: exact first frame + driving audio.
+  fal_audio_model_id?: string;
+  audio_input_mode?: "seedance_r2v" | "wan_i2v";
+  audio_resolutions?: string[];
+  // fal reference-audio route pricing in USD per output second. This is a
+  // separate SKU from the normal OpenRouter pricing matrix below.
+  audio_pricing?: Record<string, number>;
   tier: VideoTier;
   tagline: string;
   durations: number[];
@@ -214,6 +251,14 @@ export interface VideoModel {
   // Mirrors backend config's supports_audio_input — drives the mic toggle
   // visibility on the scene row.
   supports_audio_input?: boolean;
+  // Reference audio is different from model-generated sound. "app" means
+  // the Generate Scenes flow can send the song segment today; "provider"
+  // means the upstream model supports it but this app has not wired it yet.
+  audio_reference_support?: "app" | "provider" | "none";
+  audio_note?: string;
+  face_guardrail?: "low" | "medium" | "high";
+  face_guardrail_note?: string;
+  reference_note?: string;
   // Pricing matrix kept as { with_audio, without_audio } for backward compat
   // with existing OpenRouter pricing_skus snapshots. We always pay the
   // without_audio rate on the OpenRouter route (audio is muxed at

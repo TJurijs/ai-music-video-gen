@@ -34,7 +34,7 @@ export default function FrameSlot({
   // Resolution the NEXT generation will use (scene.resolution).
   nextResolution?: string | null;
   onOpenLightbox: () => void;
-  onActivate: (id: number) => void;
+  onActivate: (id: number) => Promise<void>;
   onDelete: (id: number) => void;
   // Optional download / upload hooks. When set, a small icon button appears
   // on the slot title row. Used for: first-frame download (image slot),
@@ -291,7 +291,7 @@ export default function FrameSlot({
           assetType={assetType}
           assets={assets}
           modelLookup={modelLookup}
-          onActivate={(id) => { onActivate(id); setShowGallery(false); }}
+          onActivate={onActivate}
           onDelete={onDelete}
           onClose={() => setShowGallery(false)}
         />

@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Download, Film, Loader2, Sparkles, DollarSign, AlertCircle, RefreshCw } from "lucide-react";
 import { api } from "@/lib/api";
+import { contiguousDoneSequence } from "@/lib/sceneSequence";
 import type { Project, Scene, Song, ProjectCosts } from "@/lib/types";
 
 export default function StepAssembleCell({
@@ -28,7 +29,7 @@ export default function StepAssembleCell({
     onSuccess: () => status.refetch(),
   });
 
-  const doneScenes = scenes.filter((s) => s.status === "done");
+  const { doneScenes, hasCompletedAfterGap } = contiguousDoneSequence(scenes);
   const done = doneScenes.length;
   const total = scenes.length;
   // Only count done scenes — those are the ones that actually end up in the
@@ -38,8 +39,13 @@ export default function StepAssembleCell({
 
   if (total === 0 || done === 0) {
     return (
-      <div className="pt-4 text-sm text-zinc-500">
-        Generate at least one scene video to enable assembly. ({done}/{total} ready)
+      <div className="pt-4 space-y-2 text-sm text-zinc-500">
+        <p>Generate scene #1 to enable assembly. ({done}/{total} contiguous scenes ready)</p>
+        {hasCompletedAfterGap && (
+          <p className="text-xs text-amber-300">
+            Later scenes are complete, but assembly always starts at scene #1. Complete the gap first.
+          </p>
+        )}
       </div>
     );
   }
@@ -55,12 +61,21 @@ export default function StepAssembleCell({
         <div className="bg-amber-900/20 border border-amber-800/40 rounded-lg p-3 flex items-start gap-2 text-amber-200">
           <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
           <div className="text-xs leading-snug">
-            <span className="font-medium">Partial assembly:</span> only {done} of {total} scenes have generated videos. The output will include those scenes only, and the song audio will be trimmed to match.
+            <span className="font-medium">Partial assembly:</span> the first {done} of {total} scenes form a continuous finished sequence. The output will include that prefix only, and the song audio will be trimmed to match.
           </div>
         </div>
       )}
 
-      <div className="bg-surface-2 rounded-xl p-4 grid grid-cols-4 gap-3 text-center">
+      {hasCompletedAfterGap && (
+        <div className="bg-red-900/20 border border-red-800/40 rounded-lg p-3 flex items-start gap-2 text-red-200">
+          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+          <div className="text-xs leading-snug">
+            A later scene is complete after an unfinished gap. Finish the missing scene(s) before assembly so ordering and audio timing stay deterministic.
+          </div>
+        </div>
+      )}
+
+      <div className="bg-surface-2 rounded-xl p-4 grid grid-cols-2 sm:grid-cols-4 gap-3 text-center">
         <div>
           <div className="text-2xl font-bold text-accent">{isPartial ? `${done}/${total}` : total}</div>
           <div className="text-[10px] text-zinc-500 uppercase tracking-wide mt-0.5">Scenes</div>
@@ -113,20 +128,21 @@ export default function StepAssembleCell({
           videoUrl={s.url}
           projectName={project.name}
           completedAt={s.completed_at}
-          scenes={scenes}
+          scenes={doneScenes}
           onReassemble={() => assemble.mutate()}
           reassembling={assemble.isPending}
+          canReassemble={!hasCompletedAfterGap}
         />
       ) : isRunning ? (
         <AssemblyRunningPanel startedAt={s?.started_at} />
       ) : (
         <button
           onClick={() => assemble.mutate()}
-          disabled={assemble.isPending}
+          disabled={assemble.isPending || hasCompletedAfterGap}
           className="w-full flex items-center justify-center gap-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-white text-sm font-medium py-3 rounded-lg transition-colors"
         >
           <Sparkles className="w-4 h-4" />
-          Assemble Final Video
+          {hasCompletedAfterGap ? "Complete scene gaps before assembly" : "Assemble Final Video"}
         </button>
       )}
 
@@ -141,7 +157,7 @@ export default function StepAssembleCell({
           </div>
           <button
             onClick={() => assemble.mutate()}
-            disabled={assemble.isPending}
+            disabled={assemble.isPending || hasCompletedAfterGap}
             className="text-xs px-3 py-1.5 bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/40 rounded flex items-center gap-1 disabled:opacity-50"
           >
             <RefreshCw className="w-3 h-3" /> Retry
@@ -179,6 +195,7 @@ function AssemblyRunningPanel({ startedAt }: { startedAt?: string | null }) {
 
 function AssembledVideoPanel({
   videoUrl, projectName, completedAt, scenes, onReassemble, reassembling,
+  canReassemble,
 }: {
   videoUrl: string;
   projectName: string;
@@ -186,6 +203,7 @@ function AssembledVideoPanel({
   scenes: Scene[];
   onReassemble: () => void;
   reassembling: boolean;
+  canReassemble: boolean;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [currentTime, setCurrentTime] = useState(0);
@@ -297,9 +315,11 @@ function AssembledVideoPanel({
           </button>
           <button
             onClick={onReassemble}
-            disabled={reassembling}
+            disabled={reassembling || !canReassemble}
             className="text-xs px-2 py-1 bg-surface-3 hover:bg-surface text-zinc-400 hover:text-white border border-white/10 rounded flex items-center gap-1 disabled:opacity-50"
-            title="Re-assemble using current scene videos + song"
+            title={canReassemble
+              ? "Re-assemble using current scene videos + song"
+              : "Complete the scene gap before re-assembling"}
           >
             {reassembling ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
             Re-assemble

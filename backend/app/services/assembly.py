@@ -34,6 +34,7 @@ def _run_ffmpeg(cmd: list[str]) -> None:
         text=True,
         encoding="utf-8",
         errors="replace",
+        timeout=1800,
     )
     if proc.returncode != 0:
         # Last 1.5KB of stderr usually carries the actionable error
@@ -101,7 +102,7 @@ def _pick_common_dims(
     return (target_w, target_h, 24)
 
 
-async def assemble_project(project_id: int, engine) -> str:
+def assemble_project(project_id: int, engine, job_id: int | None = None) -> str:
     """Concatenate all done scenes, mux with song audio. Returns output path."""
     with Session(engine) as db:
         project = db.get(Project, project_id)
@@ -118,7 +119,14 @@ async def assemble_project(project_id: int, engine) -> str:
             select(Song).where(Song.project_id == project_id)
         ).first()
 
-    done_scenes = [s for s in scenes if s.status == "done"]
+    prefix_length = 0
+    while prefix_length < len(scenes) and scenes[prefix_length].status == "done":
+        prefix_length += 1
+    if any(scene.status == "done" for scene in scenes[prefix_length:]):
+        raise RuntimeError(
+            "Cannot assemble non-contiguous completed scenes; complete the gaps first"
+        )
+    done_scenes = scenes[:prefix_length]
     if not done_scenes:
         raise RuntimeError("No completed scenes to assemble")
 
@@ -208,6 +216,10 @@ async def assemble_project(project_id: int, engine) -> str:
 
     safe_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in project.name)
     output_path = os.path.join(output_dir, f"{safe_name}_final.mp4")
+    run_token = str(job_id or "manual")
+    temporary_output = os.path.join(
+        output_dir, f"{safe_name}_final_{run_token}.tmp.mp4",
+    )
 
     has_audio = bool(song and song.file_path and os.path.exists(song.file_path))
 
@@ -216,7 +228,7 @@ async def assemble_project(project_id: int, engine) -> str:
         # The concat filter normalizes each input (scale/pad/setsar/fps/format)
         # before concatenating, which is what fixes the freeze-on-spec-mismatch
         # bug the concat demuxer had.
-        intermediate = os.path.join(output_dir, "assembled_noaudio.mp4")
+        intermediate = os.path.join(output_dir, f"assembled_noaudio_{run_token}.mp4")
         _run_ffmpeg([
             "ffmpeg", "-y", "-v", "warning",
             *inputs,
@@ -243,7 +255,7 @@ async def assemble_project(project_id: int, engine) -> str:
             "-c:a", "aac", "-b:a", "320k",
             "-movflags", "+faststart",
             "-shortest",
-            output_path,
+            temporary_output,
         ])
 
         try:
@@ -260,9 +272,12 @@ async def assemble_project(project_id: int, engine) -> str:
             "-c:v", "libx264", "-crf", "18", "-preset", "fast",
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
-            output_path,
+            temporary_output,
         ])
 
+    # The canonical output is replaced only after ffmpeg closes a complete
+    # file, so readers never observe a half-written render.
+    os.replace(temporary_output, output_path)
     return output_path
 
 

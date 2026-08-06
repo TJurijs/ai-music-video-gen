@@ -18,20 +18,24 @@ class SunoError(Exception):
     pass
 
 
+class RemoteJobPendingError(RuntimeError):
+    """The local poll stopped, but the paid Suno task may still be running."""
+
+
 # A dummy callback URL — the API requires the field but we ignore the callback
 # and poll the record-info endpoint instead.
 _DUMMY_CALLBACK = "https://example.com/suno-callback-noop"
 
 
-async def generate_song(
+async def submit_song(
     description: str,
     title: str = "",
     style_tags: str = "",
     lyrics: str = "",
     instrumental: bool = False,
     model: str = "V5_5",
-) -> dict:
-    """Generate a song via sunoapi.org. Returns {id, audio_url, title, duration}."""
+) -> str:
+    """Submit a song and return the provider task ID before polling."""
     if not settings.suno_api_key:
         raise SunoError("SUNO_API_KEY is not set")
 
@@ -79,7 +83,49 @@ async def generate_song(
     if not task_id:
         raise SunoError(f"No taskId in response: {body}")
 
-    return await _poll_until_ready(task_id, headers, base)
+    return task_id
+
+
+async def poll_song(
+    task_id: str,
+    *,
+    timeout: int = 360,
+    interval: int = 12,
+) -> dict:
+    """Poll an existing provider task without submitting another song."""
+    if not settings.suno_api_key:
+        raise SunoError("SUNO_API_KEY is not set")
+    headers = {
+        "Authorization": f"Bearer {settings.suno_api_key}",
+        "Content-Type": "application/json",
+    }
+    return await _poll_until_ready(
+        task_id,
+        headers,
+        settings.suno_api_base.rstrip("/"),
+        timeout=timeout,
+        interval=interval,
+    )
+
+
+async def generate_song(
+    description: str,
+    title: str = "",
+    style_tags: str = "",
+    lyrics: str = "",
+    instrumental: bool = False,
+    model: str = "V5_5",
+) -> dict:
+    """Compatibility wrapper: submit and then poll a new song task."""
+    task_id = await submit_song(
+        description=description,
+        title=title,
+        style_tags=style_tags,
+        lyrics=lyrics,
+        instrumental=instrumental,
+        model=model,
+    )
+    return await poll_song(task_id)
 
 
 async def _poll_until_ready(
@@ -91,16 +137,37 @@ async def _poll_until_ready(
 ) -> dict:
     """Poll /generate/record-info until status SUCCESS (or first audio available)."""
     deadline = asyncio.get_event_loop().time() + timeout
+    consecutive_transient_failures = 0
 
     async with httpx.AsyncClient(timeout=30) as client:
         while asyncio.get_event_loop().time() < deadline:
-            r = await client.get(
-                f"{base}/api/v1/generate/record-info",
-                headers=headers,
-                params={"taskId": task_id},
-            )
+            try:
+                r = await client.get(
+                    f"{base}/api/v1/generate/record-info",
+                    headers=headers,
+                    params={"taskId": task_id},
+                )
+            except httpx.RequestError as exc:
+                consecutive_transient_failures += 1
+                if consecutive_transient_failures >= 4:
+                    raise RemoteJobPendingError(
+                        f"Suno polling lost contact with task {task_id}. Retry "
+                        "the song to resume this existing provider task."
+                    ) from exc
+                await asyncio.sleep(interval)
+                continue
+            if r.status_code == 429 or r.status_code >= 500:
+                consecutive_transient_failures += 1
+                if consecutive_transient_failures >= 4:
+                    raise RemoteJobPendingError(
+                        f"Suno repeatedly returned HTTP {r.status_code} for "
+                        f"task {task_id}. Retry to resume the same task."
+                    )
+                await asyncio.sleep(interval)
+                continue
             if r.status_code >= 400:
                 raise SunoError(f"Suno poll HTTP {r.status_code}: {r.text[:400]}")
+            consecutive_transient_failures = 0
 
             data = r.json().get("data") or {}
             status = data.get("status", "")
@@ -126,4 +193,7 @@ async def _poll_until_ready(
 
             await asyncio.sleep(interval)
 
-    raise TimeoutError(f"Suno task {task_id} timed out after {timeout}s")
+    raise RemoteJobPendingError(
+        f"Suno task {task_id} exceeded the local {timeout}s polling window. "
+        "Retry the song to resume the same provider task."
+    )

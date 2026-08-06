@@ -6,7 +6,7 @@ export default function GlobalModelPicker({
   icon: React.ReactNode;
   label: string;
   value: string | undefined;
-  options: { key: string; label: string }[];
+  options: { key: string; label: string; disabled?: boolean; reason?: string }[];
   onChange: (v: string) => void;
   disabled?: boolean;
 }) {
@@ -22,7 +22,9 @@ export default function GlobalModelPicker({
       >
         {options.length === 0 && <option value="">—</option>}
         {options.map((o) => (
-          <option key={o.key} value={o.key}>{o.label}</option>
+          <option key={o.key} value={o.key} disabled={o.disabled} title={o.reason}>
+            {o.label}{o.disabled && o.reason ? ` — ${o.reason}` : ""}
+          </option>
         ))}
       </select>
     </div>

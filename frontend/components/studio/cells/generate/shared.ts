@@ -17,3 +17,18 @@ export function mostCommon<T>(arr: T[]): T | undefined {
   for (const v of arr) counts.set(v, (counts.get(v) ?? 0) + 1);
   return Array.from(counts.entries()).sort((a, b) => b[1] - a[1])[0][0];
 }
+
+export function textMentionsCharacter(haystack: string, name: string): boolean {
+  const normalizedName = name.toLocaleLowerCase().trim();
+  if (!normalizedName) return false;
+  const normalizedText = haystack.toLocaleLowerCase();
+  const candidates = [normalizedName, ...normalizedName.split(/\s+/)];
+  return candidates.some((candidate) => {
+    if (!candidate) return false;
+    const escaped = candidate.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(
+      `(^|[^\\p{L}\\p{N}_])${escaped}(?=$|[^\\p{L}\\p{N}_])`,
+      "u",
+    ).test(normalizedText);
+  });
+}

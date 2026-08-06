@@ -7,28 +7,27 @@ Two video paths, picked per scene:
    extracted last frame) + optional input_references (Seedance only) to
    OpenRouter's /videos endpoint. Cheap, no audio.
 
-2) fal Seedance reference-to-video (opt-in via `scene.audio_sync_enabled`)
-   — only available when the chosen video model has
-   `supports_audio_input=True` (Seedance variants). Sends a sliced audio
-   clip + character refs to fal's R2V endpoint. No first_frame — the
-   model owns composition entirely. Costs ~6× more per second but the
-   character "performs" the audio (lipsynced when faces are present),
-   which OpenRouter's I2V route can't do.
+2) fal audio-driven video (opt-in via `scene.audio_sync_enabled`). Seedance
+   R2V uses the song slice + character references with no exact first frame;
+   Wan 2.7 I2V uses the song slice + the exact scene/chained first frame.
 
 Other lipsync paths (post-process via OmniHuman / LatentSync / etc) were
 explored and removed; the song's audio is otherwise muxed verbatim at the
 assembly stage. Runs as a FastAPI BackgroundTask.
 """
 
+import asyncio
 import json
 import os
 import re
 import subprocess
+import uuid
 from datetime import datetime
 from sqlmodel import Session, select
-from app.config import settings, VIDEO_MODELS
+from app.config import settings, VIDEO_MODELS, IMAGE_MODELS
 from app.models import Scene, SceneAsset, GenerationJob, Project, Character, Song
 from app.services import openrouter, fal_client, pricing
+from app.services.media_files import remove_storage_file, validate_media
 from app.services.versioning import make_active
 
 
@@ -113,7 +112,11 @@ def _probe_duration(path: str) -> float | None:
                 "-of", "default=noprint_wrappers=1:nokey=1",
                 path,
             ],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
         )
         if proc.returncode != 0:
             return None
@@ -175,18 +178,54 @@ def _extract_last_frame(video_path: str, dest_path: str) -> bool:
         return False
 
 
+async def _prepare_generated_video(scene: Scene, video_path: str) -> str:
+    """Validate a provider download and atomically refresh its chain anchor.
+
+    The prior anchor remains available until both the new video and extracted
+    frame pass validation.  A failed provider download can therefore never
+    poison downstream chaining or replace a known-good last frame.
+    """
+    await asyncio.to_thread(validate_media, video_path, "video")
+    final_frame = _storage(
+        scene.project_id, "extracted", f"scene_{scene.order}_last.jpg",
+    )
+    temporary_frame = _storage(
+        scene.project_id,
+        "extracted",
+        f"scene_{scene.order}_last_{uuid.uuid4().hex}.tmp.jpg",
+    )
+    try:
+        extracted = await asyncio.to_thread(
+            _extract_last_frame, video_path, temporary_frame,
+        )
+        if not extracted:
+            raise RuntimeError(
+                "The generated video downloaded, but its final frame could not "
+                "be decoded. The render was not activated; retry generation."
+            )
+        await asyncio.to_thread(validate_media, temporary_frame, "image")
+        os.replace(temporary_frame, final_frame)
+    finally:
+        remove_storage_file(temporary_frame)
+    scene.extracted_last_frame_path = final_frame
+    return final_frame
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
-import asyncio
-
-
-async def generate_scene(scene_id: int, engine, phase: str = "all") -> None:
+async def generate_scene(
+    scene_id: int,
+    engine,
+    phase: str = "all",
+    run_id: str | None = None,
+    force: bool = False,
+) -> None:
     """Run the scene pipeline.
 
     phase:
-      - "image":  reference still only (cheap, ~$0.04). Lets the user review
+      - "image":  reference still only. Lets the user review
                   before paying for video.
       - "video":  video gen. Skips image step if a reference already exists;
                   auto-generates one if missing. Skips image entirely when
@@ -198,24 +237,51 @@ async def generate_scene(scene_id: int, engine, phase: str = "all") -> None:
         scene = db.get(Scene, scene_id)
         if not scene:
             return
+        if run_id and scene.generation_run_id != run_id:
+            # A stale background callback must never run after a newer claim.
+            return
         # Clear any stale cancel flag from a previous run
         if scene.cancel_requested:
             scene.cancel_requested = False
             db.add(scene); db.commit()
         try:
-            await _run_pipeline(scene, db, engine, phase=phase)
+            await _run_pipeline(scene, db, engine, phase=phase, force=force)
         except asyncio.CancelledError:
             # User pressed Stop — mark cancelled, don't propagate
             db.refresh(scene)
-            scene.status = "cancelled"
+            has_existing_video = bool(
+                scene.video_path and os.path.exists(scene.video_path)
+            )
+            scene.status = "done" if has_existing_video else "cancelled"
+            scene.error_message = (
+                "New generation was cancelled; the existing active video "
+                "was preserved."
+                if has_existing_video
+                else None
+            )
             scene.cancel_requested = False
             db.add(scene); db.commit()
         except Exception as e:
-            scene.status = "error"
+            # Variant generation is non-destructive. If an older active video
+            # still exists, keep the scene assembly-ready and surface the new
+            # attempt's error separately instead of invalidating good work.
+            scene.status = (
+                "done"
+                if scene.video_path and os.path.exists(scene.video_path)
+                else "error"
+            )
             scene.error_message = str(e)[:500]
             db.add(scene)
             db.commit()
             raise
+        finally:
+            db.refresh(scene)
+            if not run_id or scene.generation_run_id == run_id:
+                scene.generation_run_id = None
+                scene.generation_phase = None
+                scene.generation_requested_at = None
+                db.add(scene)
+                db.commit()
 
 
 def _check_cancelled(engine, scene_id: int) -> bool:
@@ -225,14 +291,29 @@ def _check_cancelled(engine, scene_id: int) -> bool:
         return bool(sc and sc.cancel_requested)
 
 
-async def _run_pipeline(scene: Scene, db: Session, engine, phase: str = "all") -> None:
-    model_cfg = VIDEO_MODELS.get(scene.video_model, VIDEO_MODELS["kling-v3.0-pro"])
+async def _run_pipeline(
+    scene: Scene,
+    db: Session,
+    engine,
+    phase: str = "all",
+    force: bool = False,
+) -> None:
+    model_cfg = VIDEO_MODELS.get(scene.video_model)
+    if not model_cfg:
+        raise RuntimeError(
+            f"Unknown video model '{scene.video_model}'. Choose an available "
+            "model from the video model reference before generating."
+        )
 
     if phase == "image":
         await _generate_image(scene, db)
         if _check_cancelled(engine, scene.id):
             raise asyncio.CancelledError()
-        scene.status = "image_ready"
+        scene.status = (
+            "done"
+            if scene.video_path and os.path.exists(scene.video_path)
+            else "image_ready"
+        )
         db.add(scene); db.commit()
         return
 
@@ -240,8 +321,13 @@ async def _run_pipeline(scene: Scene, db: Session, engine, phase: str = "all") -
     use_audio_sync = (
         scene.audio_sync_enabled
         and bool(model_cfg.get("supports_audio_input"))
-        and bool(model_cfg.get("fal_r2v_model_id"))
+        and bool(model_cfg.get("fal_audio_model_id") or model_cfg.get("fal_r2v_model_id"))
     )
+    if use_audio_sync and not settings.fal_api_key:
+        raise RuntimeError(
+            "Audio-sync requires FAL_API_KEY in .env. Add the key or turn "
+            "off audio-sync on this scene. No image or video generation was submitted."
+        )
 
     # Gen the reference still in BOTH routes (unless one already exists, or
     # we're chaining from the prev scene). In OpenRouter I2V it becomes the
@@ -250,13 +336,25 @@ async def _run_pipeline(scene: Scene, db: Session, engine, phase: str = "all") -
     # it specially — Seedance gets up to 9 reference images and the planned
     # still is one of them, giving the model compositional/style anchoring
     # on top of the character identity refs.
-    if not scene.reference_image_path and not scene.chain_from_prev:
+    character_reference_only = (
+        not use_audio_sync
+        and getattr(scene, "video_reference_mode", "frame") == "character"
+        and bool(model_cfg.get("supports_reference_images"))
+    )
+    if (
+        not character_reference_only
+        and (not scene.reference_image_path or (force and phase == "all"))
+        and not scene.chain_from_prev
+    ):
         await _generate_image(scene, db)
         if _check_cancelled(engine, scene.id):
             raise asyncio.CancelledError()
 
     if use_audio_sync:
-        await _generate_video_fal_seedance_audio(scene, db, model_cfg, engine=engine)
+        if model_cfg.get("audio_input_mode") == "wan_i2v":
+            await _generate_video_fal_wan_audio(scene, db, model_cfg, engine=engine)
+        else:
+            await _generate_video_fal_seedance_audio(scene, db, model_cfg, engine=engine)
     else:
         await _generate_video_openrouter(scene, db, model_cfg, engine=engine)
 
@@ -289,25 +387,54 @@ async def _generate_image(scene: Scene, db: Session) -> None:
     if ref_paths:
         detail += f" + {len(ref_paths)} character ref(s)"
     job = _create_job(db, scene, "image", "openrouter", cost, detail)
+    dest: str | None = None
+    temporary: str | None = None
     try:
-        image_bytes = await openrouter.generate_image(
+        image_result = await openrouter.generate_image(
             prompt, scene.image_model, reference_image_paths=ref_paths,
             aspect_ratio=aspect,
         )
+        image_bytes = image_result.data
+        if image_result.cost_usd is not None:
+            cost = image_result.cost_usd
+            detail = f"{detail} · actual OpenRouter usage"
+        job.cost_usd = cost
+        job.cost_detail = detail
+        job.external_id = image_result.generation_id
+        job.request_json = json.dumps({
+            "generation_id": image_result.generation_id,
+            "usage": image_result.usage,
+        }, ensure_ascii=False)
         # Reserve an asset row first so we can use its id in the filename;
         # then write the bytes to that filename.
-        ts = int(datetime.utcnow().timestamp())
-        dest = _storage(scene.project_id, "images", f"scene_{scene.id}_{ts}.jpg")
-        with open(dest, "wb") as f:
+        dest = _storage(
+            scene.project_id,
+            "images",
+            f"scene_{scene.id}_{uuid.uuid4().hex}.jpg",
+        )
+        temporary = f"{dest}.{uuid.uuid4().hex}.tmp"
+        with open(temporary, "xb") as f:
             f.write(image_bytes)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, dest)
+        await asyncio.to_thread(validate_media, dest, "image")
         _save_asset(
             db, scene, "image", dest,
             model_used=scene.image_model, cost_usd=cost, cost_detail=detail,
-            metadata={"prompt": prompt, "char_refs": len(ref_paths or [])},
+            metadata={
+                "prompt": prompt,
+                "char_refs": len(ref_paths or []),
+                "provider_cost_usd": image_result.cost_usd,
+                "generation_id": image_result.generation_id,
+            },
         )
         job.status = "completed"
         job.result_path = dest
     except Exception as e:
+        remove_storage_file(temporary)
+        if dest and job.result_path != dest:
+            remove_storage_file(dest)
         job.status = "failed"; job.error = str(e); raise
     finally:
         job.completed_at = datetime.utcnow()
@@ -349,9 +476,15 @@ def _find_character_references(scene: Scene, db: Session, prompt: str) -> list[s
         # Match full name OR any individual token (single-word names match
         # themselves; multi-word names like "Elias Thorne" also match
         # bare "Elias").
-        matched = (
-            name in haystack
-            or any(tok and tok in haystack for tok in name.split())
+        candidates = [name, *name.split()]
+        matched = any(
+            candidate
+            and re.search(
+                rf"(?<!\w){re.escape(candidate)}(?!\w)",
+                haystack,
+                flags=re.IGNORECASE,
+            )
+            for candidate in candidates
         )
         if matched:
             refs.append(c.reference_image_path)
@@ -362,14 +495,205 @@ def _find_character_references(scene: Scene, db: Session, prompt: str) -> list[s
 # Video generation — OpenRouter (text/image to video)
 # ---------------------------------------------------------------------------
 
+async def _resume_openrouter_video_job(
+    scene: Scene,
+    db: Session,
+    job: GenerationJob,
+    engine=None,
+) -> None:
+    """Finish an already-submitted OpenRouter job without rebuilding inputs."""
+    try:
+        snapshot = json.loads(job.request_json or "{}")
+    except json.JSONDecodeError:
+        snapshot = {}
+    job_id = job.external_id
+    if not job_id:
+        raise RuntimeError("Saved OpenRouter job has no provider request ID.")
+    print(f"[resume] scene {scene.id}: polling existing OpenRouter job {job_id}")
+
+    dest: str | None = None
+    try:
+        is_cancelled = (
+            (lambda: _check_cancelled(engine, scene.id)) if engine else None
+        )
+        video_url = await openrouter.poll_video_job(
+            job_id,
+            is_cancelled=is_cancelled,
+        )
+        dest = _storage(
+            scene.project_id,
+            "videos",
+            f"scene_{scene.id}_{uuid.uuid4().hex}.mp4",
+        )
+        await openrouter.download_file(video_url, dest)
+        await _prepare_generated_video(scene, dest)
+        _save_asset(
+            db,
+            scene,
+            "video",
+            dest,
+            model_used=snapshot.get("model_key", scene.video_model),
+            cost_usd=job.cost_usd,
+            cost_detail=job.cost_detail,
+            metadata={
+                "duration": snapshot.get("duration"),
+                "resolution": snapshot.get("resolution"),
+                "aspect": snapshot.get("aspect_ratio"),
+                "provider": "openrouter",
+                "char_refs": snapshot.get("char_refs", 0),
+                "reference_mode": snapshot.get("reference_mode", "frame"),
+                "chained_from": snapshot.get("chained_from"),
+                "resumed": True,
+            },
+        )
+        job.status = "completed"
+        job.result_url = video_url
+        job.result_path = dest
+        job.error = None
+    except asyncio.CancelledError:
+        job.status = "running"
+        job.error = (
+            "Local polling stopped by user; retry to resume this existing "
+            "provider job."
+        )
+        raise
+    except openrouter.RemoteJobPendingError as exc:
+        job.status = "running"
+        job.error = str(exc)
+        raise
+    except Exception as exc:
+        if dest and job.result_path != dest:
+            remove_storage_file(dest)
+        job.status = "failed"
+        job.error = str(exc)
+        raise
+    finally:
+        job.completed_at = (
+            datetime.utcnow()
+            if job.status in ("completed", "failed", "cancelled")
+            else None
+        )
+        db.add(job)
+        db.add(scene)
+        db.commit()
+
+
+async def _resume_fal_video_job(
+    scene: Scene,
+    db: Session,
+    job: GenerationJob,
+    engine=None,
+) -> None:
+    """Finish an already-submitted fal job from its persisted queue URLs."""
+    try:
+        snapshot = json.loads(job.request_json or "{}")
+    except json.JSONDecodeError:
+        snapshot = {}
+    submission = snapshot.get("submission")
+    if not isinstance(submission, dict):
+        job.status = "failed"
+        job.error = "Saved fal job is missing its queue URLs and cannot be resumed."
+        job.completed_at = datetime.utcnow()
+        db.add(job)
+        db.commit()
+        raise RuntimeError(job.error)
+
+    print(f"[resume] scene {scene.id}: polling existing fal job {job.external_id}")
+    dest: str | None = None
+    try:
+        is_cancelled = (
+            (lambda: _check_cancelled(engine, scene.id)) if engine else None
+        )
+        result = await fal_client.poll(
+            submission,
+            timeout=900,
+            interval=8,
+            is_cancelled=is_cancelled,
+        )
+        video_url = fal_client.extract_video_url(result)
+        if not video_url:
+            raise RuntimeError(
+                "fal completed the saved job but returned no playable video URL."
+            )
+        dest = _storage(
+            scene.project_id,
+            "videos",
+            f"scene_{scene.id}_{uuid.uuid4().hex}.mp4",
+        )
+        await fal_client.download_file(video_url, dest)
+        await _prepare_generated_video(scene, dest)
+        rendered_duration = _probe_duration(dest)
+        audio_duration = snapshot.get("audio_duration")
+        route = snapshot.get("route", "fal-video")
+        _save_asset(
+            db,
+            scene,
+            "video",
+            dest,
+            model_used=snapshot.get("model_key", scene.video_model),
+            cost_usd=job.cost_usd,
+            cost_detail=job.cost_detail,
+            metadata={
+                "duration": snapshot.get("duration"),
+                "rendered_duration": (
+                    round(rendered_duration, 2) if rendered_duration else None
+                ),
+                "audio_duration": audio_duration,
+                "resolution": snapshot.get("resolution"),
+                "aspect": snapshot.get("aspect_ratio"),
+                "provider": "fal",
+                "route": route,
+                "audio_synced": True,
+                "reference_mode": (
+                    "frame" if route == "wan-i2v-audio" else "references"
+                ),
+                "image_refs": snapshot.get("image_refs"),
+                "char_refs": snapshot.get("char_refs"),
+                "frame_ref_included": snapshot.get("frame_ref_included"),
+                "chained_from": snapshot.get("chained_from"),
+                "resumed": True,
+            },
+        )
+        job.status = "completed"
+        job.result_url = video_url
+        job.result_path = dest
+        job.error = None
+    except asyncio.CancelledError:
+        job.status = "cancelled"
+        job.error = "Cancelled by user."
+        raise
+    except fal_client.RemoteJobPendingError as exc:
+        job.status = "running"
+        job.error = str(exc)
+        raise
+    except Exception as exc:
+        if dest and job.result_path != dest:
+            remove_storage_file(dest)
+        job.status = "failed"
+        job.error = str(exc)
+        raise
+    finally:
+        job.completed_at = (
+            datetime.utcnow()
+            if job.status in ("completed", "failed", "cancelled")
+            else None
+        )
+        db.add(job)
+        db.add(scene)
+        db.commit()
+
 async def _generate_video_openrouter(scene: Scene, db: Session, model_cfg: dict, engine=None) -> None:
     scene.status = "generating_video"
     db.add(scene); db.commit()
 
-    # Constrain duration to what the model supports.
-    raw_duration = int(scene.audio_end - scene.audio_start)
-    durations = model_cfg.get("durations") or [model_cfg.get("max_duration", 8)]
-    duration = _closest_supported(raw_duration, durations)
+    resumable = _find_resumable_video_job(
+        db, scene, "openrouter", route="openrouter-video",
+    )
+    if resumable:
+        await _resume_openrouter_video_job(scene, db, resumable, engine)
+        return
+
+    duration = _exact_video_duration(scene, model_cfg)
 
     # Validate resolution against the model; fall back to its first option.
     supported_res = model_cfg.get("resolutions") or ["720p"]
@@ -382,28 +706,40 @@ async def _generate_video_openrouter(scene: Scene, db: Session, model_cfg: dict,
     if aspect_ratio not in (model_cfg.get("aspects") or [aspect_ratio]):
         aspect_ratio = (model_cfg.get("aspects") or ["16:9"])[0]
 
-    # Character refs: portraits whose name appears in the prompt go to
-    # input_references so the model preserves identity through the clip.
-    # BUT only Seedance variants effectively use input_references on the
-    # OpenRouter route:
-    #   - Seedance: triggers R2V pathway, strong identity anchor (~70% weight)
-    #   - Kling: refs silently ignored by OpenRouter passthrough
-    #   - Veo: refs rejected when first_frame is also sent (we always send it)
-    # For Kling/Veo we send NO refs — saves bandwidth and avoids the bad
-    # signal that "we tried to pass them, they just didn't take." The model
-    # card's `supports_reference_images` flag drives both this decision and
-    # the UI badge.
-    if model_cfg.get("supports_reference_images"):
-        char_refs = _find_character_references(scene, db, prompt)
-    else:
-        char_refs = []
+    # Frame conditioning and character-reference conditioning are distinct
+    # OpenRouter modes. Sending both does not blend them: frame_images takes
+    # precedence and the provider ignores input_references. Construct exactly
+    # the mode selected on this scene.
+    requested_reference_mode = getattr(scene, "video_reference_mode", "frame") or "frame"
+    use_character_references = (
+        requested_reference_mode == "character"
+        and bool(model_cfg.get("supports_reference_images"))
+    )
+    if requested_reference_mode == "character" and not model_cfg.get("supports_reference_images"):
+        raise RuntimeError(
+            f"{model_cfg.get('name', scene.video_model)} does not support "
+            "separate character-reference mode. Switch this scene to Frame "
+            "mode or choose Seedance/Wan. No generation was submitted."
+        )
+    if use_character_references and scene.chain_from_prev:
+        raise RuntimeError(
+            "Character-reference mode cannot be combined with scene chaining. "
+            "Switch this scene to Frame mode or turn chaining off."
+        )
 
-    # Resolve first_frame_path. Default: this scene's planned reference still.
-    # Chained: previous scene's EXTRACTED LAST FRAME — its actual final
-    # rendered pixels, not its planned still. This produces an invisible
-    # handoff at the seam (next clip opens on exact prev-clip-final pixels).
-    first_frame_path = scene.reference_image_path
-    if scene.chain_from_prev:
+    char_refs = _find_character_references(scene, db, prompt) if use_character_references else []
+    if use_character_references and not char_refs:
+        raise RuntimeError(
+            "Character-reference mode needs at least one named cast character "
+            "with a portrait. Mention the character by name in this scene's "
+            "prompt and generate/upload their portrait first. No generation was submitted."
+        )
+
+    # Frame mode defaults to this scene's planned still. A chained scene uses
+    # the previous clip's extracted final pixels. Character mode deliberately
+    # sends no frame_images, otherwise OpenRouter would ignore the portraits.
+    first_frame_path = None if use_character_references else scene.reference_image_path
+    if scene.chain_from_prev and not use_character_references:
         prev_scene = db.exec(
             select(Scene).where(
                 Scene.project_id == scene.project_id,
@@ -424,7 +760,7 @@ async def _generate_video_openrouter(scene: Scene, db: Session, model_cfg: dict,
             )
         first_frame_path = prev_scene.extracted_last_frame_path
 
-    # Audio is never sent to the video model — the song's audio is muxed
+    # Audio is never sent to this OpenRouter route — the song's audio is muxed
     # in verbatim at assembly time, so model-generated audio would just be
     # overwritten. Pricing reflects video-only (no audio surcharge).
     cost, detail = pricing.video_cost(
@@ -432,60 +768,327 @@ async def _generate_video_openrouter(scene: Scene, db: Session, model_cfg: dict,
     )
     if char_refs:
         detail += f" + {len(char_refs)} char ref(s)"
+        detail += " + character-reference mode"
+    elif first_frame_path:
+        detail += " + frame mode"
     if scene.chain_from_prev:
         detail += " + chained"
-    job = _create_job(db, scene, "video", "openrouter", cost, detail)
-    try:
-        job_id = await openrouter.submit_video_job(
-            prompt=prompt,
-            model_id=model_cfg["model_id"],
-            duration=duration,
-            aspect_ratio=aspect_ratio,
-            resolution=resolution,
-            first_frame_path=first_frame_path,
-            reference_image_paths=char_refs,
+    request_snapshot = {
+        "route": "openrouter-video",
+        "model_key": scene.video_model,
+        "model_id": model_cfg["model_id"],
+        "duration": duration,
+        "resolution": resolution,
+        "aspect_ratio": aspect_ratio,
+        "reference_mode": "character" if use_character_references else "frame",
+        "char_refs": len(char_refs or []),
+        "chained_from": prev_scene.id if scene.chain_from_prev else None,
+    }
+    job = _find_resumable_video_job(
+        db, scene, "openrouter", route="openrouter-video",
+    )
+    if job:
+        try:
+            request_snapshot = json.loads(job.request_json or "{}") or request_snapshot
+        except json.JSONDecodeError:
+            pass
+        cost = job.cost_usd
+        detail = job.cost_detail or detail
+    else:
+        job = _create_job(
+            db, scene, "video", "openrouter", cost, detail,
+            request_snapshot=request_snapshot,
         )
-        scene.openrouter_job_id = job_id
-        job.external_id = job_id
-        job.status = "running"
-        db.add(scene); db.add(job); db.commit()
+    dest: str | None = None
+    try:
+        if job.external_id:
+            job_id = job.external_id
+            print(f"[resume] scene {scene.id}: polling existing OpenRouter job {job_id}")
+        else:
+            job_id = await openrouter.submit_video_job(
+                prompt=prompt,
+                model_id=model_cfg["model_id"],
+                duration=duration,
+                aspect_ratio=aspect_ratio,
+                resolution=resolution,
+                first_frame_path=first_frame_path,
+                reference_image_paths=char_refs,
+            )
+            scene.openrouter_job_id = job_id
+            job.external_id = job_id
+            job.status = "running"
+            db.add(scene); db.add(job); db.commit()
 
         scene_id = scene.id
         is_cancelled = (lambda: _check_cancelled(engine, scene_id)) if engine else None
         video_url = await openrouter.poll_video_job(job_id, is_cancelled=is_cancelled)
-        ts = int(datetime.utcnow().timestamp())
-        dest = _storage(scene.project_id, "videos", f"scene_{scene.id}_{ts}.mp4")
+        dest = _storage(
+            scene.project_id,
+            "videos",
+            f"scene_{scene.id}_{uuid.uuid4().hex}.mp4",
+        )
         await openrouter.download_file(video_url, dest)
+        await _prepare_generated_video(scene, dest)
 
         _save_asset(
             db, scene, "video", dest,
-            model_used=scene.video_model, cost_usd=cost, cost_detail=detail,
+            model_used=request_snapshot.get("model_key", scene.video_model),
+            cost_usd=cost, cost_detail=detail,
             metadata={
-                "duration": duration, "resolution": resolution,
-                "aspect": aspect_ratio,
+                "duration": request_snapshot.get("duration", duration),
+                "resolution": request_snapshot.get("resolution", resolution),
+                "aspect": request_snapshot.get("aspect_ratio", aspect_ratio),
                 "provider": "openrouter",
-                "char_refs": len(char_refs or []),
-                "chained_from": prev_scene.id if scene.chain_from_prev else None,
+                "char_refs": request_snapshot.get("char_refs", len(char_refs or [])),
+                "reference_mode": request_snapshot.get("reference_mode", "frame"),
+                "chained_from": request_snapshot.get("chained_from"),
             },
         )
-
-        # Extract the actual last frame so the NEXT scene can chain from it.
-        # We do this for every video gen (not just when the next scene is
-        # chained), so enabling chaining downstream doesn't require re-
-        # rendering this scene. Stored alongside the video at a stable path.
-        last_frame_dest = _storage(
-            scene.project_id, "extracted", f"scene_{scene.order}_last.jpg",
-        )
-        if _extract_last_frame(dest, last_frame_dest):
-            scene.extracted_last_frame_path = last_frame_dest
 
         job.status = "completed"
         job.result_url = video_url
         job.result_path = dest
+        job.error = None
+    except asyncio.CancelledError:
+        # OpenRouter exposes no cancellation endpoint in this integration.
+        # Keep the handle so a retry resumes polling rather than paying twice.
+        job.status = "running"
+        job.error = (
+            "Local polling stopped by user; retry to resume this existing "
+            "provider job."
+        )
+        raise
+    except openrouter.RemoteJobPendingError as e:
+        job.status = "running"
+        job.error = str(e)
+        raise
     except Exception as e:
+        if dest and job.result_path != dest:
+            remove_storage_file(dest)
         job.status = "failed"; job.error = str(e); raise
     finally:
-        job.completed_at = datetime.utcnow()
+        job.completed_at = (
+            datetime.utcnow()
+            if job.status in ("completed", "failed", "cancelled")
+            else None
+        )
+        db.add(job); db.add(scene); db.commit()
+
+
+# ---------------------------------------------------------------------------
+# fal Wan 2.7 image-to-video (exact first frame + driving audio)
+# ---------------------------------------------------------------------------
+
+async def _generate_video_fal_wan_audio(
+    scene: Scene, db: Session, model_cfg: dict, engine=None,
+) -> None:
+    """Render Wan 2.7 through fal with the scene song slice as audio_url.
+
+    Unlike Seedance R2V, Wan's audio endpoint preserves an exact image_url
+    first frame. Separate character portraits are not accepted by this I2V
+    endpoint; identity comes from the planned still or chained final frame.
+    """
+    if not settings.fal_api_key:
+        raise RuntimeError("Audio-sync requires FAL_API_KEY in .env.")
+
+    scene.status = "generating_video"
+    db.add(scene); db.commit()
+
+    resumable = _find_resumable_video_job(
+        db, scene, "fal", route="wan-i2v-audio",
+    )
+    if resumable:
+        await _resume_fal_video_job(scene, db, resumable, engine)
+        return
+
+    duration = _exact_video_duration(scene, model_cfg)
+    supported_res = (
+        model_cfg.get("audio_resolutions")
+        or model_cfg.get("resolutions")
+        or ["720p", "1080p"]
+    )
+    resolution = scene.resolution if scene.resolution in supported_res else supported_res[0]
+    prompt = _append_style(
+        scene.video_prompt or scene.description or "Cinematic music video shot",
+        db,
+        scene.project_id,
+    )
+    cost, detail = pricing.video_cost_fal_wan_audio(
+        scene.video_model, duration, resolution,
+    )
+    detail += " + exact first frame"
+    if scene.chain_from_prev:
+        detail += " + chained"
+
+    snapshot: dict = {
+        "route": "wan-i2v-audio",
+        "model_key": scene.video_model,
+        "model_id": model_cfg["fal_audio_model_id"],
+        "duration": duration,
+        "resolution": resolution,
+        "chained_from": None,
+        "audio_duration": None,
+    }
+    submission: dict | None = None
+    job = _find_resumable_video_job(
+        db, scene, "fal", route="wan-i2v-audio",
+    )
+
+    if job:
+        try:
+            snapshot = json.loads(job.request_json or "{}") or snapshot
+        except json.JSONDecodeError:
+            snapshot = {}
+        submission = snapshot.get("submission")
+        if not isinstance(submission, dict):
+            job.status = "failed"
+            job.error = "Saved fal job is missing its queue URLs and cannot be resumed."
+            job.completed_at = datetime.utcnow()
+            db.add(job); db.commit()
+            raise RuntimeError(job.error)
+        duration = int(snapshot.get("duration", duration))
+        resolution = snapshot.get("resolution", resolution)
+        cost = job.cost_usd
+        detail = job.cost_detail or detail
+        print(f"[resume] scene {scene.id}: polling existing fal job {job.external_id}")
+    else:
+        first_frame_path = scene.reference_image_path
+        previous_scene_id: int | None = None
+        if scene.chain_from_prev:
+            prev_scene = db.exec(select(Scene).where(
+                Scene.project_id == scene.project_id,
+                Scene.order == scene.order - 1,
+            )).first()
+            if (
+                not prev_scene
+                or not prev_scene.extracted_last_frame_path
+                or not os.path.exists(prev_scene.extracted_last_frame_path)
+            ):
+                raise RuntimeError(
+                    "Wan audio mode needs the previous scene's extracted last "
+                    "frame. Generate the previous scene first or turn chaining off."
+                )
+            first_frame_path = prev_scene.extracted_last_frame_path
+            previous_scene_id = prev_scene.id
+        if not first_frame_path or not os.path.exists(first_frame_path):
+            raise RuntimeError(
+                "Wan audio mode needs an exact first frame. Generate this "
+                "scene's still first, or chain it from a rendered previous scene."
+            )
+
+        # Wan accepts 2-30s driving audio. Keep the slice at or below the
+        # chosen output duration so scene timing and assembly stay aligned.
+        audio_path = await _extract_audio_segment(scene, db, max_duration=duration)
+        audio_actual_dur = _probe_duration(audio_path)
+        audio_url, image_url = await asyncio.gather(
+            fal_client.upload_file(audio_path),
+            fal_client.upload_file(first_frame_path),
+        )
+        snapshot.update({
+            "chained_from": previous_scene_id,
+            "audio_duration": audio_actual_dur,
+        })
+        job = _create_job(
+            db,
+            scene,
+            "video",
+            "fal",
+            cost,
+            detail,
+            request_snapshot=snapshot,
+        )
+
+    dest: str | None = None
+    try:
+        if submission is None:
+            if engine and _check_cancelled(engine, scene.id):
+                raise asyncio.CancelledError()
+            submission = await fal_client.submit_wan_audio_video(
+                fal_model_id=snapshot.get("model_id", model_cfg["fal_audio_model_id"]),
+                prompt=prompt,
+                image_url=image_url,
+                audio_url=audio_url,
+                duration=duration,
+                resolution=resolution,
+            )
+            request_id = submission.get("request_id")
+            if not request_id:
+                raise RuntimeError(f"fal returned no request_id: {submission}")
+            snapshot["submission"] = submission
+            job.request_json = json.dumps(snapshot, ensure_ascii=False)
+            scene.openrouter_job_id = request_id
+            job.external_id = request_id
+            job.status = "running"
+            db.add(scene); db.add(job); db.commit()
+
+        is_cancelled = (
+            (lambda: _check_cancelled(engine, scene.id)) if engine else None
+        )
+        result = await fal_client.poll(
+            submission,
+            timeout=900,
+            interval=8,
+            is_cancelled=is_cancelled,
+        )
+        video_url = fal_client.extract_video_url(result)
+        if not video_url:
+            raise RuntimeError(
+                "fal Wan 2.7 returned no video URL. "
+                f"Full body: {str(result)[:600]}"
+            )
+
+        dest = _storage(
+            scene.project_id,
+            "videos",
+            f"scene_{scene.id}_{uuid.uuid4().hex}.mp4",
+        )
+        await fal_client.download_file(video_url, dest)
+        await _prepare_generated_video(scene, dest)
+        rendered_dur = _probe_duration(dest)
+        audio_actual_dur = snapshot.get("audio_duration")
+
+        _save_asset(
+            db, scene, "video", dest,
+            model_used=snapshot.get("model_key", scene.video_model),
+            cost_usd=cost,
+            cost_detail=detail,
+            metadata={
+                "duration": duration,
+                "rendered_duration": round(rendered_dur, 2) if rendered_dur else None,
+                "audio_duration": round(audio_actual_dur, 2) if audio_actual_dur else None,
+                "resolution": resolution,
+                "provider": "fal",
+                "route": "wan-i2v-audio",
+                "audio_synced": True,
+                "reference_mode": "frame",
+                "chained_from": snapshot.get("chained_from"),
+            },
+        )
+        job.status = "completed"
+        job.result_url = video_url
+        job.result_path = dest
+        job.error = None
+    except asyncio.CancelledError:
+        # fal_client.poll has already sent the queue's cancel request.
+        job.status = "cancelled"
+        job.error = "Cancelled by user."
+        raise
+    except fal_client.RemoteJobPendingError as e:
+        job.status = "running"
+        job.error = str(e)
+        raise
+    except Exception as e:
+        if dest and job.result_path != dest:
+            remove_storage_file(dest)
+        job.status = "failed"
+        job.error = str(e)
+        raise
+    finally:
+        job.completed_at = (
+            datetime.utcnow()
+            if job.status in ("completed", "failed", "cancelled")
+            else None
+        )
         db.add(job); db.add(scene); db.commit()
 
 
@@ -521,13 +1124,22 @@ async def _generate_video_fal_seedance_audio(
     scene.status = "generating_video"
     db.add(scene); db.commit()
 
+    resumable = _find_resumable_video_job(
+        db, scene, "fal", route="seedance-r2v",
+    )
+    if resumable:
+        await _resume_fal_video_job(scene, db, resumable, engine)
+        return
+
     fal_model_id = model_cfg["fal_r2v_model_id"]
 
-    raw_duration = int(round(scene.audio_end - scene.audio_start))
-    durations = model_cfg.get("durations") or [model_cfg.get("max_duration", 8)]
-    duration = _closest_supported(raw_duration, durations)
+    duration = _exact_video_duration(scene, model_cfg)
 
-    supported_res = model_cfg.get("resolutions") or ["720p"]
+    supported_res = (
+        model_cfg.get("audio_resolutions")
+        or model_cfg.get("resolutions")
+        or ["720p"]
+    )
     resolution = scene.resolution if scene.resolution in supported_res else supported_res[0]
 
     project = db.get(Project, scene.project_id)
@@ -630,27 +1242,83 @@ async def _generate_video_fal_seedance_audio(
     n_frame = 1 if (scene.chain_from_prev or scene.reference_image_path) and len(image_ref_paths) > len(char_ref_paths) else 0
     detail += f" + {n_frame} still + {len(char_ref_paths)} char ref(s)"
 
-    job = _create_job(db, scene, "video", "fal", cost, detail)
-    try:
-        submission = await fal_client.submit_seedance_audio_video(
-            fal_model_id=fal_model_id,
-            prompt=prompt,
-            image_urls=image_ref_urls,
-            audio_urls=[audio_url],
-            duration=duration,
-            resolution=resolution,
-            aspect_ratio=aspect_ratio,
+    request_snapshot = {
+        "route": "seedance-r2v",
+        "model_key": scene.video_model,
+        "model_id": fal_model_id,
+        "duration": duration,
+        "resolution": resolution,
+        "aspect_ratio": aspect_ratio,
+        "audio_duration": audio_actual_dur,
+        "image_refs": len(image_ref_urls),
+        "char_refs": len(char_ref_paths),
+        "frame_ref_included": len(image_ref_paths) > len(char_ref_paths),
+    }
+    submission: dict | None = None
+    job = _find_resumable_video_job(
+        db, scene, "fal", route="seedance-r2v",
+    )
+    if job:
+        try:
+            request_snapshot = json.loads(job.request_json or "{}") or request_snapshot
+        except json.JSONDecodeError:
+            request_snapshot = {}
+        submission = request_snapshot.get("submission")
+        if not isinstance(submission, dict):
+            job.status = "failed"
+            job.error = "Saved fal job is missing its queue URLs and cannot be resumed."
+            job.completed_at = datetime.utcnow()
+            db.add(job); db.commit()
+            raise RuntimeError(job.error)
+        duration = int(request_snapshot.get("duration", duration))
+        resolution = request_snapshot.get("resolution", resolution)
+        aspect_ratio = request_snapshot.get("aspect_ratio", aspect_ratio)
+        audio_actual_dur = request_snapshot.get("audio_duration")
+        cost = job.cost_usd
+        detail = job.cost_detail or detail
+        print(f"[resume] scene {scene.id}: polling existing fal job {job.external_id}")
+    else:
+        job = _create_job(
+            db, scene, "video", "fal", cost, detail,
+            request_snapshot=request_snapshot,
         )
-        request_id = submission.get("request_id")
-        scene.openrouter_job_id = request_id  # field is now generic "external job ID"
-        job.external_id = request_id
-        job.status = "running"
-        db.add(scene); db.add(job); db.commit()
+
+    dest: str | None = None
+    try:
+        if submission is None:
+            if engine and _check_cancelled(engine, scene.id):
+                raise asyncio.CancelledError()
+            submission = await fal_client.submit_seedance_audio_video(
+                fal_model_id=fal_model_id,
+                prompt=prompt,
+                image_urls=image_ref_urls,
+                audio_urls=[audio_url],
+                duration=duration,
+                resolution=resolution,
+                aspect_ratio=aspect_ratio,
+            )
+            request_id = submission.get("request_id")
+            if not request_id:
+                raise RuntimeError(f"fal returned no request_id: {submission}")
+            request_snapshot["submission"] = submission
+            job.request_json = json.dumps(request_snapshot, ensure_ascii=False)
+            scene.openrouter_job_id = request_id
+            job.external_id = request_id
+            job.status = "running"
+            db.add(scene); db.add(job); db.commit()
 
         # Cancel-aware poll. fal_client.poll doesn't accept a cancel
         # callback today; we use a long timeout and rely on the user
         # restarting the scene rather than killing the upstream job.
-        result = await fal_client.poll(submission, timeout=900, interval=8)
+        is_cancelled = (
+            (lambda: _check_cancelled(engine, scene.id)) if engine else None
+        )
+        result = await fal_client.poll(
+            submission,
+            timeout=900,
+            interval=8,
+            is_cancelled=is_cancelled,
+        )
         video_url = fal_client.extract_video_url(result)
         if not video_url:
             raise RuntimeError(
@@ -658,9 +1326,13 @@ async def _generate_video_fal_seedance_audio(
                 f"Full body: {str(result)[:600]}"
             )
 
-        ts = int(datetime.utcnow().timestamp())
-        dest = _storage(scene.project_id, "videos", f"scene_{scene.id}_{ts}.mp4")
+        dest = _storage(
+            scene.project_id,
+            "videos",
+            f"scene_{scene.id}_{uuid.uuid4().hex}.mp4",
+        )
         await fal_client.download_file(video_url, dest)
+        await _prepare_generated_video(scene, dest)
 
         # Probe the actual rendered duration. If it's noticeably shorter
         # than what we requested, the metadata makes the cause obvious in
@@ -675,7 +1347,9 @@ async def _generate_video_fal_seedance_audio(
 
         _save_asset(
             db, scene, "video", dest,
-            model_used=scene.video_model, cost_usd=cost, cost_detail=detail,
+            model_used=request_snapshot.get("model_key", scene.video_model),
+            cost_usd=cost,
+            cost_detail=detail,
             metadata={
                 "duration": duration,
                 # Actual on-disk duration of the rendered video. When this
@@ -688,27 +1362,41 @@ async def _generate_video_fal_seedance_audio(
                 "provider": "fal",
                 "route": "seedance-r2v",
                 "audio_synced": True,
-                "image_refs": len(image_ref_urls),
-                "char_refs": len(char_ref_paths),
-                "frame_ref_included": len(image_ref_paths) > len(char_ref_paths),
+                "image_refs": request_snapshot.get("image_refs", len(image_ref_urls)),
+                "char_refs": request_snapshot.get("char_refs", len(char_ref_paths)),
+                "frame_ref_included": request_snapshot.get(
+                    "frame_ref_included",
+                    len(image_ref_paths) > len(char_ref_paths),
+                ),
             },
         )
 
         # Extract the actual last frame — same as the OpenRouter path —
         # so downstream chaining works even when this scene used R2V.
-        last_frame_dest = _storage(
-            scene.project_id, "extracted", f"scene_{scene.order}_last.jpg",
-        )
-        if _extract_last_frame(dest, last_frame_dest):
-            scene.extracted_last_frame_path = last_frame_dest
-
         job.status = "completed"
         job.result_url = video_url
         job.result_path = dest
+        job.error = None
+    except asyncio.CancelledError:
+        job.status = "cancelled"
+        job.error = "Cancelled by user."
+        raise
+    except fal_client.RemoteJobPendingError as e:
+        job.status = "running"
+        job.error = str(e)
+        raise
     except Exception as e:
-        job.status = "failed"; job.error = str(e); raise
+        if dest and job.result_path != dest:
+            remove_storage_file(dest)
+        job.status = "failed"
+        job.error = str(e)
+        raise
     finally:
-        job.completed_at = datetime.utcnow()
+        job.completed_at = (
+            datetime.utcnow()
+            if job.status in ("completed", "failed", "cancelled")
+            else None
+        )
         db.add(job); db.add(scene); db.commit()
 
 
@@ -756,14 +1444,22 @@ async def _extract_audio_segment(
         "-acodec", "libmp3lame", "-q:a", "2",
         dest,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    proc = await asyncio.to_thread(
+        subprocess.run,
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
     if proc.returncode != 0 or not os.path.exists(dest):
         raise RuntimeError(
             f"ffmpeg failed to slice scene audio: {(proc.stderr or '')[-400:]}"
         )
     print(
-        f"[audio slice] scene {scene.id}: {duration:.2f}s from {start:.2f}s → {end:.2f}s "
-        f"out of song={song.file_path} → {dest}"
+        f"[audio slice] scene {scene.id}: {duration:.2f}s from {start:.2f}s -> {end:.2f}s "
+        f"out of song={song.file_path} -> {dest}"
     )
     return dest
 
@@ -772,6 +1468,21 @@ def _closest_supported(value: int, options: list[int]) -> int:
     if not options:
         return value
     return min(options, key=lambda x: (abs(x - value), x))
+
+
+def _exact_video_duration(scene: Scene, model_cfg: dict) -> int:
+    """Require the provider to support the planned scene length exactly."""
+    duration = int(round(scene.audio_end - scene.audio_start))
+    supported = model_cfg.get("durations") or []
+    if duration not in supported:
+        supported_label = ", ".join(f"{value}s" for value in supported)
+        raise RuntimeError(
+            f"{model_cfg.get('name', scene.video_model)} cannot render scene "
+            f"#{scene.order} at {duration}s. Supported durations: "
+            f"{supported_label}. Choose a compatible model or change the "
+            "scene length. No generation was submitted."
+        )
+    return duration
 
 
 def _append_style(prompt: str, db: Session, project_id: int) -> str:
@@ -792,11 +1503,236 @@ def _append_style(prompt: str, db: Session, project_id: int) -> str:
     return f"{prompt}\n\nVisual style guide (apply throughout): {style}"
 
 
+def scene_generation_preflight(
+    scene: Scene,
+    db: Session,
+    *,
+    phase: str,
+    force: bool = False,
+) -> dict:
+    """Describe what a scene generation request will submit before billing."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    estimated_cost = 0.0
+    provider: str | None = None
+    route: str | None = None
+    video_cost_estimate = 0.0
+    image_cost_estimate = 0.0
+
+    if scene.generation_run_id:
+        errors.append(
+            f"Scene generation is already queued or running ({scene.generation_phase or 'unknown phase'})."
+        )
+
+    model_cfg = VIDEO_MODELS.get(scene.video_model)
+    prompt = scene.video_prompt or scene.description or ""
+    char_refs = _find_character_references(scene, db, prompt)
+    audio_sync = bool(
+        model_cfg
+        and scene.audio_sync_enabled
+        and model_cfg.get("supports_audio_input")
+        and (model_cfg.get("fal_audio_model_id") or model_cfg.get("fal_r2v_model_id"))
+    )
+    character_mode = bool(
+        model_cfg
+        and not audio_sync
+        and scene.video_reference_mode == "character"
+        and model_cfg.get("supports_reference_images")
+    )
+    has_still = bool(
+        scene.reference_image_path and os.path.exists(scene.reference_image_path)
+    )
+    image_will_generate = phase == "image" or (
+        phase in ("video", "all")
+        and not scene.chain_from_prev
+        and not character_mode
+        and (not has_still or (force and phase == "all"))
+    )
+
+    if image_will_generate:
+        if not settings.openrouter_api_key:
+            errors.append("OPENROUTER_API_KEY is missing; image generation cannot be submitted.")
+        if scene.image_model not in IMAGE_MODELS:
+            errors.append(
+                f"Unknown image model '{scene.image_model}'. Choose an available image model."
+            )
+        else:
+            image_cost_estimate, _ = pricing.image_cost(scene.image_model)
+            estimated_cost += image_cost_estimate
+
+    if phase in ("video", "all"):
+        if not model_cfg:
+            errors.append(
+                f"Unknown video model '{scene.video_model}'. Choose an available video model."
+            )
+        else:
+            raw_duration = int(round(scene.audio_end - scene.audio_start))
+            durations = model_cfg.get("durations") or []
+            duration = raw_duration
+            supported_res = (
+                model_cfg.get("audio_resolutions")
+                if audio_sync
+                else model_cfg.get("resolutions")
+            ) or ["720p"]
+            resolution = (
+                scene.resolution
+                if scene.resolution in supported_res
+                else supported_res[0]
+            )
+            if duration not in durations:
+                supported_label = ", ".join(f"{value}s" for value in durations)
+                errors.append(
+                    f"{model_cfg.get('name', scene.video_model)} cannot render "
+                    f"this {duration}s scene. Supported durations: "
+                    f"{supported_label}. Choose a compatible model or change "
+                    "the scene length."
+                )
+            if resolution != scene.resolution:
+                warnings.append(
+                    f"{scene.resolution} is unsupported; this request will use {resolution}."
+                )
+
+            project = db.get(Project, scene.project_id)
+            aspect = project.aspect_ratio if project else "16:9"
+            if aspect not in (model_cfg.get("aspects") or [aspect]):
+                warnings.append(
+                    f"Project aspect {aspect} is unsupported; the provider's "
+                    "first supported aspect will be used."
+                )
+
+            if scene.audio_sync_enabled and not audio_sync:
+                warnings.append(
+                    "Audio sync is enabled on the scene but this model cannot "
+                    "accept reference audio; the OpenRouter video-only route will be used."
+                )
+
+            if audio_sync:
+                provider = "fal"
+                if model_cfg.get("audio_input_mode") == "wan_i2v":
+                    route = "wan-i2v-audio"
+                    video_cost_estimate, _ = pricing.video_cost_fal_wan_audio(
+                        scene.video_model, duration, resolution,
+                    )
+                else:
+                    route = "seedance-r2v"
+                    video_cost_estimate, _ = pricing.video_cost_fal_seedance_r2v(
+                        scene.video_model, duration, resolution,
+                    )
+                if not settings.fal_api_key:
+                    errors.append("FAL_API_KEY is missing; audio-sync cannot be submitted.")
+                song = db.exec(
+                    select(Song).where(Song.project_id == scene.project_id)
+                ).first()
+                if not song or not song.file_path or not os.path.exists(song.file_path):
+                    errors.append("The project song file is missing; reference audio cannot be sliced.")
+            else:
+                provider = "openrouter"
+                route = "openrouter-video"
+                if not settings.openrouter_api_key:
+                    errors.append(
+                        "OPENROUTER_API_KEY is missing; video generation cannot be submitted."
+                    )
+                video_cost_estimate, _ = pricing.video_cost(
+                    scene.video_model, duration, resolution, with_audio=False,
+                )
+
+            previous_scene = None
+            if scene.chain_from_prev:
+                previous_scene = db.exec(select(Scene).where(
+                    Scene.project_id == scene.project_id,
+                    Scene.order == scene.order - 1,
+                )).first()
+            has_chain_frame = bool(
+                previous_scene
+                and previous_scene.extracted_last_frame_path
+                and os.path.exists(previous_scene.extracted_last_frame_path)
+            )
+
+            if audio_sync and model_cfg.get("audio_input_mode") == "wan_i2v":
+                if scene.chain_from_prev and not has_chain_frame:
+                    errors.append(
+                        "Wan audio mode needs the previous scene's rendered last frame."
+                    )
+                elif not scene.chain_from_prev and not (has_still or image_will_generate):
+                    errors.append("Wan audio mode needs a scene reference still.")
+            elif audio_sync:
+                has_seedance_reference = bool(
+                    has_chain_frame
+                    or (not scene.chain_from_prev and (has_still or image_will_generate))
+                    or char_refs
+                )
+                if not has_seedance_reference:
+                    errors.append(
+                        "Seedance audio mode needs a scene image or a named cast "
+                        "character with an active portrait."
+                    )
+                warnings.append(
+                    "Reference audio mode composes a new opening frame; exact "
+                    "first/last-frame conditioning is not used."
+                )
+            elif character_mode:
+                if scene.chain_from_prev:
+                    errors.append(
+                        "Character-reference mode and scene chaining are mutually exclusive."
+                    )
+                if not char_refs:
+                    errors.append(
+                        "Character-reference mode needs a named cast character "
+                        "with an active portrait."
+                    )
+                warnings.append(
+                    "Character-reference mode does not send the saved first frame."
+                )
+            else:
+                if scene.video_reference_mode == "character" and not model_cfg.get(
+                    "supports_reference_images"
+                ):
+                    errors.append(
+                        f"{model_cfg.get('name', scene.video_model)} does not "
+                        "support separate character references on this route."
+                    )
+                if scene.chain_from_prev and not has_chain_frame:
+                    errors.append(
+                        "The previous scene must finish rendering before this "
+                        "chained scene can generate."
+                    )
+                elif not scene.chain_from_prev and not (has_still or image_will_generate):
+                    errors.append("A reference still is required for frame mode.")
+
+            resumable = (
+                _find_resumable_video_job(db, scene, provider, route=route)
+                if provider and route
+                else None
+            )
+            if resumable:
+                warnings.append(
+                    f"Provider job {resumable.external_id} is already submitted; "
+                    "this action will resume it at no new estimated charge."
+                )
+                video_cost_estimate = 0.0
+            estimated_cost += video_cost_estimate
+
+    return {
+        "scene_id": scene.id,
+        "scene_order": scene.order,
+        "ready": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "provider": provider,
+        "route": route,
+        "will_generate_image": image_will_generate,
+        "estimated_image_cost": round(image_cost_estimate, 4),
+        "estimated_video_cost": round(video_cost_estimate, 4),
+        "estimated_cost": round(estimated_cost, 4),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 def _create_job(
     db: Session, scene: Scene, job_type: str, provider: str,
     cost_usd: float = 0.0, cost_detail: str | None = None,
+    request_snapshot: dict | None = None,
 ) -> GenerationJob:
     job = GenerationJob(
         project_id=scene.project_id,
@@ -806,6 +1742,36 @@ def _create_job(
         status="pending",
         cost_usd=cost_usd,
         cost_detail=cost_detail,
+        request_json=json.dumps(request_snapshot, ensure_ascii=False) if request_snapshot else None,
     )
     db.add(job); db.commit(); db.refresh(job)
     return job
+
+
+def _find_resumable_video_job(
+    db: Session,
+    scene: Scene,
+    provider: str,
+    route: str | None = None,
+) -> GenerationJob | None:
+    jobs = db.exec(
+        select(GenerationJob)
+        .where(
+            GenerationJob.scene_id == scene.id,
+            GenerationJob.job_type == "video",
+            GenerationJob.provider == provider,
+            GenerationJob.status == "running",
+            GenerationJob.external_id.isnot(None),
+        )
+        .order_by(GenerationJob.id.desc())
+    ).all()
+    if route is None:
+        return jobs[0] if jobs else None
+    for job in jobs:
+        try:
+            snapshot = json.loads(job.request_json or "{}")
+        except json.JSONDecodeError:
+            continue
+        if snapshot.get("route") == route:
+            return job
+    return None

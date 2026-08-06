@@ -29,6 +29,10 @@ import httpx
 from app.config import settings
 
 
+class RemoteJobPendingError(RuntimeError):
+    """The local poll failed, but the paid fal job may still be running."""
+
+
 def _headers() -> dict:
     if not settings.fal_api_key:
         raise RuntimeError("FAL_API_KEY is not set")
@@ -105,7 +109,32 @@ async def submit(model_id: str, payload: dict) -> dict:
         return r.json()
 
 
-async def poll(submission: dict, timeout: int = 900, interval: int = 8) -> dict:
+async def cancel_submission(submission: dict) -> bool:
+    """Cancel through fal's queue-provided URL and report confirmation."""
+    cancel_url = submission.get("cancel_url")
+    if not cancel_url:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.put(cancel_url, headers=_headers())
+            if response.status_code < 400:
+                return True
+            if response.status_code >= 400:
+                print(
+                    f"[fal cancel] upstream returned {response.status_code}: "
+                    f"{response.text[:300]}"
+                )
+    except httpx.RequestError as exc:
+        print(f"[fal cancel] request failed: {type(exc).__name__}: {str(exc)[:200]}")
+    return False
+
+
+async def poll(
+    submission: dict,
+    timeout: int = 900,
+    interval: int = 8,
+    is_cancelled=None,
+) -> dict:
     """Poll a fal submission until completion. `submission` is the dict
     returned by `submit()` — its `status_url` / `response_url` are used
     directly so nested-path models work without URL-construction tricks.
@@ -125,20 +154,71 @@ async def poll(submission: dict, timeout: int = 900, interval: int = 8) -> dict:
     request_id = submission.get("request_id", "?")
 
     deadline = asyncio.get_event_loop().time() + timeout
+    consecutive_network_failures = 0
     async with httpx.AsyncClient(timeout=30) as client:
         while asyncio.get_event_loop().time() < deadline:
-            status = await client.get(status_url, headers=_headers())
+            if is_cancelled is not None and is_cancelled():
+                if await cancel_submission(submission):
+                    raise asyncio.CancelledError(
+                        f"fal job {request_id} cancelled by user"
+                    )
+                raise RemoteJobPendingError(
+                    f"Cancellation could not be confirmed for fal request "
+                    f"{request_id}. The provider handle was preserved; retry "
+                    "the scene to check or resume it without another submission."
+                )
+            try:
+                status = await client.get(status_url, headers=_headers())
+            except httpx.RequestError as exc:
+                consecutive_network_failures += 1
+                if consecutive_network_failures >= 4:
+                    raise RemoteJobPendingError(
+                        f"fal polling lost contact with request {request_id}; "
+                        "the remote job is preserved and can be resumed by retrying."
+                    ) from exc
+                await asyncio.sleep(interval)
+                continue
+            if status.status_code == 429 or status.status_code >= 500:
+                consecutive_network_failures += 1
+                if consecutive_network_failures >= 4:
+                    raise RemoteJobPendingError(
+                        f"fal status endpoint repeatedly returned HTTP "
+                        f"{status.status_code} for request {request_id}; the "
+                        "remote job was preserved and can be resumed."
+                    )
+                await asyncio.sleep(interval)
+                continue
             if status.status_code >= 400:
                 body = status.text[:600]
                 raise RuntimeError(
                     f"fal status check failed ({status.status_code}) for request "
                     f"{request_id}: {body}"
                 )
-            sd = status.json()
+            consecutive_network_failures = 0
+            try:
+                sd = status.json()
+            except ValueError as exc:
+                raise RemoteJobPendingError(
+                    f"fal returned malformed status JSON for request {request_id}; "
+                    "the remote job was preserved and can be resumed."
+                ) from exc
             state = sd.get("status")
 
             if state == "COMPLETED":
-                result = await client.get(response_url, headers=_headers())
+                try:
+                    result = await client.get(response_url, headers=_headers())
+                except httpx.RequestError as exc:
+                    raise RemoteJobPendingError(
+                        f"fal completed request {request_id}, but the result "
+                        "download endpoint is temporarily unreachable. Retry "
+                        "to fetch the same result."
+                    ) from exc
+                if result.status_code == 429 or result.status_code >= 500:
+                    raise RemoteJobPendingError(
+                        f"fal completed request {request_id}, but result fetch "
+                        f"returned HTTP {result.status_code}. Retry to fetch "
+                        "the same result."
+                    )
                 if result.status_code >= 400:
                     body = result.text[:1500]
                     # 422 here typically means the model failed at inference
@@ -159,7 +239,10 @@ async def poll(submission: dict, timeout: int = 900, interval: int = 8) -> dict:
                 raise RuntimeError(f"fal job {state}: {json.dumps(sd)[:600]}")
 
             await asyncio.sleep(interval)
-    raise TimeoutError(f"fal job {request_id} timed out after {timeout}s")
+    raise RemoteJobPendingError(
+        f"fal job {request_id} exceeded the local {timeout}s polling window; "
+        "the remote job is preserved and can be resumed by retrying."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +351,32 @@ async def submit_seedance_audio_video(
         f"[fal seedance r2v] submit model={fal_model_id} duration={duration}s "
         f"resolution={resolution} aspect={aspect_ratio} "
         f"image_urls={len(image_urls)} audio_urls={len(audio_urls)} "
+        f"prompt[:120]={prompt[:120]!r}"
+    )
+    return await submit(fal_model_id, payload)
+
+
+async def submit_wan_audio_video(
+    fal_model_id: str,
+    prompt: str,
+    image_url: str,
+    audio_url: str,
+    duration: int,
+    resolution: str = "720p",
+) -> dict:
+    """Submit Wan 2.7 I2V with an exact first frame and driving audio."""
+    payload = {
+        "prompt": prompt,
+        "image_url": image_url,
+        "audio_url": audio_url,
+        "duration": duration,
+        "resolution": resolution,
+        "enable_prompt_expansion": True,
+        "enable_safety_checker": True,
+    }
+    print(
+        f"[fal wan i2v audio] submit model={fal_model_id} duration={duration}s "
+        f"resolution={resolution} image_url=yes audio_url=yes "
         f"prompt[:120]={prompt[:120]!r}"
     )
     return await submit(fal_model_id, payload)

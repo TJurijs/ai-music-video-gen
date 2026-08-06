@@ -6,6 +6,8 @@ import { api } from "@/lib/api";
 import { useConfirm } from "@/components/ConfirmDialog";
 import type { Project, Song, Scene } from "@/lib/types";
 import ModelTag from "../ModelTag";
+import VideoModelCheatSheet from "./generate/VideoModelCheatSheet";
+import { mostCommon } from "./generate/shared";
 
 export default function StepPlanCell({
   project, song, scenes,
@@ -37,6 +39,15 @@ export default function StepPlanCell({
 
   const { data: models } = useQuery({ queryKey: ["models"], queryFn: api.models.list });
   const refresh = () => qc.invalidateQueries({ queryKey: ["project", project.id] });
+  const setPlanVideoModel = useMutation({
+    mutationFn: async ({ videoModel, resolution }: { videoModel: string; resolution: string }) => {
+      await Promise.all(scenes.map((scene) => api.scenes.update(scene.id, {
+        video_model: videoModel,
+        resolution,
+      })));
+    },
+    onSuccess: refresh,
+  });
 
   // Single LLM identifier used for both the batch generator and per-scene
   // re-expand. Resolves the user's preference to OpenRouter's full model_id.
@@ -160,6 +171,26 @@ export default function StepPlanCell({
     }
   };
 
+  const startReplacementPlan = async (oneBatch: boolean) => {
+    if (scenes.length > 0) {
+      const ok = await confirm({
+        title: oneBatch ? "Replace the plan with scene 1?" : "Replace the scene plan?",
+        message: [
+          `The current plan has ${scenes.length} scene${scenes.length === 1 ? "" : "s"}.`,
+          "The existing scenes and their generated assets are preserved until the first replacement batch succeeds.",
+          oneBatch
+            ? "After success, the project will contain only the newly planned first scene."
+            : "After success, the new plan replaces the current scenes and generation history tied to them.",
+          "This cannot be undone from the app.",
+        ].join("\n\n"),
+        confirmLabel: oneBatch ? "Replace with scene 1" : "Replace plan",
+        destructive: true,
+      });
+      if (!ok) return;
+    }
+    await runGenerateLoop({ oneBatch, startFrom: 0 });
+  };
+
   // Poll the project every 2s while the batch loop is running so per-scene
   // progress flips live in the UI.
   useEffect(() => {
@@ -280,7 +311,7 @@ export default function StepPlanCell({
             from here. */}
         <div className="flex gap-2">
           <button
-            onClick={() => runGenerateLoop({ oneBatch: false, startFrom: 0 })}
+            onClick={() => startReplacementPlan(false)}
             disabled={genRunning}
             className="flex-1 flex items-center justify-center gap-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-white text-sm font-medium py-2.5 rounded-lg transition-colors"
           >
@@ -297,7 +328,7 @@ export default function StepPlanCell({
             })()}
           </button>
           <button
-            onClick={() => runGenerateLoop({ oneBatch: true, startFrom: 0 })}
+            onClick={() => startReplacementPlan(true)}
             disabled={genRunning}
             className="shrink-0 flex items-center justify-center gap-1.5 bg-surface-3 hover:bg-surface-2 disabled:opacity-50 text-zinc-200 text-xs font-medium px-3 py-2.5 rounded-lg border border-white/10 transition-colors"
             title={
@@ -355,6 +386,18 @@ export default function StepPlanCell({
           />
         </div>
       </div>
+
+      {models && scenes.length > 0 && (
+        <VideoModelCheatSheet
+          models={models}
+          selectedModel={mostCommon(scenes.map((scene) => scene.video_model)) || ""}
+          sceneDurations={scenes.map((scene) => Math.round(scene.audio_end - scene.audio_start))}
+          disabled={setPlanVideoModel.isPending}
+          onSelect={(videoModel, resolution) =>
+            setPlanVideoModel.mutate({ videoModel, resolution })
+          }
+        />
+      )}
 
       {/* Scenes list */}
       {scenes.length > 0 && (
@@ -515,8 +558,13 @@ function ScenePlanRow({
         <span className="text-[11px] text-zinc-500 font-mono w-20 shrink-0">
           {fmt(scene.audio_start)}–{fmt(scene.audio_end)}
         </span>
-        <span className="text-xs flex-1 truncate text-zinc-300">
-          {scene.description || <span className="text-zinc-600 italic">No description</span>}
+        <span className="flex-1 min-w-0">
+          <span className="block text-xs truncate text-zinc-300">
+            {scene.description || <span className="text-zinc-600 italic">No description</span>}
+          </span>
+          <span className="block text-[10px] truncate text-amber-200/65 mt-0.5">
+            {scene.lyrics_segment ? `♪ ${scene.lyrics_segment}` : "♪ Instrumental / no timestamped lyrics"}
+          </span>
         </span>
         {/* AI / plan-only / expanding badge removed — the new batch generator
             always produces fully-expanded scenes, so the distinction is moot.

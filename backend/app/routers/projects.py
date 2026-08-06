@@ -1,18 +1,41 @@
 import os
 import shutil
+import json
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks
 from sqlmodel import Session, select
+from sqlalchemy import update
 from datetime import datetime
 from typing import Optional
 from pydantic import BaseModel
 
 from app.database import get_session, engine
 from app.models import Project, Song, Scene, Character, CharacterAsset, GenerationJob
-from app.config import settings
-from app.services import pricing
+from app.config import settings, IMAGE_MODELS
+from app.services import openrouter, pricing
 from app.services.urls import to_storage_url
+from app.services.media_files import (
+    IMAGE_EXTENSIONS,
+    MAX_IMAGE_UPLOAD_BYTES,
+    MediaValidationError,
+    remove_storage_file,
+    remove_storage_files,
+    save_upload_limited,
+    storage_path_is_safe,
+    upload_destination,
+    validate_media_async,
+    validated_extension,
+)
 
 router = APIRouter()
+
+
+def _ensure_character_idle(character: Character) -> None:
+    if character.portrait_status == "generating":
+        raise HTTPException(
+            409,
+            "Portrait generation is already running for this character. "
+            "Wait for it to finish before changing or deleting portraits.",
+        )
 
 
 class ProjectCreate(BaseModel):
@@ -113,19 +136,49 @@ def update_project(project_id: int, data: ProjectUpdate, db: Session = Depends(g
 
 @router.delete("/{project_id}", status_code=204)
 def delete_project(project_id: int, db: Session = Depends(get_session)):
-    import os, shutil
-    from app.config import settings
-
     project = db.get(Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
+    active_job = db.exec(
+        select(GenerationJob)
+        .where(
+            GenerationJob.project_id == project_id,
+            GenerationJob.status.in_(["pending", "running"]),
+        )
+        .order_by(GenerationJob.id.desc())
+    ).first()
+    if active_job:
+        raise HTTPException(
+            409,
+            f"Project has an active {active_job.job_type} job "
+            f"({active_job.external_id or active_job.id}). Stop or reconcile "
+            "it before deleting the project.",
+        )
+    active_song = db.exec(
+        select(Song).where(
+            Song.project_id == project_id,
+            Song.status.in_(["pending", "generating", "analyzing"]),
+        )
+    ).first()
+    active_character = db.exec(
+        select(Character).where(
+            Character.project_id == project_id,
+            Character.portrait_status == "generating",
+        )
+    ).first()
+    if active_song or active_character:
+        raise HTTPException(
+            409,
+            "Project still has background audio or portrait work running. "
+            "Wait for it to finish before deleting the project.",
+        )
 
     db.delete(project)
     db.commit()
 
     # Best-effort cleanup of generated assets on disk
     asset_dir = os.path.join(settings.storage_dir, str(project_id))
-    if os.path.isdir(asset_dir):
+    if os.path.isdir(asset_dir) and storage_path_is_safe(asset_dir):
         try:
             shutil.rmtree(asset_dir)
         except OSError:
@@ -147,6 +200,8 @@ class CharacterUpdate(BaseModel):
 
 @router.post("/{project_id}/characters", status_code=201)
 def create_character(project_id: int, data: CharacterCreate, db: Session = Depends(get_session)):
+    if not db.get(Project, project_id):
+        raise HTTPException(404, "Project not found")
     char = Character(project_id=project_id, **data.model_dump())
     db.add(char)
     db.commit()
@@ -170,8 +225,14 @@ def delete_character(project_id: int, char_id: int, db: Session = Depends(get_se
     char = db.get(Character, char_id)
     if not char or char.project_id != project_id:
         raise HTTPException(404, "Character not found")
+    _ensure_character_idle(char)
+    _ensure_character_idle(char)
+    portrait_paths = [asset.file_path for asset in char.portraits]
+    if char.reference_image_path:
+        portrait_paths.append(char.reference_image_path)
     db.delete(char)
     db.commit()
+    remove_storage_files(portrait_paths)
 
 
 # ---------------------------------------------------------------------------
@@ -186,16 +247,22 @@ async def upload_character_image(
     char = db.get(Character, char_id)
     if not char or char.project_id != project_id:
         raise HTTPException(404, "Character not found")
+    _ensure_character_idle(char)
 
-    ext = (file.filename or "img.jpg").rsplit(".", 1)[-1].lower()
-    if ext not in ("jpg", "jpeg", "png", "webp"):
-        raise HTTPException(400, "Image must be jpg/png/webp")
-    dest_dir = os.path.join(settings.storage_dir, str(project_id), "characters")
-    os.makedirs(dest_dir, exist_ok=True)
-    ts = int(datetime.utcnow().timestamp())
-    dest_path = os.path.join(dest_dir, f"char_{char_id}_{ts}.{ext}")
-    with open(dest_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    try:
+        ext = validated_extension(
+            file.filename, IMAGE_EXTENSIONS, fallback="portrait.jpg",
+        )
+        dest_path = upload_destination(
+            project_id, "characters", f"char_{char_id}_upload", ext,
+        )
+        await save_upload_limited(
+            file, dest_path, max_bytes=MAX_IMAGE_UPLOAD_BYTES,
+        )
+        await validate_media_async(dest_path, "image")
+    except MediaValidationError as exc:
+        remove_storage_file(locals().get("dest_path"))
+        raise HTTPException(400, str(exc)) from exc
 
     # Deactivate prior portraits, save this upload as a new active asset.
     # Snapshot the current description so the variant + description stay
@@ -240,7 +307,27 @@ async def generate_character_portrait(
     char = db.get(Character, char_id)
     if not char or char.project_id != project_id:
         raise HTTPException(404, "Character not found")
-
+    if req.image_model not in IMAGE_MODELS:
+        raise HTTPException(400, f"Unknown image model: {req.image_model}")
+    if not settings.openrouter_api_key:
+        raise HTTPException(400, "OPENROUTER_API_KEY is missing")
+    claimed = db.exec(
+        update(Character)
+        .where(
+            Character.id == char_id,
+            Character.project_id == project_id,
+            Character.portrait_status != "generating",
+        )
+        .values(
+            portrait_status="generating",
+            portrait_error=None,
+            portrait_model=req.image_model,
+        )
+    )
+    if claimed.rowcount != 1:
+        db.rollback()
+        raise HTTPException(409, "Portrait generation is already running")
+    db.commit()
     background_tasks.add_task(_generate_portrait_bg, char_id, req.image_model)
     return {"message": "Portrait generation started", "character_id": char_id}
 
@@ -266,6 +353,7 @@ def activate_character_portrait(project_id: int, char_id: int, asset_id: int, db
     char = db.get(Character, char_id)
     if not char or char.project_id != project_id:
         raise HTTPException(404, "Character not found")
+    _ensure_character_idle(char)
     asset = db.get(CharacterAsset, asset_id)
     if not asset or asset.character_id != char_id:
         raise HTTPException(404, "Portrait not found")
@@ -306,6 +394,7 @@ def update_portrait_description(
     asset = db.get(CharacterAsset, asset_id)
     if not char or char.project_id != project_id or not asset or asset.character_id != char_id:
         raise HTTPException(404, "Portrait not found")
+    _ensure_character_idle(char)
     asset.description = payload.description
     db.add(asset)
     if asset.is_active:
@@ -323,6 +412,7 @@ def delete_character_portrait(project_id: int, char_id: int, asset_id: int, db: 
     char = db.get(Character, char_id)
     if not asset or asset.character_id != char_id or not char or char.project_id != project_id:
         raise HTTPException(404, "Portrait not found")
+    _ensure_character_idle(char)
 
     file_path = asset.file_path
     delete_and_promote(
@@ -336,12 +426,7 @@ def delete_character_portrait(project_id: int, char_id: int, asset_id: int, db: 
     )
     db.commit()
 
-    if file_path:
-        try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-        except OSError:
-            pass
+    remove_storage_file(file_path)
 
 
 # ---------------------------------------------------------------------------
@@ -387,9 +472,14 @@ async def expand_character(
         char.trigger_word = result["trigger_word"][:40]
 
     cost, detail = pricing.llm_expand_cost()
+    cost, detail, external_id, request_json = openrouter.consume_chat_billing(
+        cost,
+        detail,
+    )
     db.add(GenerationJob(
         project_id=project_id, job_type="llm_expand",
         provider="openrouter", status="completed",
+        external_id=external_id, request_json=request_json,
         cost_usd=cost, cost_detail=f"Character expand — {detail}",
         completed_at=datetime.utcnow(),
     ))
@@ -449,9 +539,14 @@ async def regenerate_character(
         char.trigger_word = result["trigger_word"][:40]
 
     cost, detail = pricing.llm_expand_cost()
+    cost, detail, external_id, request_json = openrouter.consume_chat_billing(
+        cost,
+        detail,
+    )
     db.add(GenerationJob(
         project_id=project_id, job_type="llm_expand",
         provider="openrouter", status="completed",
+        external_id=external_id, request_json=request_json,
         cost_usd=cost, cost_detail=f"Character regenerate — {detail}",
         completed_at=datetime.utcnow(),
     ))
@@ -467,6 +562,8 @@ async def _generate_portrait_bg(char_id: int, image_model: str):
             return
         project = db.get(Project, char.project_id)
         style = (project.style or "").strip() if project else ""
+        dest_path: str | None = None
+        temporary_path: str | None = None
 
         # Mark as generating
         char.portrait_status = "generating"
@@ -494,16 +591,23 @@ async def _generate_portrait_bg(char_id: int, image_model: str):
                 prompt = f"{base}\n\nVisual style guide (apply throughout): {style}"
             else:
                 prompt = base + " Photorealistic, professional reference photo."
-            image_bytes = await openrouter.generate_image(prompt, image_model)
-            dest_dir = os.path.join(settings.storage_dir, str(char.project_id), "characters")
-            os.makedirs(dest_dir, exist_ok=True)
-            # Use a timestamped filename so regenerations don't clobber prior portraits
-            ts = int(datetime.utcnow().timestamp())
-            dest_path = os.path.join(dest_dir, f"char_{char_id}_{ts}.jpg")
-            with open(dest_path, "wb") as f:
+            image_result = await openrouter.generate_image(prompt, image_model)
+            image_bytes = image_result.data
+            dest_path = upload_destination(
+                char.project_id, "characters", f"char_{char_id}_generated", "jpg",
+            )
+            temporary_path = f"{dest_path}.tmp"
+            with open(temporary_path, "xb") as f:
                 f.write(image_bytes)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary_path, dest_path)
+            await validate_media_async(dest_path, "image")
 
-            cost, detail = pricing.image_cost(image_model)
+            estimated_cost, detail = pricing.image_cost(image_model)
+            cost = image_result.cost_usd if image_result.cost_usd is not None else estimated_cost
+            if image_result.cost_usd is not None:
+                detail += " · actual OpenRouter usage"
 
             # Deactivate prior actives, save new asset, point char.reference_image_path at it.
             # The description that drove this generation is snapshot onto the
@@ -533,10 +637,17 @@ async def _generate_portrait_bg(char_id: int, image_model: str):
                 project_id=char.project_id, job_type="image",
                 provider="openrouter", status="completed",
                 cost_usd=cost, cost_detail=f"Character portrait — {detail}",
+                external_id=image_result.generation_id,
+                request_json=json.dumps({
+                    "generation_id": image_result.generation_id,
+                    "usage": image_result.usage,
+                }, ensure_ascii=False),
                 completed_at=datetime.utcnow(),
             ))
             db.commit()
         except Exception as e:
+            remove_storage_file(temporary_path)
+            remove_storage_file(dest_path)
             char.portrait_status = "error"
             char.portrait_error = str(e)[:300]
             db.add(char); db.commit()
@@ -589,9 +700,14 @@ async def suggest_characters(
 
     # Cost tracking
     cost, detail = pricing.character_suggest_cost(req.count)
+    cost, detail, external_id, request_json = openrouter.consume_chat_billing(
+        cost,
+        detail,
+    )
     db.add(GenerationJob(
         project_id=project_id, job_type="llm_chars",
         provider="openrouter", status="completed",
+        external_id=external_id, request_json=request_json,
         cost_usd=cost, cost_detail=detail,
         completed_at=datetime.utcnow(),
     ))

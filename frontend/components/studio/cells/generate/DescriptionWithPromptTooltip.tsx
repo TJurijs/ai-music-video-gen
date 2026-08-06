@@ -3,7 +3,7 @@ import { Image as ImageIcon, Video } from "lucide-react";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { createPortal } from "react-dom";
 import type { Scene, Character } from "@/lib/types";
-import { fmt } from "./shared";
+import { fmt, textMentionsCharacter } from "./shared";
 
 export default function DescriptionWithPromptTooltip({
   scene,
@@ -11,6 +11,7 @@ export default function DescriptionWithPromptTooltip({
   videoModelLabel,
   videoModelUsesRefs,
   audioSyncActive,
+  audioUsesFrame,
 }: {
   scene: Scene;
   characters?: Character[];
@@ -27,6 +28,8 @@ export default function DescriptionWithPromptTooltip({
   // When true, the request routes through fal Seedance R2V instead of
   // OpenRouter I2V; no first_frame is sent, audio reference IS sent.
   audioSyncActive?: boolean;
+  // Wan audio I2V keeps an exact first frame; Seedance audio R2V does not.
+  audioUsesFrame?: boolean;
 }) {
   // Portal-rendered tooltip — necessary because the parent scene card uses
   // overflow-hidden (for rounded corners on the inner divider), which clips
@@ -114,12 +117,17 @@ export default function DescriptionWithPromptTooltip({
     scene.image_prompt || "",
     scene.description || "",
   ].join(" ").toLowerCase();
+  const characterReferenceMode = (
+    !audioSyncActive
+    && videoModelUsesRefs === true
+    && scene.video_reference_mode === "character"
+  );
+  const referencesActive = (!!audioSyncActive && !audioUsesFrame) || characterReferenceMode;
   const charsActuallyPassed = (characters || []).filter((c) => {
+    if (!referencesActive) return false;
     if (!c.reference_image_url) return false;
     const name = (c.name || "").toLowerCase().trim();
-    if (!name) return false;
-    if (haystack.includes(name)) return true;
-    return name.split(/\s+/).some((part) => part && haystack.includes(part));
+    return textMentionsCharacter(haystack, name);
   });
 
   const swappedVideo = scene.video_prompt;
@@ -132,9 +140,14 @@ export default function DescriptionWithPromptTooltip({
       onMouseEnter={hasPrompts ? onEnter : undefined}
       onMouseLeave={hasPrompts ? scheduleClose : undefined}
     >
-      <p className={`text-xs text-zinc-300 truncate ${hasPrompts ? "cursor-help" : ""}`}>
-        {scene.description || <span className="text-zinc-600 italic">no description</span>}
-      </p>
+      <div className={hasPrompts ? "cursor-help" : ""}>
+        <p className="text-xs text-zinc-300 truncate">
+          {scene.description || <span className="text-zinc-600 italic">no description</span>}
+        </p>
+        <p className="text-[10px] text-amber-200/65 truncate mt-0.5">
+          {scene.lyrics_segment ? `♪ ${scene.lyrics_segment}` : "♪ Instrumental / no timestamped lyrics"}
+        </p>
+      </div>
       {hasPrompts && open && typeof document !== "undefined" && createPortal(
         <div
           className="fixed z-[100] bg-surface-2 border border-white/10 rounded-lg shadow-2xl p-4 overflow-y-auto"
@@ -147,14 +160,15 @@ export default function DescriptionWithPromptTooltip({
           onMouseEnter={cancelClose}
           onMouseLeave={scheduleClose}
         >
-          {/* Honest summary of what the video call will include. Two routes:
-                - OpenRouter I2V (default): first_frame + (optional) refs.
-                - fal Seedance R2V (audio-sync ON): audio + refs, NO first_frame.
+          {/* Honest summary of what the video call will include. Three routes:
+                - OpenRouter I2V (default): first_frame OR character refs.
+                - fal Seedance R2V: audio + refs, NO first_frame.
+                - fal Wan I2V: audio + exact first_frame, NO character refs.
               The text changes per route so the user knows what's actually sent. */}
           <div className={`mb-3 text-[10px] ${audioSyncActive ? "text-fuchsia-200" : "text-zinc-400"} ${audioSyncActive ? "bg-fuchsia-500/10 border-fuchsia-500/30" : "bg-zinc-500/10 border-zinc-500/30"} border rounded px-2 py-1.5`}>
             <div className="font-semibold mb-1" style={{ color: audioSyncActive ? "rgb(244 114 182)" : "rgb(212 212 216)" }}>
               {audioSyncActive
-                ? `Sent to fal ${videoModelLabel || "Seedance"} R2V (audio-sync route):`
+                ? `Sent to fal ${videoModelLabel || "video model"} (${audioUsesFrame ? "audio-driven I2V" : "audio-sync R2V"}):`
                 : `Sent to ${videoModelLabel || "OpenRouter"} (image-to-video route):`}
             </div>
             <ul className="space-y-0.5 leading-snug">
@@ -162,48 +176,54 @@ export default function DescriptionWithPromptTooltip({
               {audioSyncActive ? (
                 <>
                   <li>
-                    · audio_urls[0] ={" "}
+                    · {audioUsesFrame ? "audio_url" : "audio_urls[0]"} ={" "}
                     <span className="text-fuchsia-200">
-                      song slice {fmt(scene.audio_start)}–{fmt(scene.audio_end)} (trimmed ~150ms under video duration)
+                      song slice {fmt(scene.audio_start)}–{fmt(scene.audio_end)}
+                      {!audioUsesFrame && " (trimmed ~150ms under video duration)"}
                     </span>
                   </li>
-                  <li>
-                    · image_urls ={" "}
-                    {(() => {
-                      const frameSource = scene.chain_from_prev
-                        ? "prev scene's extracted last frame"
-                        : scene.reference_image_url
-                          ? "this scene's generated still"
-                          : null;
-                      const items: React.ReactNode[] = [];
-                      if (frameSource) {
-                        items.push(<span key="f" className="text-fuchsia-100">{frameSource}</span>);
-                      }
-                      if (charsActuallyPassed.length > 0) {
-                        items.push(
-                          <span key="c" className="text-fuchsia-100">
-                            {charsActuallyPassed.map((c) => c.name).join(", ")}
-                            {" "}({charsActuallyPassed.length} portrait{charsActuallyPassed.length === 1 ? "" : "s"})
-                          </span>
-                        );
-                      }
-                      if (items.length === 0) {
-                        return <span className="text-red-300">none — REQUIRED. Generate a still (click Img) or mention a cast character with a portrait.</span>;
-                      }
-                      // Render items separated by " + "
-                      return items.reduce((acc, el, i) => i === 0 ? [el] : [...acc as any, <span key={`s${i}`} className="text-zinc-500"> + </span>, el], [] as React.ReactNode[]);
-                    })()}
-                  </li>
-                  <li className="text-zinc-500 italic">
-                    · no first_frame — Seedance R2V doesn't have that concept;
-                    all images above are treated as compositional/style/identity references.
-                  </li>
+                  {audioUsesFrame ? (
+                    <>
+                      <li>
+                        · image_url ={" "}
+                        {scene.chain_from_prev
+                          ? <span className="text-emerald-300">prev scene's extracted last frame (exact first frame)</span>
+                          : scene.reference_image_url
+                            ? <span className="text-fuchsia-100">this scene's generated still (exact first frame)</span>
+                            : <span className="text-red-300">none — REQUIRED; the app will generate a still first</span>}
+                      </li>
+                      <li className="text-zinc-500 italic">· no separate character portraits — Wan audio I2V uses the exact frame as its identity anchor.</li>
+                    </>
+                  ) : (
+                    <>
+                      <li>
+                        · image_urls ={" "}
+                        {(() => {
+                          const frameSource = scene.chain_from_prev
+                            ? "prev scene's extracted last frame"
+                            : scene.reference_image_url
+                              ? "this scene's generated still"
+                              : null;
+                          const items: React.ReactNode[] = [];
+                          if (frameSource) items.push(<span key="f" className="text-fuchsia-100">{frameSource}</span>);
+                          if (charsActuallyPassed.length > 0) {
+                            items.push(<span key="c" className="text-fuchsia-100">{charsActuallyPassed.map((c) => c.name).join(", ")} ({charsActuallyPassed.length} portrait{charsActuallyPassed.length === 1 ? "" : "s"})</span>);
+                          }
+                          if (items.length === 0) return <span className="text-red-300">none — REQUIRED. Generate a still or mention a cast character with a portrait.</span>;
+                          return items.reduce((acc, el, i) => i === 0 ? [el] : [...acc as any, <span key={`s${i}`} className="text-zinc-500"> + </span>, el], [] as React.ReactNode[]);
+                        })()}
+                      </li>
+                      <li className="text-zinc-500 italic">· no first_frame — Seedance treats all images as compositional/style/identity references.</li>
+                    </>
+                  )}
                 </>
               ) : (
                 <>
                   <li>
                     · first_frame ={" "}
-                    {scene.chain_from_prev
+                    {characterReferenceMode
+                      ? <span className="text-zinc-500 italic">none (character-reference mode)</span>
+                      : scene.chain_from_prev
                       ? <span className="text-emerald-300">prev scene's extracted last frame (chained)</span>
                       : scene.reference_image_url
                         ? <span className="text-zinc-300">this scene's generated still</span>
@@ -213,6 +233,8 @@ export default function DescriptionWithPromptTooltip({
                     · input_references ={" "}
                     {videoModelUsesRefs === false
                       ? <span className="text-zinc-500 italic">none (model doesn't use refs — skipped)</span>
+                      : !characterReferenceMode
+                        ? <span className="text-zinc-500 italic">none (frame mode)</span>
                       : charsActuallyPassed.length === 0
                         ? <span className="text-zinc-500 italic">none</span>
                         : (
@@ -227,12 +249,14 @@ export default function DescriptionWithPromptTooltip({
             </ul>
             <div className="mt-1 text-zinc-500">
               {audioSyncActive
-                ? "Audio-sync route: Seedance R2V composes the shot using the audio + all image_urls as combined references. Character portraits give the ~70% identity anchor per ByteDance docs; the scene's still (when present) adds compositional / setting anchor without being a strict first_frame. The model lipsyncs the character to the audio when faces are visible. Costs ~6× the OpenRouter rate."
+                ? audioUsesFrame
+                  ? "Wan audio mode: the uploaded song segment drives lip/action timing while the scene still or chained frame remains the exact visual start. Character-reference mode is not combined with this route."
+                  : "Audio-sync route: Seedance R2V composes the shot using the audio + all image_urls as combined references. Character portraits provide identity anchoring; the scene still adds composition without being a strict first frame."
                 : videoModelUsesRefs === false
                   ? `${videoModelLabel || "This model"} doesn't accept input_references on the OpenRouter route — character identity comes entirely from the first_frame. Switch to a Seedance variant if you need character-portrait identity anchoring.`
-                  : scene.chain_from_prev || scene.reference_image_url
-                    ? "Seedance I2V mode (first_frame present) — first_frame pixels dominate. input_references are a soft hint (~30% weight). For the strong ~70% identity anchor, enable audio-sync (the mic icon) or drop the first_frame."
-                    : "Seedance is running in reference-to-video mode. input_references are the primary identity anchor (~70% weight per ByteDance). Pose and composition come from the prompt."}
+                  : characterReferenceMode
+                    ? "Character-reference mode: named cast portraits are the identity anchors. No exact first/last frame is sent because OpenRouter treats frame images and character references as mutually exclusive inputs."
+                    : "Frame mode: the scene still or chained final frame is used as the exact first frame. Separate character portraits are not sent."}
             </div>
           </div>
           {scene.video_prompt && (

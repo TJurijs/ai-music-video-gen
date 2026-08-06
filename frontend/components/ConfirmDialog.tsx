@@ -58,15 +58,17 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
           onMouseDown={(e) => { if (e.target === e.currentTarget) handle(false); }}
           role="dialog"
           aria-modal="true"
+          aria-labelledby={state.title ? "confirm-dialog-title" : undefined}
+          aria-describedby="confirm-dialog-message"
         >
           <div
             className="bg-surface-2 border border-white/10 rounded-xl shadow-2xl max-w-md w-full p-5"
             onMouseDown={(e) => e.stopPropagation()}
           >
             {state.title && (
-              <h3 className="text-sm font-semibold mb-2 text-white">{state.title}</h3>
+              <h3 id="confirm-dialog-title" className="text-sm font-semibold mb-2 text-white">{state.title}</h3>
             )}
-            <p className="text-sm text-zinc-300 leading-relaxed whitespace-pre-line">
+            <p id="confirm-dialog-message" className="text-sm text-zinc-300 leading-relaxed whitespace-pre-line">
               {state.message}
             </p>
             <div className="flex justify-end gap-2 mt-5">

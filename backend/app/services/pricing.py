@@ -9,8 +9,7 @@ from app.config import VIDEO_MODELS, IMAGE_MODELS
 
 
 # Flat-rate operations
-MUSIC_LYRIA_USD = 0.08              # Lyria 3 Pro per song
-MUSIC_SUNO_USD = 0.118              # Suno V4 per clip
+MUSIC_SUNO_USD = 0.118              # Suno route estimate per generated song
 WHISPER_USD_PER_MIN = 0.006         # fal-ai/whisper word-level (preferred), or OpenRouter chat fallback
 LLM_PLAN_FLAT_USD = 0.06            # Claude scene plan, ~5K in + 3K out
 LLM_EXPAND_FLAT_USD = 0.005         # Per-scene prompt expansion
@@ -39,26 +38,6 @@ def video_cost(
     return total, f"{name} · {duration_seconds}s × ${rate}/s @ {resolution}{suffix}"
 
 
-# Seedance reference-to-video via fal — separate cost matrix because fal's
-# pricing is ~6× the OpenRouter image-to-video route (the audio path is a
-# different product, not a feature toggle). Numbers from fal's pricing page;
-# update if their catalog moves. The OpenRouter `video_cost` above doesn't
-# apply here — different provider, different SKU.
-FAL_R2V_PRICING_USD_PER_SEC = {
-    # standard tier — bytedance/seedance-{1.5-pro,2.0}/reference-to-video
-    "standard": {
-        "480p":  0.18,
-        "720p":  0.30,
-        "1080p": 0.62,
-    },
-    # fast tier — bytedance/seedance-2.0-fast/reference-to-video
-    "fast": {
-        "480p": 0.09,
-        "720p": 0.15,
-    },
-}
-
-
 def video_cost_fal_seedance_r2v(
     model_key: str,
     duration_seconds: int,
@@ -72,19 +51,31 @@ def video_cost_fal_seedance_r2v(
     charge, not what OpenRouter would have charged for the I2V route.
     """
     cfg = VIDEO_MODELS.get(model_key, {})
-    is_fast = "fast" in model_key.lower()
-    tier = "fast" if is_fast else "standard"
-    table = FAL_R2V_PRICING_USD_PER_SEC[tier]
+    table = cfg.get("audio_pricing") or {"720p": 0.30}
     rate = table.get(resolution) or next(iter(table.values()))
     total = round(rate * duration_seconds, 4)
     name = cfg.get("name", model_key)
     return total, f"{name} R2V (fal) · {duration_seconds}s × ${rate}/s @ {resolution} +audio"
 
 
+def video_cost_fal_wan_audio(
+    model_key: str,
+    duration_seconds: int,
+    resolution: str = "720p",
+) -> tuple[float, str]:
+    """Cost for fal Wan 2.7 image-to-video with driving audio."""
+    cfg = VIDEO_MODELS.get(model_key, {})
+    table = cfg.get("audio_pricing") or {"720p": 0.10, "1080p": 0.15}
+    rate = table.get(resolution) or next(iter(table.values()))
+    total = round(rate * duration_seconds, 4)
+    name = cfg.get("name", model_key)
+    return total, f"{name} I2V (fal) · {duration_seconds}s × ${rate}/s @ {resolution} +audio"
+
+
 def music_cost(source: str) -> tuple[float, str]:
-    if source == "suno":
-        return MUSIC_SUNO_USD, "Suno V4 · 1 song"
-    return MUSIC_LYRIA_USD, "Lyria 3 Pro · 1 song"
+    if source != "suno":
+        raise ValueError(f"Unknown music-generation source: {source}")
+    return MUSIC_SUNO_USD, "Suno V5.5 · 1 song"
 
 
 def transcription_cost(duration_seconds: float) -> tuple[float, str]:

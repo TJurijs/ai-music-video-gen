@@ -196,7 +196,7 @@ export default function StepCharactersCell({
 
 const PORTRAIT_MODELS = [
   { key: "gemini-3.1-flash-image", short: "Flash", full: "Gemini 3.1 Flash Image", price: "$0.04" },
-  { key: "gemini-3-pro-image",     short: "Pro",   full: "Gemini 3 Pro Image",   price: "$0.06" },
+  { key: "gemini-3-pro-image",     short: "Pro",   full: "Gemini 3 Pro Image",   price: "~$0.14" },
 ] as const;
 
 function CharacterRow({

@@ -4,7 +4,7 @@
   "configurations": [
     {
       "name": "backend",
-      "runtimeExecutable": "backend/.venv/bin/python",
+      "runtimeExecutable": "python",
       "runtimeArgs": [
         "-m", "uvicorn", "app.main:app",
         "--port", "8010",
@@ -14,7 +14,8 @@
       ],
       "port": 8010,
       "env": {
-        "PYTHONUNBUFFERED": "1"
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONUTF8": "1"
       }
     },
     {

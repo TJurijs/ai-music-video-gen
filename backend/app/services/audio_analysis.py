@@ -5,6 +5,7 @@ Transcription tries fal-ai/whisper first (word-level timestamps), falls back
 to OpenRouter chat-completions (lyrics text only, no timestamps).
 """
 
+import asyncio
 import numpy as np
 import librosa
 from typing import Optional
@@ -23,8 +24,12 @@ async def analyze_song(audio_path: str, existing_lyrics: Optional[str] = None) -
         lyrics: str
     }
     """
-    beats, bpm, key, sections, duration = _analyze_audio(audio_path)
-    transcription, lyrics = await _transcribe(audio_path, existing_lyrics)
+    beats, bpm, key, sections, duration = await asyncio.to_thread(
+        _analyze_audio, audio_path,
+    )
+    transcription, lyrics, transcription_provider = await _transcribe(
+        audio_path, existing_lyrics,
+    )
 
     return {
         "duration": duration,
@@ -34,6 +39,7 @@ async def analyze_song(audio_path: str, existing_lyrics: Optional[str] = None) -
         "sections": sections,
         "transcription": transcription,
         "lyrics": lyrics,
+        "transcription_provider": transcription_provider,
     }
 
 
@@ -98,7 +104,8 @@ async def _transcribe(audio_path: str, existing_lyrics: Optional[str]) -> tuple:
     """
     if settings.fal_api_key:
         try:
-            return await _transcribe_fal_whisper(audio_path)
+            words, text = await _transcribe_fal_whisper(audio_path)
+            return words, text, "fal"
         except Exception as e:
             print(f"[transcribe] fal whisper failed, falling back to OpenRouter: {e}")
             # Fall through to OpenRouter
@@ -107,7 +114,7 @@ async def _transcribe(audio_path: str, existing_lyrics: Optional[str]) -> tuple:
         result = await openrouter.transcribe_audio(audio_path)
     except Exception as e:
         if existing_lyrics:
-            return [], existing_lyrics
+            return [], existing_lyrics, "provided"
         raise RuntimeError(f"Transcription failed: {e}") from e
 
     words = []
@@ -127,7 +134,7 @@ async def _transcribe(audio_path: str, existing_lyrics: Optional[str]) -> tuple:
         # Fresh transcription wins; only fall back to existing if model returned nothing
         lyrics = new_text or (existing_lyrics or "")
 
-    return words, lyrics.strip()
+    return words, lyrics.strip(), "openrouter"
 
 
 async def _transcribe_fal_whisper(audio_path: str) -> tuple:

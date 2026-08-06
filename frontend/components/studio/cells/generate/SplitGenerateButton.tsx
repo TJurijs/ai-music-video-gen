@@ -12,7 +12,7 @@ export default function SplitGenerateButton({
   running: boolean;
   disabled: boolean;
   currentModel: string;
-  options: { key: string; label: string }[];
+  options: { key: string; label: string; disabled?: boolean; reason?: string }[];
   onClickMain: () => void;
   onPickModel: (key: string) => void;
   colorClasses: string;
@@ -94,13 +94,23 @@ export default function SplitGenerateButton({
           {options.map((o) => (
             <button
               key={o.key}
-              onClick={() => { setOpen(false); onPickModel(o.key); }}
+              onClick={() => {
+                if (o.disabled) return;
+                setOpen(false);
+                onPickModel(o.key);
+              }}
+              disabled={o.disabled}
+              title={o.reason}
               className={`w-full text-left text-xs px-3 py-1.5 hover:bg-accent/20 flex items-center justify-between gap-3 ${
-                o.key === currentModel ? "text-accent font-medium" : "text-zinc-300"
+                o.disabled
+                  ? "text-zinc-600 cursor-not-allowed hover:bg-transparent"
+                  : o.key === currentModel ? "text-accent font-medium" : "text-zinc-300"
               }`}
             >
               <span>{o.label}</span>
-              {o.key === currentModel && <span className="text-[9px] text-zinc-500 shrink-0">current</span>}
+              {o.disabled
+                ? <span className="text-[9px] text-amber-500/70 shrink-0">wrong length</span>
+                : o.key === currentModel && <span className="text-[9px] text-zinc-500 shrink-0">current</span>}
             </button>
           ))}
         </div>,

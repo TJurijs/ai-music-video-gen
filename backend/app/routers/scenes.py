@@ -1,6 +1,5 @@
 import json
 import os
-import shutil
 import traceback
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
@@ -12,7 +11,50 @@ from typing import Optional
 from app.database import engine, get_session
 from app.models import Scene, SceneAsset, ScenePromptVersion, Song, Project, Character, GenerationJob
 from app.config import settings, VIDEO_MODELS
-from app.services import pricing
+from app.services import openrouter, pricing
+from app.services.media_files import (
+    MAX_VIDEO_UPLOAD_BYTES,
+    VIDEO_EXTENSIONS,
+    MediaValidationError,
+    remove_storage_file,
+    remove_storage_files,
+    safe_original_name,
+    save_upload_limited,
+    upload_destination,
+    validate_media_async,
+    validated_extension,
+)
+from app.services.generation_state import release_stale_scene_claim
+
+
+def _record_failed_chat_billing(
+    project_id: int,
+    job_type: str,
+    fallback_cost: float,
+    fallback_detail: str,
+    error: Exception,
+) -> None:
+    """Persist a billed LLM response even when parsing/validation later fails."""
+    cost, detail, external_id, request_json = openrouter.consume_chat_billing(
+        fallback_cost,
+        fallback_detail,
+    )
+    if not external_id:
+        return
+    with Session(engine) as billing_db:
+        billing_db.add(GenerationJob(
+            project_id=project_id,
+            job_type=job_type,
+            provider="openrouter",
+            status="failed",
+            cost_usd=cost,
+            cost_detail=f"{detail} · response could not be used",
+            external_id=external_id,
+            request_json=request_json,
+            error=str(error)[:500],
+            completed_at=datetime.utcnow(),
+        ))
+        billing_db.commit()
 
 
 def _sync_scene_prompt_pointer(scene: Scene, prompt_type: str, text: str | None) -> None:
@@ -31,6 +73,76 @@ def _sync_scene_asset_pointer(scene: Scene, asset_type: str, file_path: str | No
         scene.reference_image_path = file_path
     elif asset_type == "video":
         scene.video_path = file_path
+
+
+def _detach_scene_jobs(db: Session, scene_ids: list[int]) -> None:
+    """Preserve project cost history when scene rows are replaced/deleted."""
+    if not scene_ids:
+        return
+    jobs = db.exec(
+        select(GenerationJob).where(GenerationJob.scene_id.in_(scene_ids))
+    ).all()
+    for job in jobs:
+        job.scene_id = None
+        db.add(job)
+
+
+def _ensure_scene_idle(
+    scene: Scene,
+    db: Session,
+    *,
+    include_remote_job: bool = True,
+) -> None:
+    release_stale_scene_claim(scene, db)
+    if scene.generation_run_id or scene.status in ("generating_image", "generating_video"):
+        raise HTTPException(
+            409,
+            "Scene generation is queued or running. Stop it and wait for the "
+            "scene to settle before changing its inputs or assets.",
+        )
+    if include_remote_job:
+        remote = db.exec(
+            select(GenerationJob)
+            .where(
+                GenerationJob.scene_id == scene.id,
+                GenerationJob.job_type == "video",
+                GenerationJob.status == "running",
+                GenerationJob.external_id.isnot(None),
+            )
+            .order_by(GenerationJob.id.desc())
+        ).first()
+        if remote:
+            raise HTTPException(
+                409,
+                f"Provider job {remote.external_id} is still active. Retry the "
+                "scene to reconcile that job before deleting or replacing it.",
+            )
+
+
+def _refresh_scene_last_frame(scene: Scene, video_path: str | None) -> bool:
+    """Keep the chain anchor synchronized with the active video variant."""
+    previous_path = scene.extracted_last_frame_path
+    if not video_path or not os.path.isfile(video_path):
+        remove_storage_file(previous_path)
+        scene.extracted_last_frame_path = None
+        return False
+
+    from app.services.generation_service import _extract_last_frame
+
+    destination = os.path.join(
+        settings.storage_dir,
+        str(scene.project_id),
+        "extracted",
+        f"scene_{scene.order}_last.jpg",
+    )
+    if _extract_last_frame(video_path, destination):
+        scene.extracted_last_frame_path = destination
+        return True
+    remove_storage_file(destination)
+    if previous_path and previous_path != destination:
+        remove_storage_file(previous_path)
+    scene.extracted_last_frame_path = None
+    return False
 
 
 def _save_prompt_version(
@@ -112,6 +224,7 @@ class SceneCreate(BaseModel):
     resolution: str = "720p"
     align_to_beats: bool = True
     audio_sync_enabled: bool = False
+    video_reference_mode: str = "frame"
     lyrics_segment: Optional[str] = None
 
 
@@ -127,6 +240,7 @@ class SceneUpdate(BaseModel):
     resolution: Optional[str] = None
     align_to_beats: Optional[bool] = None
     audio_sync_enabled: Optional[bool] = None
+    video_reference_mode: Optional[str] = None
     lyrics_segment: Optional[str] = None
     chain_from_prev: Optional[bool] = None
 
@@ -160,6 +274,8 @@ def list_scenes(project_id: int, db: Session = Depends(get_session)):
 
 @router.post("", status_code=201)
 def create_scene(data: SceneCreate, db: Session = Depends(get_session)):
+    if not db.get(Project, data.project_id):
+        raise HTTPException(404, "Project not found")
     scene = Scene(**data.model_dump())
     db.add(scene)
     db.commit()
@@ -181,6 +297,44 @@ def update_scene(scene_id: int, data: SceneUpdate, db: Session = Depends(get_ses
     if not scene:
         raise HTTPException(404, "Scene not found")
     payload = data.model_dump(exclude_none=True)
+    generation_inputs = {
+        "audio_start", "audio_end", "description", "video_prompt",
+        "image_prompt", "video_model", "image_model", "resolution",
+        "audio_sync_enabled", "video_reference_mode", "chain_from_prev",
+    }
+    if generation_inputs.intersection(payload):
+        _ensure_scene_idle(scene, db)
+    if "video_reference_mode" in payload and payload["video_reference_mode"] not in ("frame", "character"):
+        raise HTTPException(400, "video_reference_mode must be 'frame' or 'character'")
+    if payload.get("video_reference_mode") == "character":
+        # Chaining is exact first-frame conditioning, so it cannot coexist
+        # with character-reference mode.
+        payload["chain_from_prev"] = False
+    if "video_model" in payload:
+        selected_cfg = VIDEO_MODELS.get(payload["video_model"])
+        if not selected_cfg:
+            raise HTTPException(400, f"Unknown video model: {payload['video_model']}")
+        if not selected_cfg.get("supports_reference_images"):
+            # Switching away from a refs-capable model must not leave a
+            # hidden character-mode selection that the new model can't use.
+            payload["video_reference_mode"] = "frame"
+    if {"video_model", "audio_start", "audio_end"}.intersection(payload):
+        proposed_model = payload.get("video_model", scene.video_model)
+        selected_cfg = VIDEO_MODELS.get(proposed_model)
+        if not selected_cfg:
+            raise HTTPException(400, f"Unknown video model: {proposed_model}")
+        proposed_start = float(payload.get("audio_start", scene.audio_start))
+        proposed_end = float(payload.get("audio_end", scene.audio_end))
+        proposed_duration = int(round(proposed_end - proposed_start))
+        supported = selected_cfg.get("durations") or []
+        if proposed_duration not in supported:
+            supported_label = ", ".join(f"{value}s" for value in supported)
+            raise HTTPException(
+                400,
+                f"{selected_cfg.get('name', proposed_model)} cannot render this "
+                f"{proposed_duration}s scene. Supported durations: {supported_label}. "
+                "Choose a compatible model or change the scene length.",
+            )
     boundary_changed = "audio_start" in payload or "audio_end" in payload
 
     # If user manually edited a prompt, save it as a "manual" version.
@@ -196,9 +350,20 @@ def update_scene(scene_id: int, data: SceneUpdate, db: Session = Depends(get_ses
         _save_prompt_version(db, scene, "image", new_image_prompt, source="manual")
     if new_video_prompt is not None:
         _save_prompt_version(db, scene, "video", new_video_prompt, source="manual")
-    # Reset status if prompts changed (allow re-generation)
-    if any(k in payload for k in ["video_prompt", "image_prompt", "video_model"]):
-        if scene.status in ("done", "error"):
+    # Existing successful variants remain valid when prompts/models change;
+    # their metadata records what produced them. Timing edits are different:
+    # they change clip length and song alignment, so require a new render.
+    prompts_changed = new_image_prompt is not None or new_video_prompt is not None
+    if prompts_changed or "video_model" in payload:
+        if scene.status == "error" and scene.video_path and os.path.exists(scene.video_path):
+            scene.status = "done"
+    if boundary_changed:
+        if scene.video_path and os.path.exists(scene.video_path):
+            scene.status = "image_ready" if scene.reference_image_path else "pending"
+            scene.error_message = (
+                "Scene timing changed. Regenerate the video before assembly."
+            )
+        elif scene.status in ("done", "error"):
             scene.status = "pending"
 
     # If audio_start/audio_end moved, recompute lyrics_segment from word
@@ -246,6 +411,13 @@ def delete_scene(scene_id: int, db: Session = Depends(get_session)):
     scene = db.get(Scene, scene_id)
     if not scene:
         raise HTTPException(404, "Scene not found")
+    _ensure_scene_idle(scene, db, include_remote_job=True)
+    file_paths = [asset.file_path for asset in scene.assets]
+    file_paths.extend([
+        scene.reference_image_path,
+        scene.video_path,
+        scene.extracted_last_frame_path,
+    ])
     # Find scene N+1 BEFORE deleting N — once N is gone, the FK lookup
     # by order is the only way to find the orphan-link candidate.
     next_scene = db.exec(select(Scene).where(
@@ -255,24 +427,35 @@ def delete_scene(scene_id: int, db: Session = Depends(get_session)):
     if next_scene and next_scene.chain_from_prev:
         next_scene.chain_from_prev = False
         db.add(next_scene)
+    _detach_scene_jobs(db, [scene.id])
     db.delete(scene)
     db.commit()
+    remove_storage_files(file_paths)
 
 
 @router.delete("", status_code=200)
 def delete_all_scenes(project_id: int, db: Session = Depends(get_session)):
-    """Delete every scene in a project (and cascade their assets / prompt
-    versions / generation jobs). Returns the count deleted so the UI can
-    show feedback. Disk files are left behind — they're cheap and the user
-    can wipe storage/<project_id>/ manually if needed."""
+    """Delete every scene and its managed files while preserving project jobs."""
     project = db.get(Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
     scenes = db.exec(select(Scene).where(Scene.project_id == project_id)).all()
+    for scene in scenes:
+        _ensure_scene_idle(scene, db, include_remote_job=True)
+    file_paths: list[str | None] = []
+    for scene in scenes:
+        file_paths.extend(asset.file_path for asset in scene.assets)
+        file_paths.extend([
+            scene.reference_image_path,
+            scene.video_path,
+            scene.extracted_last_frame_path,
+        ])
     count = len(scenes)
+    _detach_scene_jobs(db, [scene.id for scene in scenes if scene.id is not None])
     for s in scenes:
         db.delete(s)
     db.commit()
+    remove_storage_files(file_paths)
     return {"deleted": count}
 
 
@@ -295,19 +478,36 @@ async def generate_scene_batch(req: GenerateBatchRequest, db: Session = Depends(
     the UI sees scenes appear progressively after every batch.
     """
     try:
+        if req.start_index < 0:
+            raise HTTPException(400, "start_index must be zero or greater")
+        if req.batch_size < 1 or req.batch_size > 10:
+            raise HTTPException(400, "batch_size must be between 1 and 10")
+        if req.target_scene_duration < 1 or req.target_scene_duration > 60:
+            raise HTTPException(400, "target_scene_duration must be between 1 and 60 seconds")
         song = db.get(Song, req.song_id)
-        if not song or song.status != "ready":
+        if not song or song.project_id != req.project_id:
+            raise HTTPException(404, "Song not found in this project")
+        if song.status != "ready":
             raise HTTPException(400, "Song not analyzed yet — wait for status: ready")
         project = db.get(Project, req.project_id)
         if not project:
             raise HTTPException(404, "Project not found")
+        if req.start_index == 0:
+            existing_plan = db.exec(
+                select(Scene).where(Scene.project_id == req.project_id)
+            ).all()
+            for existing_scene in existing_plan:
+                _ensure_scene_idle(
+                    existing_scene,
+                    db,
+                    include_remote_job=True,
+                )
 
         # Persist the seed on first batch so AI tools (and the user, on next
         # reload) inherit the same direction.
         if req.start_index == 0 and req.story_seed is not None and req.story_seed.strip():
             project.story_seed = req.story_seed.strip()
             db.add(project)
-            db.commit()
 
         characters = db.exec(
             select(Character).where(Character.project_id == req.project_id)
@@ -339,14 +539,9 @@ async def generate_scene_batch(req: GenerateBatchRequest, db: Session = Depends(
 
         # First batch wipes any existing scenes so the user gets a clean
         # plan (this matches `replace_existing=true` on the old auto-plan).
-        if req.start_index == 0:
-            existing = db.exec(select(Scene).where(Scene.project_id == req.project_id)).all()
-            for s in existing:
-                db.delete(s)
-            db.commit()
-
-        # Pull scenes already planned in earlier batches for continuity context.
-        previous_scenes_raw = db.exec(
+        # Keep the old plan intact while the replacement LLM call is running.
+        # A replacement also starts with a clean continuity context.
+        previous_scenes_raw = [] if req.start_index == 0 else db.exec(
             select(Scene).where(Scene.project_id == req.project_id).order_by(Scene.order)
         ).all()
         previous_scenes = [
@@ -373,7 +568,9 @@ async def generate_scene_batch(req: GenerateBatchRequest, db: Session = Depends(
         target_orders = list(range(req.start_index + 1,
                                    req.start_index + 1 + len(batch_windows)))
         existing_by_order = {s.order: s for s in previous_scenes_raw if s.order in target_orders}
-        if len(existing_by_order) == len(target_orders) and target_orders:
+        for existing_scene in existing_by_order.values():
+            _ensure_scene_idle(existing_scene, db, include_remote_job=True)
+        if req.start_index > 0 and len(existing_by_order) == len(target_orders) and target_orders:
             print(f"[generate-batch] start_index={req.start_index}: scenes at "
                   f"orders {target_orders} already exist — returning idempotent "
                   f"no-op (retry-safe path).")
@@ -389,13 +586,10 @@ async def generate_scene_batch(req: GenerateBatchRequest, db: Session = Depends(
         # Partial-overlap case (some scenes exist, others don't): treat as
         # corrupt state, delete the partial ones in this batch's range so the
         # LLM call below can repopulate cleanly without leaving orphans.
-        if existing_by_order:
+        if req.start_index > 0 and existing_by_order:
             print(f"[generate-batch] start_index={req.start_index}: partial overlap "
                   f"({len(existing_by_order)}/{len(target_orders)} scenes already exist) "
                   f"— deleting the partials and re-planning the batch.")
-            for s in existing_by_order.values():
-                db.delete(s)
-            db.commit()
 
         char_dicts = [{"name": c.name, "description": c.description} for c in characters]
         scene_dicts = await plan_scene_batch(
@@ -435,15 +629,58 @@ async def generate_scene_batch(req: GenerateBatchRequest, db: Session = Depends(
                 f"failures are common on per-batch calls.",
             )
 
+        valid_items = [
+            (index, item)
+            for index, item in enumerate(scene_dicts)
+            if (
+                isinstance(item, dict)
+                and index < len(batch_windows)
+                and all(
+                    isinstance(item.get(field), str) and item[field].strip()
+                    for field in ("description", "image_prompt", "video_prompt")
+                )
+            )
+        ]
+        if len(valid_items) != len(batch_windows):
+            raise HTTPException(
+                502,
+                f"Generate-batch returned {len(valid_items)} complete scene "
+                f"objects for {len(batch_windows)} requested windows. Every "
+                "scene needs description, image_prompt, and video_prompt. "
+                "The existing plan was preserved; try re-running.",
+            )
+
+        # Only now, after a successful and validated provider response, may a
+        # replacement remove existing rows. The delete and inserts share the
+        # final transaction below, so an insert failure rolls everything back.
+        removed_file_paths: list[str | None] = []
+        if req.start_index == 0:
+            replaced = db.exec(
+                select(Scene).where(Scene.project_id == req.project_id)
+            ).all()
+        else:
+            replaced = list(existing_by_order.values())
+        _detach_scene_jobs(
+            db,
+            [scene.id for scene in replaced if scene.id is not None],
+        )
+        for replaced_scene in replaced:
+            removed_file_paths.extend(asset.file_path for asset in replaced_scene.assets)
+            removed_file_paths.extend([
+                replaced_scene.reference_image_path,
+                replaced_scene.video_path,
+                replaced_scene.extracted_last_frame_path,
+            ])
+            db.delete(replaced_scene)
+        db.flush()
+
         # Persist this batch's scenes one-by-one so frontend polling sees
         # them appear progressively if the request happens to take longer.
         default_res = (VIDEO_MODELS.get(settings.default_video_model, {})
                        .get("resolutions") or ["720p"])[0]
         from app.services.audio_analysis import words_in_range
         created: list[Scene] = []
-        for i, sd in enumerate(scene_dicts):
-            if not isinstance(sd, dict):
-                continue
+        for i, sd in valid_items:
             order = req.start_index + i + 1
             # Trust the pre-determined window over whatever the LLM returned.
             try:
@@ -469,8 +706,7 @@ async def generate_scene_batch(req: GenerateBatchRequest, db: Session = Depends(
                 prompts_expanded=True,
             )
             db.add(scene)
-            db.commit()
-            db.refresh(scene)
+            db.flush()
             vp = (sd.get("video_prompt") or "").strip()
             ip = (sd.get("image_prompt") or "").strip()
             if vp:
@@ -498,14 +734,20 @@ async def generate_scene_batch(req: GenerateBatchRequest, db: Session = Depends(
         cost, detail = pricing.llm_plan_cost()
         # Scale roughly by batch fraction so 1 batch ≠ full plan cost.
         cost = round(cost * (len(batch_windows) / max(total_scenes, 1)), 4)
+        cost, detail, external_id, request_json = openrouter.consume_chat_billing(
+            cost,
+            detail,
+        )
         db.add(GenerationJob(
             project_id=req.project_id, job_type="llm_plan",
             provider="openrouter", status="completed",
             cost_usd=cost,
+            external_id=external_id, request_json=request_json,
             cost_detail=f"{detail} · batch {req.start_index // req.batch_size + 1} ({len(created)} scenes)",
             completed_at=datetime.utcnow(),
         ))
         db.commit()
+        remove_storage_files(removed_file_paths)
 
         next_index = req.start_index + len(created)
         return {
@@ -515,9 +757,25 @@ async def generate_scene_batch(req: GenerateBatchRequest, db: Session = Depends(
             "has_more": next_index < total_scenes,
             "next_start_index": next_index if next_index < total_scenes else None,
         }
-    except HTTPException:
+    except HTTPException as exc:
+        fallback_cost, fallback_detail = pricing.llm_plan_cost()
+        _record_failed_chat_billing(
+            req.project_id,
+            "llm_plan",
+            fallback_cost,
+            fallback_detail,
+            exc,
+        )
         raise
     except Exception as e:
+        fallback_cost, fallback_detail = pricing.llm_plan_cost()
+        _record_failed_chat_billing(
+            req.project_id,
+            "llm_plan",
+            fallback_cost,
+            fallback_detail,
+            e,
+        )
         print("[generate-batch] uncaught:")
         traceback.print_exc()
         raise HTTPException(
@@ -649,10 +907,15 @@ async def expand_prompts(
 
     # Record LLM expand cost
     exp_cost, exp_detail = pricing.llm_expand_cost()
+    exp_cost, exp_detail, external_id, request_json = openrouter.consume_chat_billing(
+        exp_cost,
+        exp_detail,
+    )
     db.add(GenerationJob(
         project_id=scene.project_id, scene_id=scene.id, job_type="llm_expand",
         provider="openrouter", status="completed",
         cost_usd=exp_cost, cost_detail=exp_detail,
+        external_id=external_id, request_json=request_json,
         completed_at=datetime.utcnow(),
     ))
 
@@ -825,10 +1088,15 @@ async def generate_continuation_prompt(
         # expand, but the difference is small (~$0.001-0.005). Tag the
         # cost_detail so it shows up distinctly in the job log.
         exp_cost, exp_detail = pricing.llm_expand_cost()
+        exp_cost, exp_detail, external_id, request_json = openrouter.consume_chat_billing(
+            exp_cost,
+            exp_detail,
+        )
         db.add(GenerationJob(
             project_id=scene.project_id, scene_id=scene.id, job_type="llm_expand",
             provider="openrouter", status="completed",
             cost_usd=exp_cost,
+            external_id=external_id, request_json=request_json,
             cost_detail=f"{exp_detail} · continuation (vision-grounded on prev last frame)",
             completed_at=datetime.utcnow(),
         ))
@@ -839,7 +1107,7 @@ async def generate_continuation_prompt(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[continuation-prompt] uncaught:")
+        print("[continuation-prompt] uncaught:")
         traceback.print_exc()
         raise HTTPException(
             500,
@@ -890,9 +1158,14 @@ async def soften_scene_prompt(
         scene.status = "image_ready" if scene.reference_image_path else "pending"
 
     cost, detail = pricing.llm_expand_cost()
+    cost, detail, external_id, request_json = openrouter.consume_chat_billing(
+        cost,
+        detail,
+    )
     db.add(GenerationJob(
         project_id=scene.project_id, scene_id=scene_id, job_type="llm_expand",
         provider="openrouter", status="completed",
+        external_id=external_id, request_json=request_json,
         cost_usd=cost, cost_detail=f"Soften {req.field} — {detail}",
         completed_at=datetime.utcnow(),
     ))
@@ -941,29 +1214,26 @@ def clear_scene(scene_id: int, db: Session = Depends(get_session)):
     """Wipe all generated assets for a scene (images, videos + files on disk)
     but keep the scene row + plan/prompts. Resets status to 'pending' so the
     user can re-generate fresh."""
-    import os as _os
     scene = db.get(Scene, scene_id)
     if not scene:
         raise HTTPException(404, "Scene not found")
+    _ensure_scene_idle(scene, db, include_remote_job=True)
 
     assets = db.exec(select(SceneAsset).where(SceneAsset.scene_id == scene_id)).all()
-    deleted_files = 0
+    file_paths = [asset.file_path for asset in assets]
+    file_paths.append(scene.extracted_last_frame_path)
     for a in assets:
-        if a.file_path and _os.path.exists(a.file_path):
-            try:
-                _os.remove(a.file_path)
-                deleted_files += 1
-            except OSError:
-                pass
         db.delete(a)
 
     scene.reference_image_path = None
     scene.video_path = None
+    scene.extracted_last_frame_path = None
     scene.openrouter_job_id = None
     scene.cancel_requested = False
     scene.error_message = None
     scene.status = "pending"
     db.add(scene); db.commit()
+    deleted_files = remove_storage_files(file_paths)
     return {
         "scene_id": scene_id,
         "assets_removed": len(assets),
@@ -1045,6 +1315,7 @@ def activate_prompt_version(scene_id: int, version_id: int, db: Session = Depend
     scene = db.get(Scene, scene_id)
     if not scene:
         raise HTTPException(404, "Scene not found")
+    _ensure_scene_idle(scene, db)
     version = db.get(ScenePromptVersion, version_id)
     if not version or version.scene_id != scene_id:
         raise HTTPException(404, "Prompt version not found")
@@ -1073,6 +1344,8 @@ def delete_prompt_version(scene_id: int, version_id: int, db: Session = Depends(
     if not version or version.scene_id != scene_id:
         raise HTTPException(404, "Prompt version not found")
     scene = db.get(Scene, scene_id)
+    if scene:
+        _ensure_scene_idle(scene, db)
     prompt_type = version.prompt_type
     delete_and_promote(
         db,
@@ -1109,9 +1382,12 @@ def activate_scene_asset(scene_id: int, asset_id: int, db: Session = Depends(get
     scene = db.get(Scene, scene_id)
     if not scene:
         raise HTTPException(404, "Scene not found")
+    _ensure_scene_idle(scene, db)
     asset = db.get(SceneAsset, asset_id)
     if not asset or asset.scene_id != scene_id:
         raise HTTPException(404, "Asset not found")
+    if not os.path.isfile(asset.file_path):
+        raise HTTPException(409, "Asset file is missing from storage")
 
     from app.services.versioning import make_active
     make_active(
@@ -1126,6 +1402,8 @@ def activate_scene_asset(scene_id: int, asset_id: int, db: Session = Depends(get
             db.add(scene),
         ),
     )
+    if asset.asset_type == "video":
+        _refresh_scene_last_frame(scene, asset.file_path)
     db.commit()
     return _scene_with_urls(scene, db)
 
@@ -1135,15 +1413,18 @@ def delete_scene_asset(scene_id: int, asset_id: int, db: Session = Depends(get_s
     """Delete a single asset version. Promotes the next-most-recent asset of
     the same type to active if the deleted one was active."""
     from app.services.versioning import delete_and_promote
-    import os as _os
     asset = db.get(SceneAsset, asset_id)
     if not asset or asset.scene_id != scene_id:
         raise HTTPException(404, "Asset not found")
     scene = db.get(Scene, scene_id)
+    if not scene:
+        raise HTTPException(404, "Scene not found")
+    _ensure_scene_idle(scene, db)
     asset_type = asset.asset_type
     file_path = asset.file_path
+    was_active = bool(asset.is_active)
 
-    delete_and_promote(
+    promoted = delete_and_promote(
         db,
         deleted=asset,
         siblings_filter=[
@@ -1155,15 +1436,11 @@ def delete_scene_asset(scene_id: int, asset_id: int, db: Session = Depends(get_s
             db.add(scene),
         ),
     )
+    if asset_type == "video" and was_active:
+        _refresh_scene_last_frame(scene, promoted.file_path if promoted else None)
     db.commit()
 
-    # Best-effort delete on disk
-    if file_path:
-        try:
-            if _os.path.exists(file_path):
-                _os.remove(file_path)
-        except OSError:
-            pass
+    remove_storage_file(file_path)
 
 
 # ---------------------------------------------------------------------------
@@ -1183,7 +1460,6 @@ def download_first_frame(scene_id: int, db: Session = Depends(get_session)):
     scene = db.get(Scene, scene_id)
     if not scene:
         raise HTTPException(404, "Scene not found")
-
     src_path: Optional[str] = None
     label = "scene_first_frame"
     if scene.chain_from_prev:
@@ -1240,7 +1516,7 @@ async def download_audio_chunk(scene_id: int, db: Session = Depends(get_session)
 
 
 @router.post("/{scene_id}/upload-video", status_code=201)
-def upload_scene_video(
+async def upload_scene_video(
     scene_id: int,
     file: UploadFile = File(...),
     db: Session = Depends(get_session),
@@ -1251,24 +1527,38 @@ def upload_scene_video(
     scene = db.get(Scene, scene_id)
     if not scene:
         raise HTTPException(404, "Scene not found")
+    _ensure_scene_idle(scene, db, include_remote_job=True)
 
-    filename = file.filename or "uploaded.mp4"
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "mp4"
-    if ext not in ("mp4", "mov", "webm"):
-        raise HTTPException(400, f"Unsupported video extension: {ext}")
-
-    ts = int(datetime.utcnow().timestamp())
-    dest_dir = os.path.join(settings.storage_dir, str(scene.project_id), "videos")
-    os.makedirs(dest_dir, exist_ok=True)
-    dest_path = os.path.join(dest_dir, f"scene_{scene.id}_upload_{ts}.{ext}")
-    with open(dest_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    filename = safe_original_name(file.filename, "uploaded.mp4")
+    try:
+        ext = validated_extension(
+            file.filename, VIDEO_EXTENSIONS, fallback="uploaded.mp4",
+        )
+        dest_path = upload_destination(
+            scene.project_id, "videos", f"scene_{scene.id}_upload", ext,
+        )
+        await save_upload_limited(
+            file, dest_path, max_bytes=MAX_VIDEO_UPLOAD_BYTES,
+        )
+        await validate_media_async(dest_path, "video")
+    except MediaValidationError as exc:
+        remove_storage_file(locals().get("dest_path"))
+        raise HTTPException(400, str(exc)) from exc
 
     # Register as a new video asset and make it active via the same path the
     # generated videos take, so the variant gallery / activate / delete flow
     # works identically.
     from app.services.versioning import make_active
-    from app.services.generation_service import _extract_last_frame
+    from app.services.generation_service import _prepare_generated_video
+
+    # Validate extraction before registering the asset. The helper updates
+    # the stable chain anchor atomically, preserving the old one on failure.
+    try:
+        last_frame_dest = await _prepare_generated_video(scene, dest_path)
+    except Exception as exc:
+        remove_storage_file(dest_path)
+        raise HTTPException(400, str(exc)) from exc
+
     asset = SceneAsset(
         scene_id=scene.id,
         asset_type="video",
@@ -1289,15 +1579,7 @@ def upload_scene_video(
         on_active_change=lambda a: setattr(scene, "video_path", a.file_path),
     )
 
-    # Extract the last frame so downstream chained scenes can use it as
-    # their first_frame, just like a generated video would.
-    last_frame_dest = os.path.join(
-        settings.storage_dir, str(scene.project_id), "extracted",
-        f"scene_{scene.order}_last.jpg",
-    )
-    os.makedirs(os.path.dirname(last_frame_dest), exist_ok=True)
-    if _extract_last_frame(dest_path, last_frame_dest):
-        scene.extracted_last_frame_path = last_frame_dest
+    scene.extracted_last_frame_path = last_frame_dest
 
     scene.status = "done"
     scene.error_message = None

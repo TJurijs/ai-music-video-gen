@@ -4,8 +4,63 @@ import asyncio
 import base64
 import os
 import httpx
+import json
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Optional
 from app.config import settings, OPENROUTER_BASE
+
+
+class RemoteJobPendingError(RuntimeError):
+    """The local poll failed, but the paid provider job may still be running."""
+
+
+@dataclass
+class ImageGenerationResult:
+    data: bytes
+    cost_usd: float | None
+    generation_id: str | None
+    usage: dict
+
+
+_last_chat_billing: ContextVar[dict | None] = ContextVar(
+    "openrouter_last_chat_billing",
+    default=None,
+)
+
+
+def consume_chat_billing(
+    fallback_cost: float,
+    fallback_detail: str,
+) -> tuple[float, str, str | None, str | None]:
+    """Return authoritative billing from the latest chat call in this task.
+
+    ContextVar keeps concurrent FastAPI requests isolated. Callers consume the
+    snapshot immediately after the planner/expander returns, then persist it
+    on GenerationJob. The fallback remains for providers that omit usage.
+    """
+    snapshot = _last_chat_billing.get()
+    _last_chat_billing.set(None)
+    if not snapshot:
+        return fallback_cost, fallback_detail, None, None
+    usage = snapshot.get("usage") if isinstance(snapshot.get("usage"), dict) else {}
+    raw_cost = usage.get("cost")
+    cost = (
+        float(raw_cost)
+        if isinstance(raw_cost, (int, float))
+        else fallback_cost
+    )
+    detail = (
+        f"{fallback_detail} · actual OpenRouter usage"
+        if isinstance(raw_cost, (int, float))
+        else fallback_detail
+    )
+    return (
+        cost,
+        detail,
+        snapshot.get("generation_id"),
+        json.dumps(snapshot, ensure_ascii=False),
+    )
 
 
 def _headers() -> dict:
@@ -23,6 +78,7 @@ def _headers() -> dict:
 async def chat(messages: list, model: Optional[str] = None, json_mode: bool = False, timeout: int = 300) -> str:
     """Send a chat completion. Default timeout is 300s — large scene plans
     can produce 50KB+ JSON responses that take 60-120s on slower models."""
+    _last_chat_billing.set(None)
     model = model or settings.default_llm_model
     payload: dict = {"model": model, "messages": messages}
     if json_mode:
@@ -37,6 +93,12 @@ async def chat(messages: list, model: Optional[str] = None, json_mode: bool = Fa
         if r.status_code >= 400:
             raise RuntimeError(f"OpenRouter chat {r.status_code}: {r.text[:600]}")
         data = r.json()
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        _last_chat_billing.set({
+            "generation_id": data.get("id"),
+            "model": data.get("model") or model,
+            "usage": usage,
+        })
         msg = data["choices"][0]["message"]
         content = msg.get("content")
         if content is None:
@@ -56,8 +118,9 @@ async def generate_image(
     reference_image_paths: Optional[list[str]] = None,
     aspect_ratio: Optional[str] = None,
     _retry_count: int = 0,
-) -> bytes:
-    """Returns raw image bytes.
+    _accumulated_cost: float = 0.0,
+) -> ImageGenerationResult:
+    """Return image bytes plus OpenRouter's authoritative billed usage.
 
     If reference_image_paths is provided, they're sent as multi-image input
     so the model preserves character/style identity. Only useful with image
@@ -117,6 +180,23 @@ async def generate_image(
         data = r.json()
 
     msg = data["choices"][0]["message"]
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    response_cost_raw = usage.get("cost")
+    response_cost = (
+        float(response_cost_raw)
+        if isinstance(response_cost_raw, (int, float))
+        else 0.0
+    )
+    total_cost = _accumulated_cost + response_cost
+    generation_id = data.get("id") if isinstance(data.get("id"), str) else None
+
+    async def result_from_url(url: str) -> ImageGenerationResult:
+        return ImageGenerationResult(
+            data=await _bytes_from_url(url),
+            cost_usd=round(total_cost, 6) if total_cost > 0 else None,
+            generation_id=generation_id,
+            usage=usage,
+        )
 
     # Gemini & some OpenAI image models return images in a separate `images` array
     # on the message, not inside `content`. Check there first.
@@ -126,7 +206,7 @@ async def generate_image(
             if isinstance(part, dict):
                 url = (part.get("image_url") or {}).get("url") or part.get("url")
                 if url:
-                    return await _bytes_from_url(url)
+                    return await result_from_url(url)
 
     # Fallback: content is a list of parts (older format)
     content = msg.get("content")
@@ -135,11 +215,11 @@ async def generate_image(
             if isinstance(part, dict) and part.get("type") == "image_url":
                 url = (part.get("image_url") or {}).get("url")
                 if url:
-                    return await _bytes_from_url(url)
+                    return await result_from_url(url)
 
     # Fallback: content is a base64 data URL string
     if isinstance(content, str) and content.startswith("data:"):
-        return await _bytes_from_url(content)
+        return await result_from_url(content)
 
     # Text-only response — model returned a description instead of an image.
     # Classic Gemini failure: prompt tripped a likeness/content filter and
@@ -158,6 +238,7 @@ async def generate_image(
             reference_image_paths=reference_image_paths,
             aspect_ratio=None,  # already baked into prompt on first try
             _retry_count=_retry_count + 1,
+            _accumulated_cost=total_cost,
         )
 
     preview = str(content)[:200] if content else str(msg)[:300]
@@ -274,10 +355,10 @@ async def submit_video_job(
     user picks the recovery path explicitly: switch to a permissive model
     (Kling / Veo) or activate a less-recognizable portrait variant.
 
-    Note on audio: we never set `generate_audio` — the song's audio is
-    muxed verbatim at assembly time, so model-generated audio would just
-    get overwritten. The OpenRouter payload omits the field entirely (the
-    model decides its default, which is "off" for all video models we use).
+    Note on audio: we explicitly set `generate_audio=False`. OpenRouter's
+    current video API may default this to the endpoint capability (often
+    true), while this app always muxes the original song at assembly time.
+    Explicitly disabling invented audio keeps billing and behavior aligned.
     """
     payload: dict = {
         "model": model_id,
@@ -285,7 +366,14 @@ async def submit_video_job(
         "duration": duration,
         "aspect_ratio": aspect_ratio,
         "resolution": resolution,
+        "generate_audio": False,
     }
+
+    if (first_frame_path or last_frame_path) and reference_image_paths:
+        raise ValueError(
+            "frame_images and input_references are mutually exclusive. "
+            "Choose frame mode or character-reference mode before submitting."
+        )
 
     # Veo accepts a personGeneration passthrough that controls its real-person
     # filter (default = dont_allow). Opt into allow_adult so photoreal
@@ -325,14 +413,20 @@ async def submit_video_job(
     # Log payload shape so we can confirm WHAT was actually sent. Doesn't
     # log the base64 image bytes — just the count + dimensions so it's
     # readable. Useful for "did the character ref actually go through?"
-    print(
-        f"[openrouter video] submit model={model_id} duration={duration}s "
-        f"resolution={resolution} aspect={aspect_ratio} "
-        f"first_frame={'yes' if first_frame_path else 'no'} "
-        f"last_frame={'yes' if last_frame_path else 'no'} "
-        f"input_references={len(refs)} ref(s) "
-        f"prompt[:120]={prompt[:120]!r}"
-    )
+    # A hidden Windows launcher can leave Python's inherited stdout handle in
+    # an invalid state. Diagnostic output must never abort a paid provider
+    # request with ``OSError: [Errno 22] Invalid argument`` before submission.
+    try:
+        print(
+            f"[openrouter video] submit model={model_id} duration={duration}s "
+            f"resolution={resolution} aspect={aspect_ratio} "
+            f"first_frame={'yes' if first_frame_path else 'no'} "
+            f"last_frame={'yes' if last_frame_path else 'no'} "
+            f"input_references={len(refs)} ref(s) "
+            f"prompt[:120]={prompt[:120]!r}"
+        )
+    except OSError:
+        pass
 
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
@@ -456,11 +550,10 @@ async def poll_video_job(
                 f"sleeping {interval}s and retrying"
             )
             if consecutive_network_fails >= MAX_CONSECUTIVE_NETWORK_FAILS:
-                raise RuntimeError(
+                raise RemoteJobPendingError(
                     f"OpenRouter polling failed: {MAX_CONSECUTIVE_NETWORK_FAILS} consecutive "
-                    f"network errors. Job {job_id} may still be running — refresh "
-                    f"in a few minutes; the BackgroundTask's self-heal pass will "
-                    f"mark it done if a video URL became available."
+                    f"network errors. Job {job_id} is preserved; retry this scene "
+                    f"to resume polling without submitting another paid render."
                 ) from net_err
             await asyncio.sleep(interval)
             continue
@@ -473,7 +566,10 @@ async def poll_video_job(
         if status in ("failed", "error"):
             raise RuntimeError(f"Video job failed: {data.get('error', 'unknown')}")
         await asyncio.sleep(interval)
-    raise TimeoutError(f"Video job {job_id} timed out after {timeout}s")
+    raise RemoteJobPendingError(
+        f"Video job {job_id} exceeded the local {timeout}s polling window. "
+        "Retry this scene to resume polling without submitting another paid render."
+    )
 
 
 # ---------------------------------------------------------------------------

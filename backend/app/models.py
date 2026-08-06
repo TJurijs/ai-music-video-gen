@@ -36,10 +36,10 @@ class Project(SQLModel, table=True):
 
 class Song(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    project_id: int = Field(foreign_key="project.id")
+    project_id: int = Field(foreign_key="project.id", index=True)
     title: str
     artist: Optional[str] = None
-    # source: "lyria" | "suno" | "upload"
+    # source: "suno" | "upload"
     source: str = Field(default="upload")
     file_path: Optional[str] = None
     duration: Optional[float] = None
@@ -54,8 +54,9 @@ class Song(SQLModel, table=True):
     sections_json: Optional[str] = None
     # JSON string: {theme, narrative, mood, visual_world, characters_in_lyrics, suggested_visual_style}
     theme_analysis: Optional[str] = None
-    # status: "pending" | "analyzing" | "ready" | "error"
+    # status: "pending" | "generating" | "analyzing" | "ready" | "error"
     status: str = Field(default="pending")
+    error_message: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
     project: Optional[Project] = Relationship(back_populates="songs")
@@ -63,7 +64,7 @@ class Song(SQLModel, table=True):
 
 class Character(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    project_id: int = Field(foreign_key="project.id")
+    project_id: int = Field(foreign_key="project.id", index=True)
     name: str
     description: str
     reference_image_path: Optional[str] = None  # active portrait — pointer into CharacterAsset
@@ -106,7 +107,7 @@ class CharacterAsset(SQLModel, table=True):
 
 class Scene(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    project_id: int = Field(foreign_key="project.id")
+    project_id: int = Field(foreign_key="project.id", index=True)
     order: int
     audio_start: float
     audio_end: float
@@ -122,14 +123,19 @@ class Scene(SQLModel, table=True):
     align_to_beats: bool = Field(default=True)
     prompts_expanded: bool = Field(default=False)  # True once a prompt has been generated (planner or wand)
 
-    # Audio sync via Seedance reference-to-video (fal-routed).
-    # When True AND the chosen video_model has `supports_audio_input=True`
-    # (Seedance variants), the video gen submits to fal's R2V endpoint with
-    # the scene's audio window passed as audio_url + character portraits as
-    # image_urls. In this mode, first_frame is NOT used (Seedance R2V doesn't
-    # accept it) so the scene's reference still is skipped at render time.
-    # No effect on non-Seedance models — silently ignored.
+    # Audio-reference video generation through a model-specific fal route.
+    # Seedance uses reference images plus a song slice and skips exact frame
+    # anchors; Wan uses its image-to-video route with the still/chained frame
+    # plus the song slice. Preflight is authoritative for route constraints.
+    # No effect on models without `supports_audio_input`.
     audio_sync_enabled: bool = Field(default=False)
+
+    # OpenRouter exposes exact frame conditioning and character-reference
+    # conditioning as separate modes. If both payload fields are sent,
+    # frame_images wins and input_references is ignored. Persist the user's
+    # choice so refs-capable models (Seedance/Wan) can genuinely use either.
+    # Values: "frame" | "character".
+    video_reference_mode: str = Field(default="frame")
 
     # Scene chaining (opt-in, off by default).
     # When `chain_from_prev` is True, this scene's video generation uses the
@@ -148,6 +154,12 @@ class Scene(SQLModel, table=True):
     error_message: Optional[str] = None
     openrouter_job_id: Optional[str] = None
     cancel_requested: bool = Field(default=False)
+    # Atomic admission token for one scene pipeline at a time. The API sets
+    # this with a conditional UPDATE before scheduling any paid work, and the
+    # pipeline clears it in a finally block.
+    generation_run_id: Optional[str] = Field(default=None, index=True)
+    generation_phase: Optional[str] = None
+    generation_requested_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
     project: Optional[Project] = Relationship(back_populates="scenes")
@@ -158,6 +170,10 @@ class Scene(SQLModel, table=True):
     prompt_versions: List["ScenePromptVersion"] = Relationship(
         back_populates="scene",
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
+    jobs: List["GenerationJob"] = Relationship(
+        back_populates="scene",
+        sa_relationship_kwargs={"passive_deletes": True},
     )
 
 
@@ -204,20 +220,29 @@ class ScenePromptVersion(SQLModel, table=True):
 
 class GenerationJob(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    project_id: int = Field(foreign_key="project.id")
-    scene_id: Optional[int] = None
+    project_id: int = Field(foreign_key="project.id", index=True)
+    scene_id: Optional[int] = Field(
+        default=None,
+        foreign_key="scene.id",
+        ondelete="SET NULL",
+        index=True,
+    )
     # job_type: "image" | "video" | "music" | "transcription" | "llm_plan"
     #         | "llm_expand" | "assembly"
     job_type: str
     # provider: "openrouter" | "fal" | "suno" | "ffmpeg"
     provider: str = Field(default="openrouter")
     external_id: Optional[str] = None
-    # status: "pending" | "running" | "completed" | "failed"
+    # Immutable provider request/submission snapshot used to reconcile jobs
+    # after a backend restart without paying for a duplicate submission.
+    request_json: Optional[str] = None
+    # status: "pending" | "running" | "completed" | "failed" | "cancelled"
     status: str = Field(default="pending")
     result_url: Optional[str] = None
     result_path: Optional[str] = None
     error: Optional[str] = None
-    # Estimated cost in USD; charged regardless of pass/fail unless 0
+    # Estimated billable cost in USD. The cost endpoint counts completed jobs
+    # plus provider-submitted jobs with an external handle.
     cost_usd: float = Field(default=0.0)
     # Free-form details: "{model} × {duration}s" or similar
     cost_detail: Optional[str] = None
@@ -225,3 +250,4 @@ class GenerationJob(SQLModel, table=True):
     completed_at: Optional[datetime] = None
 
     project: Optional[Project] = Relationship(back_populates="jobs")
+    scene: Optional[Scene] = Relationship(back_populates="jobs")

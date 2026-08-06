@@ -1,11 +1,13 @@
 "use client";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Loader2, Image as ImageIcon, Video, RefreshCw, Settings, DollarSign } from "lucide-react";
+import { Loader2, Image as ImageIcon, Video, RefreshCw, SlidersHorizontal, DollarSign } from "lucide-react";
+import { useState } from "react";
 import { api } from "@/lib/api";
 import { useConfirm } from "@/components/ConfirmDialog";
 import type { Project, Scene, GenerationJob, ProjectCosts } from "@/lib/types";
 import SceneGenRow from "./generate/SceneGenRow";
 import GlobalModelPicker from "./generate/GlobalModelPicker";
+import VideoModelCheatSheet from "./generate/VideoModelCheatSheet";
 import { fmtCost, mostCommon } from "./generate/shared";
 
 export default function StepGenerateCell({
@@ -18,6 +20,8 @@ export default function StepGenerateCell({
 }) {
   const qc = useQueryClient();
   const confirm = useConfirm();
+  const [bulkError, setBulkError] = useState<string | null>(null);
+  const [checkingPreflight, setCheckingPreflight] = useState(false);
   const refresh = () => qc.invalidateQueries({ queryKey: ["project", project.id] });
 
   const { data: models } = useQuery({
@@ -26,20 +30,81 @@ export default function StepGenerateCell({
   });
 
   const generateBatch = useMutation({
-    mutationFn: (phase: "image" | "video" | "all") =>
-      api.generation.generateBatch(project.id, undefined, false, phase),
+    mutationFn: ({
+      phase, sceneIds, force,
+    }: {
+      phase: "image" | "video" | "all";
+      sceneIds: number[];
+      force: boolean;
+    }) => api.generation.generateBatch(project.id, sceneIds, force, phase),
     onSuccess: refresh,
+    onError: (error) => setBulkError((error as Error).message),
   });
 
-  const regenerateAll = useMutation({
-    mutationFn: () => api.generation.generateBatch(project.id, undefined, true, "all"),
-    onSuccess: refresh,
-  });
-
-  const regenAllStills = useMutation({
-    mutationFn: () => api.generation.generateBatch(project.id, undefined, true, "image"),
-    onSuccess: refresh,
-  });
+  const runBulk = async ({
+    phase,
+    sceneIds,
+    force = false,
+    title,
+    confirmLabel,
+    destructive = false,
+  }: {
+    phase: "image" | "video" | "all";
+    sceneIds: number[];
+    force?: boolean;
+    title: string;
+    confirmLabel: string;
+    destructive?: boolean;
+  }) => {
+    setBulkError(null);
+    setCheckingPreflight(true);
+    try {
+      const report = await api.generation.preflight(
+        project.id,
+        phase,
+        sceneIds,
+        force,
+      );
+      const blocked = report.scenes.filter((scene) => !scene.ready);
+      if (blocked.length) {
+        setBulkError(
+          blocked
+            .map((scene) => `Scene #${scene.scene_order}: ${scene.errors.join("; ")}`)
+            .join("\n")
+        );
+        return;
+      }
+      if (!report.scene_count) {
+        setBulkError("No scenes currently need this operation.");
+        return;
+      }
+      const providers = Array.from(new Set(
+        report.scenes.map((scene) => scene.provider).filter(Boolean)
+      ));
+      const warnings = Array.from(new Set(
+        report.scenes.flatMap((scene) => scene.warnings)
+      ));
+      const ok = await confirm({
+        title,
+        message: [
+          `${report.scene_count} scene${report.scene_count === 1 ? "" : "s"} passed preflight.`,
+          `Estimated new provider cost: ${fmtCost(report.estimated_cost)}.`,
+          providers.length ? `Provider route${providers.length === 1 ? "" : "s"}: ${providers.join(" + ")}.` : null,
+          warnings.length ? `Notes:\n• ${warnings.slice(0, 4).join("\n• ")}` : null,
+          "Existing successful variants stay available unless you delete them separately.",
+        ].filter(Boolean).join("\n\n"),
+        confirmLabel,
+        destructive,
+      });
+      if (ok) {
+        generateBatch.mutate({ phase, sceneIds, force });
+      }
+    } catch (error) {
+      setBulkError((error as Error).message || "Preflight failed");
+    } finally {
+      setCheckingPreflight(false);
+    }
+  };
 
   // Global default model setter — patches every scene at once
   const setGlobalModel = useMutation({
@@ -55,13 +120,17 @@ export default function StepGenerateCell({
 
   const done = scenes.filter((s) => s.status === "done").length;
   const pending = scenes.filter((s) => s.status === "pending").length;
-  const imageReady = scenes.filter((s) => s.status === "image_ready").length;
   const errored = scenes.filter((s) => s.status === "error").length;
-  const cancelled = scenes.filter((s) => s.status === "cancelled").length;
   const inProgress = scenes.filter((s) =>
     ["generating_image", "generating_video"].includes(s.status)
   ).length;
   const noImage = scenes.filter((s) => !s.reference_image_url).length;
+  const noImageIds = scenes.filter((s) => !s.reference_image_url).map((s) => s.id);
+  const videoCandidateIds = scenes
+    .filter((s) => ["image_ready", "error", "cancelled"].includes(s.status))
+    .map((s) => s.id);
+  const sceneDurations = scenes.map((scene) => Math.round(scene.audio_end - scene.audio_start));
+  const bulkBusy = generateBatch.isPending || checkingPreflight;
 
   return (
     <div className="space-y-4 pt-4">
@@ -87,10 +156,10 @@ export default function StepGenerateCell({
       {models && (
         <div className="bg-surface-2 rounded-lg border border-white/5 p-2.5 space-y-1.5">
           <div className="text-[10px] text-zinc-500 uppercase tracking-wide flex items-center gap-1">
-            <Settings className="w-2.5 h-2.5" /> Default models for all {scenes.length} scenes
-            <span className="text-zinc-700 normal-case ml-1">(can be overridden per scene in Settings)</span>
+            <SlidersHorizontal className="w-2.5 h-2.5" /> Default models for all {scenes.length} scenes
+            <span className="text-zinc-700 normal-case ml-1">(video model can be overridden from each scene's Vid button)</span>
           </div>
-          <div className="grid grid-cols-2 gap-2">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
             <GlobalModelPicker
               icon={<ImageIcon className="w-2.5 h-2.5" />}
               label="Image"
@@ -103,7 +172,19 @@ export default function StepGenerateCell({
               icon={<Video className="w-2.5 h-2.5" />}
               label="Video"
               value={mostCommon(scenes.map((s) => s.video_model))}
-              options={Object.entries(models.video).map(([k, m]) => ({ key: k, label: m.name }))}
+              options={Object.entries(models.video).map(([k, m]) => {
+                const unsupported = Array.from(new Set(
+                  sceneDurations.filter((duration) => !m.durations.includes(duration))
+                )).sort((a, b) => a - b);
+                return {
+                  key: k,
+                  label: m.name,
+                  disabled: unsupported.length > 0,
+                  reason: unsupported.length
+                    ? `does not support ${unsupported.map((value) => `${value}s`).join(", ")} scenes`
+                    : undefined,
+                };
+              })}
               onChange={(v) => {
                 // When changing the global video model, also reset everyone's
                 // resolution to the new model's first supported option — the
@@ -124,7 +205,7 @@ export default function StepGenerateCell({
               if (!cfg?.resolutions?.length) return null;
               return (
                 <GlobalModelPicker
-                  icon={<Settings className="w-2.5 h-2.5" />}
+                  icon={<SlidersHorizontal className="w-2.5 h-2.5" />}
                   label="Resolution"
                   value={mostCommon(scenes.map((s) => s.resolution)) || cfg.resolutions[0]}
                   options={cfg.resolutions.map((r: string) => ({ key: r, label: r }))}
@@ -137,67 +218,101 @@ export default function StepGenerateCell({
         </div>
       )}
 
+      {models && (
+        <VideoModelCheatSheet
+          models={models}
+          selectedModel={mostCommon(scenes.map((s) => s.video_model)) || ""}
+          sceneDurations={sceneDurations}
+          disabled={setGlobalModel.isPending}
+          onSelect={(videoModel, resolution) =>
+            setGlobalModel.mutate({ video_model: videoModel, resolution })
+          }
+        />
+      )}
+
       {/* Bulk actions — split into stages so you preview cheap stills before paying for video */}
-      <div className="grid grid-cols-2 gap-2">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
         <button
-          onClick={() => generateBatch.mutate("image")}
-          disabled={generateBatch.isPending || noImage === 0}
+          onClick={() => runBulk({
+            phase: "image",
+            sceneIds: noImageIds,
+            title: "Generate reference stills",
+            confirmLabel: "Generate stills",
+          })}
+          disabled={bulkBusy || noImage === 0}
           className="flex items-center justify-center gap-2 bg-blue-500/15 hover:bg-blue-500/30 border border-blue-500/30 text-blue-300 disabled:opacity-50 text-sm font-medium py-2.5 rounded-lg transition-colors"
-          title="Generate reference still images for scenes that don't have one yet (~$0.04/scene)"
+          title="Generate reference still images for scenes that don't have one yet; exact provider cost is recorded from the response"
         >
           <ImageIcon className="w-4 h-4" />
           Generate {noImage} Still{noImage === 1 ? "" : "s"}
         </button>
         <button
-          onClick={() => generateBatch.mutate("video")}
-          disabled={generateBatch.isPending || imageReady + errored + cancelled === 0}
+          onClick={() => runBulk({
+            phase: "video",
+            sceneIds: videoCandidateIds,
+            title: "Generate scene videos",
+            confirmLabel: "Generate videos",
+          })}
+          disabled={bulkBusy || videoCandidateIds.length === 0}
           className="flex items-center justify-center gap-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-white text-sm font-medium py-2.5 rounded-lg transition-colors"
           title="Generate video clips from existing reference stills"
         >
           <Video className="w-4 h-4" />
-          Generate {imageReady + errored + cancelled} Video{imageReady + errored + cancelled === 1 ? "" : "s"}
+          Generate {videoCandidateIds.length} Video{videoCandidateIds.length === 1 ? "" : "s"}
         </button>
       </div>
       <div className="flex gap-2">
         {scenes.some((s) => !!s.reference_image_url) && (
           <button
-            onClick={async () => {
-              const n = scenes.filter((s) => !!s.reference_image_url).length;
-              if (await confirm({
-                title: "Regenerate all stills",
-                message: `Regenerate all ${n} stills as new variants? Estimated cost ~$${(0.04 * n).toFixed(2)}.\nThe old stills stay as variants — you can pick which one is active per scene.`,
-                confirmLabel: "Regenerate all",
-              })) {
-                regenAllStills.mutate();
-              }
-            }}
-            disabled={regenAllStills.isPending}
+            onClick={() => runBulk({
+              phase: "image",
+              sceneIds: scenes.map((scene) => scene.id),
+              force: true,
+              title: "Regenerate all stills",
+              confirmLabel: "Regenerate all",
+            })}
+            disabled={bulkBusy}
             className="flex-1 text-xs px-3 py-2 bg-blue-500/10 hover:bg-blue-500/20 text-blue-300 border border-blue-500/30 rounded-lg transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
             title="Re-render all stills using current image model + project aspect ratio + current style. Useful after changing global settings. Old stills are kept as variants."
           >
-            {regenAllStills.isPending
+            {bulkBusy
               ? <><Loader2 className="w-3 h-3 animate-spin" /> Re-rendering stills…</>
               : <><RefreshCw className="w-3 h-3" /> Regenerate all stills</>}
           </button>
         )}
         {done > 0 && (
           <button
-            onClick={async () => {
-              if (await confirm({
-                title: "Regenerate everything",
-                message: `Regenerate all ${scenes.length} scenes (image + video) from scratch?`,
-                confirmLabel: "Regenerate everything",
-                destructive: true,
-              })) {
-                regenerateAll.mutate();
-              }
-            }}
+            onClick={() => runBulk({
+              phase: "all",
+              sceneIds: scenes.map((scene) => scene.id),
+              force: true,
+              title: "Regenerate every scene",
+              confirmLabel: "Regenerate everything",
+              destructive: true,
+            })}
+            disabled={bulkBusy}
             className="flex-1 text-xs px-3 py-2 bg-surface-2 hover:bg-surface-3 text-zinc-400 hover:text-white border border-white/10 rounded-lg transition-colors flex items-center justify-center gap-1.5"
           >
             <RefreshCw className="w-3 h-3" /> Regenerate everything from scratch
           </button>
         )}
       </div>
+
+      {bulkError && (
+        <div className="whitespace-pre-line rounded-lg border border-red-800/40 bg-red-900/20 px-3 py-2 text-xs text-red-300">
+          <div className="flex items-start justify-between gap-3">
+            <span>{bulkError}</span>
+            <button
+              type="button"
+              onClick={() => setBulkError(null)}
+              className="shrink-0 text-red-400/70 hover:text-red-200"
+              aria-label="Dismiss generation error"
+            >
+              ×
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Per-scene grid */}
       <div className="grid gap-2">

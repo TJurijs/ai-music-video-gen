@@ -3,7 +3,7 @@ import { useState, useEffect, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { useMutation, useQueryClient, useQuery } from "@tanstack/react-query";
 import {
-  ChevronLeft, Film, Settings as SettingsIcon, Download, Music, Users, Layers, Wand2, Sparkles, DollarSign, Pencil, Loader2, Check,
+  ChevronLeft, Film, Wand2, DollarSign, Pencil, Loader2, Check,
 } from "lucide-react";
 import { api } from "@/lib/api";
 import type { Project, Song, Scene, GenerationJob, Character, ProjectCosts } from "@/lib/types";
@@ -59,12 +59,10 @@ export default function FlowStudio({ project, song, scenes, characters, jobs, co
         return "ready";
       })();
 
-  // Assembly unlocks as soon as at least one scene has a finished video —
-  // partial assemblies are useful for previewing the cut so far. The
-  // backend filters to status="done" scenes and -shortest-trims the
-  // muxed audio to match.
-  const anySceneDone = scenes.some((s) => s.status === "done");
-  const assembleStatus: CellStatus = anySceneDone ? "ready" : "locked";
+  // Partial assembly is valid only for a finished prefix starting at scene 1.
+  const orderedScenes = [...scenes].sort((a, b) => a.order - b.order);
+  const hasContiguousOpening = orderedScenes.length > 0 && orderedScenes[0].status === "done";
+  const assembleStatus: CellStatus = hasContiguousOpening ? "ready" : "locked";
 
   // Auto-expand the first non-complete step on mount
   const initialExpand = useMemo(() => {
@@ -102,10 +100,11 @@ export default function FlowStudio({ project, song, scenes, characters, jobs, co
     <div className="min-h-screen bg-surface text-white">
       {/* Sticky header */}
       <header className="sticky top-0 z-40 backdrop-blur bg-surface/85 border-b border-white/5">
-        <div className="max-w-3xl mx-auto px-6 py-3 flex items-center gap-3">
+        <div className="max-w-6xl mx-auto px-3 sm:px-6 py-3 flex items-center gap-3">
           <button
             onClick={() => router.push("/projects")}
             className="text-zinc-500 hover:text-white p-1 rounded transition-colors"
+            aria-label="Back to projects"
           >
             <ChevronLeft className="w-5 h-5" />
           </button>
@@ -144,7 +143,7 @@ export default function FlowStudio({ project, song, scenes, characters, jobs, co
       </header>
 
       {/* Notebook content */}
-      <main className="max-w-3xl mx-auto px-6 py-8 space-y-6">
+      <main className="max-w-6xl mx-auto px-3 sm:px-6 py-5 sm:py-8 space-y-5 sm:space-y-6">
 
         <Cell
           step={1}
@@ -271,12 +270,16 @@ function ProjectEditModal({
     <div
       className="fixed inset-0 bg-black/60 flex items-center justify-center z-50"
       onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
+      onKeyDown={(e) => { if (e.key === "Escape") onClose(); }}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="edit-project-title"
     >
       <div
         className="bg-surface-2 border border-white/10 rounded-xl p-6 w-full max-w-md shadow-2xl"
         onMouseDown={(e) => e.stopPropagation()}
       >
-        <h2 className="font-semibold text-lg mb-5">Edit Project</h2>
+        <h2 id="edit-project-title" className="font-semibold text-lg mb-5">Edit Project</h2>
         <div className="space-y-4">
           <div>
             <label className="block text-xs text-zinc-400 mb-1">Project Name</label>
@@ -313,6 +316,7 @@ function ProjectEditModal({
             <p className="text-[10px] text-zinc-600 mt-0.5">
               Appended to every image + video render prompt to keep look consistent.
             </p>
+            {expandStyle.error && <InlineError error={expandStyle.error as Error} />}
           </div>
           <div>
             <label className="block text-xs text-zinc-400 mb-1">Aspect Ratio</label>
@@ -326,6 +330,7 @@ function ProjectEditModal({
               <option value="1:1">1:1 (Square)</option>
             </select>
           </div>
+          {save.error && <InlineError error={save.error as Error} />}
           <div className="flex gap-3 pt-2">
             <button onClick={onClose} className="flex-1 bg-surface-3 hover:bg-surface border border-white/10 text-sm py-2 rounded-lg transition-colors">
               Cancel
@@ -342,6 +347,14 @@ function ProjectEditModal({
         </div>
       </div>
     </div>
+  );
+}
+
+function InlineError({ error }: { error: Error }) {
+  return (
+    <p className="mt-2 rounded-md border border-red-800/40 bg-red-900/20 p-2 text-xs text-red-300 break-words">
+      {error.message}
+    </p>
   );
 }
 
