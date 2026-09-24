@@ -4,13 +4,14 @@ import { useState, useEffect, useRef, useLayoutEffect } from "react";
 import { createPortal } from "react-dom";
 
 export default function SplitGenerateButton({
-  label, icon, running, disabled, currentModel, options,
+  label, icon, running, disabled, modelDisabled = disabled, currentModel, options,
   onClickMain, onPickModel, colorClasses, title,
 }: {
   label: string;
   icon: React.ReactNode;
   running: boolean;
   disabled: boolean;
+  modelDisabled?: boolean;
   currentModel: string;
   options: { key: string; label: string; disabled?: boolean; reason?: string }[];
   onClickMain: () => void;
@@ -55,11 +56,14 @@ export default function SplitGenerateButton({
       if (!inWrap && !inMenu) setOpen(false);
     };
     const onScroll = () => setOpen(false);
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") { setOpen(false); chevronRef.current?.focus(); } };
     document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
     window.addEventListener("scroll", onScroll, true);
     window.addEventListener("resize", onScroll);
     return () => {
       document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onKey);
       window.removeEventListener("scroll", onScroll, true);
       window.removeEventListener("resize", onScroll);
     };
@@ -79,7 +83,9 @@ export default function SplitGenerateButton({
       <button
         ref={chevronRef}
         onClick={(e) => { e.stopPropagation(); setOpen((o) => !o); }}
-        disabled={disabled || options.length === 0}
+        disabled={modelDisabled || options.length === 0}
+        aria-label={`Change model for ${label.toLowerCase()}`}
+        aria-expanded={open}
         className={`text-xs px-1 py-1.5 border-l-0 border rounded-r-lg transition-colors disabled:opacity-50 flex items-center ${colorClasses}`}
         title="Pick a model — saves to this scene without generating. Press the main button to generate with it."
       >
@@ -109,7 +115,7 @@ export default function SplitGenerateButton({
             >
               <span>{o.label}</span>
               {o.disabled
-                ? <span className="text-[9px] text-amber-500/70 shrink-0">wrong length</span>
+                ? <span className="text-[9px] text-amber-500/70 shrink-0">unavailable</span>
                 : o.key === currentModel && <span className="text-[9px] text-zinc-500 shrink-0">current</span>}
             </button>
           ))}

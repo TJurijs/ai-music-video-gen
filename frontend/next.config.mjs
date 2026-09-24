@@ -2,6 +2,8 @@ const backendUrl = process.env.BACKEND_URL || "http://localhost:8010";
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  // Starting the app should not create repository instruction files.
+  agentRules: false,
   turbopack: {
     // This repo can live below a user profile that also has a package lock.
     // Pin discovery here so builds never import dependencies from a parent.

@@ -13,6 +13,7 @@ class Project(SQLModel, table=True):
     # by AI Expand so per-scene prompts respect the same story direction the
     # original plan was anchored to. Survives refreshes / re-opens.
     story_seed: Optional[str] = None
+    target_scene_duration: Optional[int] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 

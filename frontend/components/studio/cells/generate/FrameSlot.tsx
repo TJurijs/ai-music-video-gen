@@ -261,7 +261,7 @@ export default function FrameSlot({
         return (
           <div
             className="text-[9px] truncate"
-            title={`Pressing the button below will generate using ${nextModelLabel}. Use the ▾ menu to switch.`}
+            title={`Pressing the button below will generate using ${nextModelLabel}. ${assetType === "video" ? "Change model, length and quality in the scene settings above." : "Use the ▾ menu to switch."}`}
           >
             <span className="text-zinc-600">{renderedWithLabel ? "next " : "will use "}</span>
             <span

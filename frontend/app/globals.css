@@ -6,6 +6,15 @@
 
 * { box-sizing: border-box; }
 
+:is(button, a, input, select, textarea, summary):focus-visible {
+  outline: 2px solid #a78bfa;
+  outline-offset: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+
 body {
   background: #0f0f13;
   color: #e2e2f0;

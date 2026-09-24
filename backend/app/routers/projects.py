@@ -3,7 +3,7 @@ import shutil
 import json
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks
 from sqlmodel import Session, select
-from sqlalchemy import update
+from sqlalchemy import case, func, update
 from datetime import datetime
 from typing import Optional
 from pydantic import BaseModel
@@ -57,15 +57,26 @@ class ProjectUpdate(BaseModel):
 @router.get("")
 def list_projects(db: Session = Depends(get_session)):
     projects = db.exec(select(Project).order_by(Project.created_at.desc())).all()
+    song_counts = dict(db.exec(
+        select(Song.project_id, func.count(Song.id)).group_by(Song.project_id)
+    ).all())
+    scene_counts = {
+        project_id: (total, done)
+        for project_id, total, done in db.exec(
+            select(
+                Scene.project_id, func.count(Scene.id),
+                func.sum(case((Scene.status == "done", 1), else_=0)),
+            ).group_by(Scene.project_id)
+        ).all()
+    }
     result = []
     for p in projects:
-        songs = db.exec(select(Song).where(Song.project_id == p.id)).all()
-        scenes = db.exec(select(Scene).where(Scene.project_id == p.id)).all()
+        scene_count, scenes_done = scene_counts.get(p.id, (0, 0))
         result.append({
             **p.model_dump(),
-            "song_count": len(songs),
-            "scene_count": len(scenes),
-            "scenes_done": sum(1 for s in scenes if s.status == "done"),
+            "song_count": song_counts.get(p.id, 0),
+            "scene_count": scene_count,
+            "scenes_done": scenes_done,
         })
     return result
 
@@ -111,12 +122,25 @@ def get_project(project_id: int, db: Session = Depends(get_session)):
     ).all()
     characters = db.exec(select(Character).where(Character.project_id == project_id)).all()
 
-    from app.routers.scenes import _scene_with_urls
+    portraits_by_character: dict[int, list[CharacterAsset]] = {}
+    if characters:
+        portraits = db.exec(
+            select(CharacterAsset)
+            .where(CharacterAsset.character_id.in_([char.id for char in characters]))
+            .order_by(CharacterAsset.created_at.desc(), CharacterAsset.id.desc())
+        ).all()
+        for portrait in portraits:
+            portraits_by_character.setdefault(portrait.character_id, []).append(portrait)
+
+    from app.routers.scenes import _scenes_with_urls
     return {
         **project.model_dump(),
         "songs": [_song_with_url(s) for s in songs],
-        "scenes": [_scene_with_urls(s, db) for s in scenes],
-        "characters": [_char_with_url(c, db) for c in characters],
+        "scenes": _scenes_with_urls(scenes, db),
+        "characters": [
+            _char_with_url(c, portraits=portraits_by_character.get(c.id, []))
+            for c in characters
+        ],
     }
 
 
@@ -735,18 +759,19 @@ def _portrait_to_dict(a: CharacterAsset) -> dict:
     }
 
 
-def _char_with_url(char: Character, db: Optional[Session] = None) -> dict:
+def _char_with_url(
+    char: Character, db: Optional[Session] = None,
+    *, portraits: list[CharacterAsset] | None = None,
+) -> dict:
     d = char.model_dump()
     d["reference_image_url"] = to_storage_url(char.reference_image_path)
-    if db is not None:
+    if portraits is None and db is not None:
         portraits = db.exec(
             select(CharacterAsset)
             .where(CharacterAsset.character_id == char.id)
             .order_by(CharacterAsset.created_at.desc())
         ).all()
-        d["portraits"] = [_portrait_to_dict(p) for p in portraits]
-    else:
-        d["portraits"] = []
+    d["portraits"] = [_portrait_to_dict(p) for p in portraits or []]
     return d
 
 

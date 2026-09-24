@@ -40,6 +40,13 @@ cp backend/.env.example backend/.env
 The launchers create `backend/.venv`, install dependencies only when lock files
 change, and start both services in the current terminal.
 
+The backend runs without automatic code reload so editing a file cannot interrupt
+a paid generation. For backend development, opt in with `./start.ps1 -Reload`
+or `./start.sh --reload`, then avoid code edits during generation. Restart the
+launcher to apply backend changes in normal mode. The launcher sets the frontend
+API destination to `http://127.0.0.1:8010` so a stale `frontend/.env.local` cannot
+disconnect the app from the backend it just started.
+
 | Service | URL |
 |---|---|
 | Frontend | http://localhost:3000 |
@@ -67,6 +74,10 @@ Model defaults and the model capability inventory live in
 the inventory as a collapsed model cheat sheet, including provider, price,
 frame/character/audio reference support, mutual exclusions, and face
 guardrail notes.
+
+See the [September model review](docs/MODEL_CATALOG.md) for verified model
+additions and route limitations, and the [reliability review](docs/REFACTOR_REVIEW.md)
+for the latest fixes, verification and remaining limits.
 
 ## Workflow
 

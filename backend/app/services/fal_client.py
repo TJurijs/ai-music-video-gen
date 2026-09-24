@@ -2,6 +2,7 @@
   1) fal-ai/whisper (word-level lyric transcription, audio_analysis.py)
   2) Seedance reference-to-video for the audio-sync route (per-scene opt-in
      when scene.audio_sync_enabled and the video model has supports_audio_input).
+  3) Wan 2.7 and LTX 2.5 Fast audio-driven first-frame video.
 
 The Seedance R2V endpoint accepts character reference images + an audio
 clip + a text prompt and renders video where the character "performs" the
@@ -27,10 +28,15 @@ import os
 from typing import Optional
 import httpx
 from app.config import settings
+from app.services.provider_io import log_provider, RemoteJobFailedError, download_result, retry_delay
 
 
 class RemoteJobPendingError(RuntimeError):
     """The local poll failed, but the paid fal job may still be running."""
+
+
+class RemoteJobCancelledError(asyncio.CancelledError):
+    """fal confirmed the upstream cancellation, so the handle is terminal."""
 
 
 def _headers() -> dict:
@@ -120,12 +126,12 @@ async def cancel_submission(submission: dict) -> bool:
             if response.status_code < 400:
                 return True
             if response.status_code >= 400:
-                print(
+                log_provider(
                     f"[fal cancel] upstream returned {response.status_code}: "
                     f"{response.text[:300]}"
                 )
     except httpx.RequestError as exc:
-        print(f"[fal cancel] request failed: {type(exc).__name__}: {str(exc)[:200]}")
+        log_provider(f"[fal cancel] request failed: {type(exc).__name__}: {str(exc)[:200]}")
     return False
 
 
@@ -155,11 +161,12 @@ async def poll(
 
     deadline = asyncio.get_event_loop().time() + timeout
     consecutive_network_failures = 0
+    result_failures = 0
     async with httpx.AsyncClient(timeout=30) as client:
         while asyncio.get_event_loop().time() < deadline:
             if is_cancelled is not None and is_cancelled():
                 if await cancel_submission(submission):
-                    raise asyncio.CancelledError(
+                    raise RemoteJobCancelledError(
                         f"fal job {request_id} cancelled by user"
                     )
                 raise RemoteJobPendingError(
@@ -178,7 +185,7 @@ async def poll(
                     ) from exc
                 await asyncio.sleep(interval)
                 continue
-            if status.status_code == 429 or status.status_code >= 500:
+            if status.status_code in (408, 429) or status.status_code >= 500:
                 consecutive_network_failures += 1
                 if consecutive_network_failures >= 4:
                     raise RemoteJobPendingError(
@@ -186,11 +193,11 @@ async def poll(
                         f"{status.status_code} for request {request_id}; the "
                         "remote job was preserved and can be resumed."
                     )
-                await asyncio.sleep(interval)
+                await asyncio.sleep(max(interval, retry_delay(status, consecutive_network_failures - 1)))
                 continue
             if status.status_code >= 400:
                 body = status.text[:600]
-                raise RuntimeError(
+                raise RemoteJobPendingError(
                     f"fal status check failed ({status.status_code}) for request "
                     f"{request_id}: {body}"
                 )
@@ -202,18 +209,30 @@ async def poll(
                     f"fal returned malformed status JSON for request {request_id}; "
                     "the remote job was preserved and can be resumed."
                 ) from exc
+            if not isinstance(sd, dict):
+                raise RemoteJobPendingError(
+                    f"fal returned invalid status data for {request_id}; the saved job can be resumed."
+                )
             state = sd.get("status")
 
             if state == "COMPLETED":
                 try:
                     result = await client.get(response_url, headers=_headers())
                 except httpx.RequestError as exc:
+                    result_failures += 1
+                    if result_failures < 4:
+                        await asyncio.sleep(interval)
+                        continue
                     raise RemoteJobPendingError(
                         f"fal completed request {request_id}, but the result "
                         "download endpoint is temporarily unreachable. Retry "
                         "to fetch the same result."
                     ) from exc
-                if result.status_code == 429 or result.status_code >= 500:
+                if result.status_code in (408, 429) or result.status_code >= 500:
+                    result_failures += 1
+                    if result_failures < 4:
+                        await asyncio.sleep(max(interval, retry_delay(result, result_failures - 1)))
+                        continue
                     raise RemoteJobPendingError(
                         f"fal completed request {request_id}, but result fetch "
                         f"returned HTTP {result.status_code}. Retry to fetch "
@@ -224,7 +243,8 @@ async def poll(
                     # 422 here typically means the model failed at inference
                     # time (no face detected, audio too short, etc.) and fal
                     # surfaces the reason in the body's `detail` field.
-                    raise RuntimeError(
+                    error_type = RemoteJobFailedError if result.status_code == 422 else RemoteJobPendingError
+                    raise error_type(
                         f"fal result fetch failed ({result.status_code}) for request "
                         f"{request_id} — the model accepted the job and reported "
                         f"COMPLETED but the result endpoint refused. "
@@ -232,11 +252,21 @@ async def poll(
                         f"no face detected in the video, audio too short, audio/video "
                         f"format unsupported). Full response: {body}"
                     )
-                return result.json()
+                try:
+                    payload = result.json()
+                except ValueError as exc:
+                    raise RemoteJobPendingError(
+                        f"fal result JSON for {request_id} was unreadable; resume to fetch the same render."
+                    ) from exc
+                if not isinstance(payload, dict):
+                    raise RemoteJobPendingError(
+                        f"fal returned invalid result data for {request_id}; the saved job can be resumed."
+                    )
+                return payload
 
             if state in ("FAILED", "CANCELLED"):
                 # `sd` typically carries the failure reason — surface it raw.
-                raise RuntimeError(f"fal job {state}: {json.dumps(sd)[:600]}")
+                raise RemoteJobFailedError(f"fal job {state}: {json.dumps(sd)[:600]}")
 
             await asyncio.sleep(interval)
     raise RemoteJobPendingError(
@@ -347,7 +377,7 @@ async def submit_seedance_audio_video(
         # on top. The song's audio is muxed verbatim at assembly time.
         "generate_audio": False,
     }
-    print(
+    log_provider(
         f"[fal seedance r2v] submit model={fal_model_id} duration={duration}s "
         f"resolution={resolution} aspect={aspect_ratio} "
         f"image_urls={len(image_urls)} audio_urls={len(audio_urls)} "
@@ -374,7 +404,7 @@ async def submit_wan_audio_video(
         "enable_prompt_expansion": True,
         "enable_safety_checker": True,
     }
-    print(
+    log_provider(
         f"[fal wan i2v audio] submit model={fal_model_id} duration={duration}s "
         f"resolution={resolution} image_url=yes audio_url=yes "
         f"prompt[:120]={prompt[:120]!r}"
@@ -382,15 +412,67 @@ async def submit_wan_audio_video(
     return await submit(fal_model_id, payload)
 
 
+async def submit_wan_reference_audio_video(
+    fal_model_id: str,
+    prompt: str,
+    image_urls: list[str],
+    audio_urls: list[str],
+    duration: int,
+    resolution: str = "720p",
+    aspect_ratio: str = "16:9",
+) -> dict:
+    """Wan 3 R2V: reference media, without first-frame conditioning.
+
+    Audio length is validated from the local WAV before uploading. The
+    Keep the documented audiovisual output default; reference-audio input
+    is separate and assembly still uses the original song.
+    """
+    if not 1 <= len(image_urls) <= 10:
+        raise ValueError("Wan 3.0 accepts 1–10 reference images in this app.")
+    if not 1 <= len(audio_urls) <= 5:
+        raise ValueError("Wan 3.0 accepts 1–5 audio references totaling at most 15 seconds.")
+    if type(duration) is not int or not 2 <= duration <= 15:
+        raise ValueError("Wan 3.0 song reference requires an integer scene length from 2 to 15 seconds.")
+    if resolution not in ("480p", "720p", "1080p"):
+        raise ValueError("Wan 3.0 song reference requires 480p, 720p or 1080p.")
+    if aspect_ratio not in ("16:9", "4:3", "1:1", "3:4", "9:16"):
+        raise ValueError("Wan 3.0 song reference does not support this aspect ratio.")
+    return await submit(fal_model_id, {
+        "prompt": prompt,
+        "reference_image_urls": image_urls,
+        "reference_audio_urls": audio_urls,
+        "duration": duration,
+        "resolution": resolution,
+        "aspect_ratio": aspect_ratio,
+        "audio": True,
+        "enable_prompt_expansion": True,
+        "enable_safety_checker": True,
+    })
+
+
+async def submit_ltx_audio_video(
+    fal_model_id: str,
+    prompt: str,
+    image_url: str,
+    audio_url: str,
+    aspect_ratio: str = "16:9",
+) -> dict:
+    """LTX 2.5 Fast A2V: duration follows audio; output is fixed at 1080p.
+
+    Unlike LTX's I2V schema, this endpoint does not accept duration,
+    resolution, fps, end_image_url or generate_audio fields.
+    """
+    return await submit(fal_model_id, {
+        "prompt": prompt,
+        "image_url": image_url,
+        "audio_url": audio_url,
+        "aspect_ratio": aspect_ratio,
+    })
+
+
 async def download_file(url: str, dest_path: str) -> None:
     """Stream-download a remote file to dest_path. Used for the rendered
     Seedance R2V .mp4. Idempotent: overwrites dest_path."""
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    async with httpx.AsyncClient(timeout=300) as client:
-        async with client.stream("GET", url) as r:
-            r.raise_for_status()
-            with open(dest_path, "wb") as f:
-                async for chunk in r.aiter_bytes(1 << 16):
-                    f.write(chunk)
+    await download_result(url, dest_path)
 
 

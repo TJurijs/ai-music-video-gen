@@ -1,10 +1,11 @@
 "use client";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Image as ImageIcon, Video, Mic2, Square, Trash2, Link2, Download, Wand2, Loader2, X, Users, ImageOff, AlertCircle } from "lucide-react";
-import { useState } from "react";
+import { Image as ImageIcon, Video, Square, Trash2, Link2, Download, Wand2, Loader2, X, Users, ImageOff, AlertCircle } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { useConfirm } from "@/components/ConfirmDialog";
-import type { Scene, Song, GenerationJob, ModelsConfig } from "@/lib/types";
+import type { Project, Scene, Song, GenerationJob, ModelsConfig } from "@/lib/types";
+import { hasResumableVideoJob, isSceneBusy, videoReadinessReason } from "@/lib/generationView";
 import Lightbox from "../../Lightbox";
 import ScenePreview from "./ScenePreview";
 import DescriptionWithPromptTooltip from "./DescriptionWithPromptTooltip";
@@ -12,10 +13,12 @@ import CharacterRefsBadge from "./CharacterRefsBadge";
 import { StatusPill, ExpandedBadge, SceneErrorBanner } from "./SceneStatus";
 import FrameSlot from "./FrameSlot";
 import SplitGenerateButton from "./SplitGenerateButton";
+import SceneVideoSettings from "./SceneVideoSettings";
 import { fmt, fmtCost, textMentionsCharacter } from "./shared";
+import { audioUsesFirstFrame, usesSongAudio, videoProvider } from "@/lib/videoModels";
 
 export default function SceneGenRow({
-  scene, models, song, sceneCost, sceneJobs, onRefresh,
+  scene, models, song, sceneCost, sceneJobs, onRefresh, generationDisabled = false, onSettingsDirtyChange,
 }: {
   scene: Scene;
   models?: ModelsConfig;
@@ -23,11 +26,18 @@ export default function SceneGenRow({
   sceneCost: number;
   sceneJobs: GenerationJob[];
   onRefresh: () => void;
+  generationDisabled?: boolean;
+  onSettingsDirtyChange?: (sceneId: number, dirty: boolean) => void;
 }) {
   const qc = useQueryClient();
   const confirm = useConfirm();
   const [actionError, setActionError] = useState<string | null>(null);
   const [checkingPreflight, setCheckingPreflight] = useState(false);
+  const [settingsDirty, setSettingsDirty] = useState(false);
+  const [settingsSaving, setSettingsSaving] = useState(false);
+  const submissionLock = useRef(false);
+  useEffect(() => { onSettingsDirtyChange?.(scene.id, settingsDirty); }, [onSettingsDirtyChange, scene.id, settingsDirty]);
+  useEffect(() => () => { onSettingsDirtyChange?.(scene.id, false); }, [onSettingsDirtyChange, scene.id]);
 
   const generate = useMutation({
     mutationFn: ({ phase, force }: { phase: "image" | "video" | "all"; force: boolean }) =>
@@ -48,10 +58,12 @@ export default function SceneGenRow({
   const deleteAsset = useMutation({
     mutationFn: (assetId: number) => api.scenes.deleteAsset(scene.id, assetId),
     onSuccess: onRefresh,
+    onError: (error) => setActionError(error.message),
   });
   const clearScene = useMutation({
     mutationFn: () => api.scenes.clear(scene.id),
     onSuccess: onRefresh,
+    onError: (error) => setActionError(error.message),
   });
   // Full scene delete (different from clear-assets above). Cascades to all
   // assets + prompt versions. Backend also auto-unlinks the NEXT scene's
@@ -59,6 +71,7 @@ export default function SceneGenRow({
   const deleteScene = useMutation({
     mutationFn: () => api.scenes.delete(scene.id),
     onSuccess: onRefresh,
+    onError: (error) => setActionError(error.message),
   });
   const uploadVideo = useMutation({
     mutationFn: (file: File) => api.scenes.uploadVideo(scene.id, file),
@@ -68,10 +81,12 @@ export default function SceneGenRow({
   const activatePrompt = useMutation({
     mutationFn: (versionId: number) => api.scenes.activatePrompt(scene.id, versionId),
     onSuccess: onRefresh,
+    onError: (error) => setActionError(error.message),
   });
   const deletePrompt = useMutation({
     mutationFn: (versionId: number) => api.scenes.deletePrompt(scene.id, versionId),
     onSuccess: onRefresh,
+    onError: (error) => setActionError(error.message),
   });
   const [showPreview, setShowPreview] = useState(false);
   const [showImage, setShowImage] = useState(false);
@@ -119,8 +134,7 @@ export default function SceneGenRow({
   // not have advanced the public status from "pending" yet, so relying only on
   // generating_* hides Stop and leaves the generation buttons incorrectly live.
   const hasGenerationClaim = !!scene.generation_run_id;
-  const isRunning = hasGenerationClaim
-    || ["generating_image", "generating_video"].includes(scene.status);
+  const isRunning = isSceneBusy(scene);
   const hasImage = !!scene.reference_image_url;
   const hasVideo = !!scene.video_url;
   const imageAssets = scene.assets?.filter((a) => a.asset_type === "image") || [];
@@ -132,7 +146,7 @@ export default function SceneGenRow({
   //  - nextScene: the one after this one. Drives the NEW "chain to next"
   //    icon — it represents whether the NEXT clip picks up exactly where
   //    THIS one ends, not whether this one picks up from the prev.
-  const project = qc.getQueryData<any>(["project", scene.project_id]);
+  const project = qc.getQueryData<Project>(["project", scene.project_id]);
   const allScenes: Scene[] = project?.scenes || [];
   const prevScene = allScenes.find((s) => s.order === scene.order - 1);
   const nextScene = allScenes.find((s) => s.order === scene.order + 1);
@@ -144,43 +158,31 @@ export default function SceneGenRow({
   // icon's semantics just point the other direction now.
   const canChain = scene.order >= 1;
   const chainActive = !!scene.chain_from_prev && canChain;
-  const hasChainFrame = chainActive && !!prevScene?.extracted_last_frame_url;
+  const hasChainFrame = chainActive && !!prevScene?.extracted_last_frame_url && !prevScene?.video_timing_stale;
 
-  // Video routing — most scenes go through OpenRouter (I2V). When the
-  // chosen model has supports_audio_input AND scene.audio_sync_enabled,
-  // the backend routes through fal's R2V endpoint instead. R2V doesn't
-  // use a first_frame, so the image slot / chain frame don't matter
-  // for canGenerateVideo in audio-sync mode.
+  // Audio reference routes use either image references (Seedance/Wan 3)
+  // or a first-frame anchor (Wan 2.7/LTX); LTX always requires the song.
   const videoModelCfg = models?.video?.[scene.video_model];
-  const sceneDuration = Math.round(scene.audio_end - scene.audio_start);
-  const videoDurationCompatible = !!videoModelCfg?.durations.includes(sceneDuration);
-  const modelSupportsAudio = !!videoModelCfg?.supports_audio_input;
-  const audioSyncActive = !!scene.audio_sync_enabled && modelSupportsAudio;
-  const audioUsesFrame = audioSyncActive && videoModelCfg?.audio_input_mode === "wan_i2v";
+  const audioSyncActive = usesSongAudio(videoModelCfg, scene.audio_sync_enabled);
+  const audioUsesFrame = audioSyncActive && audioUsesFirstFrame(videoModelCfg);
   const characterReferenceMode = (
     !audioSyncActive
     && !!videoModelCfg?.supports_reference_images
     && scene.video_reference_mode === "character"
   );
-  const nextVideoProvider = audioSyncActive ? "fal" : "openrouter";
-  // In audio-sync mode the model doesn't need a first_frame; the video
-  // gen button should be enabled as long as the user has picked a model.
-  // (At backend time we still require at least one named character ref;
-  // we surface that as a render-time error rather than disabling the button.)
+  const nextVideoProvider = videoProvider(videoModelCfg, audioSyncActive);
+  // Show the same named portraits used by preflight; route readiness is shared with bulk generation.
   const referenceHaystack = `${scene.video_prompt || ""} ${scene.image_prompt || ""} ${scene.description || ""}`.toLowerCase();
-  const passedCharacterReferences = (project?.characters || []).filter((character: any) => {
+  const passedCharacterReferences = (project?.characters || []).filter((character) => {
     const name = (character.name || "").toLowerCase().trim();
     const named = textMentionsCharacter(referenceHaystack, name);
     return named && !!character.reference_image_url;
   });
-  const hasUsableCharacterReference = passedCharacterReferences.length > 0;
-  const canGenerateVideo = videoDurationCompatible && (
-    audioSyncActive
-      ? true
-      : characterReferenceMode
-        ? hasUsableCharacterReference
-        : (hasImage || hasChainFrame)
-  );
+  const resumable = !isRunning && hasResumableVideoJob(sceneJobs);
+  const videoBlockedReason = project ? videoReadinessReason(scene, project, models) : "Refreshing project settings…";
+  const canGenerateVideo = resumable || !videoBlockedReason;
+  const actionBusy = generationDisabled || generate.isPending || checkingPreflight || isRunning || updateModel.isPending || settingsSaving;
+  const imageUnavailable = models?.image[scene.image_model]?.available === false || !models?.image[scene.image_model];
 
   const activeVideoAsset = videoAssets.find((a) => a.is_active);
   // Pull the recorded provider from the active video asset's metadata_json.
@@ -208,6 +210,8 @@ export default function SceneGenRow({
     phase: "image" | "video" | "all",
     force: boolean,
   ) => {
+    if (submissionLock.current || actionBusy || settingsDirty) return;
+    submissionLock.current = true;
     setActionError(null);
     setCheckingPreflight(true);
     try {
@@ -227,9 +231,10 @@ export default function SceneGenRow({
         return;
       }
       const ok = await confirm({
-        title: `${force ? "Generate a new" : "Generate"} ${phase === "image" ? "still" : "video"} for scene #${scene.order}?`,
+        title: item.resuming ? `Resume video for scene #${scene.order}?` : `${force ? "Generate a new" : "Generate"} ${phase === "image" ? "still" : "video"} for scene #${scene.order}?`,
         message: [
           `Estimated new provider cost: ${fmtCost(item.estimated_cost)}.`,
+          item.resuming ? "Continue checking the existing provider job. A new render will not be submitted." : null,
           item.provider ? `Route: ${item.provider}${item.route ? ` · ${item.route}` : ""}.` : null,
           item.will_generate_image && phase !== "image"
             ? "A reference still will be generated first and is included in the estimate."
@@ -237,18 +242,20 @@ export default function SceneGenRow({
           item.warnings.length ? `Notes:\n• ${item.warnings.join("\n• ")}` : null,
           force ? "The current successful asset remains in variant history." : null,
         ].filter(Boolean).join("\n\n"),
-        confirmLabel: phase === "image" ? "Generate still" : "Generate video",
+        confirmLabel: item.resuming ? "Resume video" : phase === "image" ? "Generate still" : "Generate video",
       });
-      if (ok) generate.mutate({ phase, force });
+      if (ok) await generate.mutateAsync({ phase, force });
     } catch (error) {
       setActionError((error as Error).message || "Preflight failed");
+      onRefresh();
     } finally {
+      submissionLock.current = false;
       setCheckingPreflight(false);
     }
   };
 
   return (
-    <div className={`bg-surface-2 rounded-lg overflow-hidden border ${
+    <div id={`scene-${scene.id}`} className={`bg-surface-2 rounded-xl overflow-hidden border ${
       scene.status === "done" ? "border-green-700/30" :
       scene.status === "error" ? "border-red-700/40" :
       isRunning ? "border-accent/40" : "border-white/5"
@@ -261,15 +268,7 @@ export default function SceneGenRow({
         <span className="text-[10px] font-mono text-zinc-500 shrink-0 w-20">
           {fmt(scene.audio_start)}–{fmt(scene.audio_end)}
         </span>
-        <StatusPill status={scene.status} />
-        {hasGenerationClaim && scene.status === "pending" && (
-          <span
-            className="text-[9px] font-mono text-amber-300/90 shrink-0"
-            title="Generation is queued and can be stopped before or during provider submission."
-          >
-            queued
-          </span>
-        )}
+        <StatusPill status={scene.cancel_requested ? "stopping" : hasGenerationClaim && !["generating_image", "generating_video"].includes(scene.status) ? "queued" : scene.status} />
         <ExpandedBadge expanded={!!scene.prompts_expanded} />
         {sceneCost > 0 && (
           <span
@@ -286,6 +285,8 @@ export default function SceneGenRow({
           videoModelUsesRefs={!!models?.video?.[scene.video_model]?.supports_reference_images}
           audioSyncActive={audioSyncActive}
           audioUsesFrame={audioUsesFrame}
+          audioInputMode={videoModelCfg?.audio_input_mode}
+          videoProvider={nextVideoProvider}
         />
         {/* "Chain to next" icon. Click meanings:
               - No next scene exists → creates scene N+1 (empty prompts,
@@ -305,7 +306,7 @@ export default function SceneGenRow({
               chainNext.mutate();
             }
           }}
-          disabled={chainNext.isPending || unchainNext.isPending}
+          disabled={actionBusy || (!!nextScene && isSceneBusy(nextScene)) || chainNext.isPending || unchainNext.isPending}
           className={`shrink-0 p-1 rounded transition-colors ${
             nextChainedFromHere
               ? "bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 ring-1 ring-emerald-500/40"
@@ -345,38 +346,6 @@ export default function SceneGenRow({
             {continuationPrompt.isPending
               ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
               : <Wand2 className="w-3.5 h-3.5" />}
-          </button>
-        )}
-        {/* Audio-sync toggle — model-specific fal audio path. Visible
-            only when the chosen video model has supports_audio_input
-            (Seedance variants on the OpenRouter route).
-            When ON:
-              - Backend routes video gen through fal R2V (NOT OpenRouter).
-              - first_frame is NOT used (Seedance R2V doesn't accept one),
-                so the image slot becomes informational only.
-              - At least one named cast character must have a portrait;
-                the model uses those as image_urls + audio as audio_url.
-              - Per-second cost is ~6× the OpenRouter rate. */}
-        {modelSupportsAudio && (
-          <button
-            onClick={() => updateModel.mutate({ audio_sync_enabled: !audioSyncActive })}
-            disabled={updateModel.isPending}
-            className={`shrink-0 p-1 rounded transition-colors ${
-              audioSyncActive
-                ? "bg-fuchsia-500/20 text-fuchsia-300 hover:bg-fuchsia-500/30 ring-1 ring-fuchsia-500/40"
-                : "text-zinc-500 hover:text-fuchsia-300"
-            } disabled:opacity-50`}
-            title={
-              audioSyncActive
-                ? audioUsesFrame
-                  ? `Audio sync ON. Video generation routes through fal Wan 2.7 I2V with this scene's song slice plus its exact still/chained first frame. Separate character refs are not sent. Click to disable.`
-                  : `Audio sync ON. Video generation routes through fal Seedance R2V with this scene's song slice plus image/character references; no exact first frame is used. Click to disable.`
-                : videoModelCfg?.audio_input_mode === "wan_i2v"
-                  ? `Audio sync OFF. Click to send this scene's song slice to fal Wan 2.7 with the exact scene/chained first frame as its visual anchor.`
-                  : `Audio sync OFF. Click to send this scene's song slice to fal Seedance R2V with character and scene-image references.`
-            }
-          >
-            <Mic2 className="w-3.5 h-3.5" />
           </button>
         )}
         {song && (
@@ -460,6 +429,8 @@ export default function SceneGenRow({
         )}
       </div>
 
+      {models && <SceneVideoSettings scene={scene} project={project} models={models} disabled={actionBusy} onRefresh={onRefresh} onError={setActionError} onDirtyChange={setSettingsDirty} onSavingChange={setSettingsSaving} />}
+
       {scene.error_message && (
         <SceneErrorBanner
           scene={scene}
@@ -467,11 +438,14 @@ export default function SceneGenRow({
           onDismissed={onRefresh}
         />
       )}
-      {videoModelCfg && !videoDurationCompatible && (
+      {!isRunning && (!hasVideo || scene.video_timing_stale) && !resumable && videoBlockedReason && (
         <div className="mx-3 mt-2 rounded-md border border-amber-700/40 bg-amber-900/20 px-2.5 py-2 text-[11px] text-amber-300">
-          {videoModelCfg.name} cannot render this {sceneDuration}s scene. Choose a model supporting {sceneDuration}s before generating video.
+          <span className="font-medium">Next step: </span>{videoBlockedReason}
         </div>
       )}
+      {!isRunning && imageUnavailable && models && <p className="mx-3 mt-2 rounded-md border border-amber-700/40 px-2.5 py-2 text-xs text-amber-300">{models.image[scene.image_model]?.unavailable_reason || "The selected image model is unavailable."} Choose a different model using the arrow beside Generate still.</p>}
+      {resumable && <p className="mx-3 mt-2 rounded-md border border-sky-700/40 bg-sky-900/15 px-2.5 py-2 text-xs text-sky-200">A submitted video job can be resumed. Check its result before starting another render.</p>}
+      {checkingPreflight && <p role="status" className="mx-3 mt-2 text-xs text-zinc-400">Checking settings and estimated cost…</p>}
       {actionError && (
         <div className="mx-3 mt-2 flex items-start justify-between gap-2 whitespace-pre-line rounded-md border border-red-800/40 bg-red-900/20 px-2.5 py-2 text-[11px] text-red-300">
           <span>{actionError}</span>
@@ -539,7 +513,7 @@ export default function SceneGenRow({
 
               {passedCharacterReferences.length > 0 ? (
                 <div className="flex items-center gap-1.5 flex-wrap">
-                  {passedCharacterReferences.map((character: any) => (
+                  {passedCharacterReferences.map((character) => (
                     <div
                       key={character.id}
                       className="flex items-center gap-1.5 rounded-full bg-surface-2 border border-violet-500/25 pr-2"
@@ -582,7 +556,7 @@ export default function SceneGenRow({
           </div>
         ) : (
         <FrameSlot
-          title="First frame"
+          title={audioSyncActive && !audioUsesFrame ? "Scene image reference" : "First frame"}
           assetType="image"
           assets={imageAssets}
           activeUrl={scene.reference_image_url}
@@ -628,19 +602,20 @@ export default function SceneGenRow({
           }
           actionButton={
             <SplitGenerateButton
-              label={imageAssets.length > 0 ? "+ Img" : "Img"}
+              label={imageAssets.length > 0 ? "New still" : "Generate still"}
               icon={<ImageIcon className="w-3 h-3" />}
               running={scene.status === "generating_image"}
-              disabled={generate.isPending || checkingPreflight || isRunning}
+              disabled={actionBusy || settingsDirty || imageUnavailable}
+              modelDisabled={actionBusy || settingsDirty}
               currentModel={scene.image_model}
-              options={models?.image ? Object.entries(models.image).map(([k, m]) => ({ key: k, label: m.name })) : []}
+              options={models?.image ? Object.entries(models.image).map(([k, m]) => ({ key: k, label: m.name, disabled: m.available === false, reason: m.unavailable_reason })) : []}
               onClickMain={() => runSingleGeneration("image", hasImage)}
               onPickModel={(key) => updateModel.mutate({ image_model: key })}
               colorClasses="bg-blue-500/15 hover:bg-blue-500/30 text-blue-300 border-blue-500/30"
-              title={audioSyncActive
+              title={audioSyncActive && !audioUsesFrame
                 ? imageAssets.length > 0
-                  ? "Generate another image variant — passed to fal Seedance R2V as one of the reference images (along with character portraits)."
-                  : "Generate a reference still — in audio-sync mode it goes into Seedance R2V's image_urls as a compositional reference (not a strict first_frame)."
+                  ? `Generate another image variant — sent to ${videoModelCfg?.name || "the video model"} on fal alongside character portraits as a reference.`
+                  : "Generate a reference still — audio-reference mode uses it for composition, not as an exact first frame."
                 : imageAssets.length > 0
                   ? "Generate another image variant — keeps prior versions"
                   : "Generate reference still"}
@@ -679,47 +654,25 @@ export default function SceneGenRow({
           onPromptActivate={(id) => activatePrompt.mutate(id)}
           onPromptDelete={(id) => deletePrompt.mutate(id)}
           actionButton={
-            <div className="flex gap-1 flex-wrap justify-center">
-              <SplitGenerateButton
-                label={videoAssets.length > 0 ? "+ Vid" : "Vid"}
-                icon={<Video className="w-3 h-3" />}
-                running={scene.status === "generating_video"}
-                disabled={generate.isPending || checkingPreflight || isRunning || !canGenerateVideo}
-                currentModel={scene.video_model}
-                options={models?.video ? Object.entries(models.video).map(([k, m]) => ({
-                  key: k,
-                  label: m.name,
-                  disabled: !m.durations.includes(sceneDuration),
-                  reason: !m.durations.includes(sceneDuration)
-                    ? `${m.name} does not support ${sceneDuration}s scenes (supports ${m.durations.join(", ")}s)`
-                    : undefined,
-                })) : []}
-                onClickMain={() => runSingleGeneration("video", scene.status === "done")}
-                onPickModel={(key) => {
-                  const fallbackResolution = models?.video?.[key]?.resolutions?.[0];
-                  updateModel.mutate(fallbackResolution
-                    ? { video_model: key, resolution: fallbackResolution }
-                    : { video_model: key });
-                }}
-                colorClasses="bg-accent/20 hover:bg-accent/40 text-accent border-accent/30"
-                title={!videoDurationCompatible
-                  ? `${videoModelCfg?.name || scene.video_model} does not support ${sceneDuration}s scenes`
-                  : !canGenerateVideo ? (characterReferenceMode
-                  ? "Character-reference mode needs a named cast character with a portrait"
-                  : chainActive
-                    ? "Previous scene needs a video first (chain frame not extracted yet)"
-                    : "Generate image first") : videoAssets.length > 0
-                  ? "Generate another video variant — keeps prior versions"
-                  : "Generate video from reference image"}
-              />
-            </div>
+            <button
+              type="button"
+              disabled={actionBusy || settingsDirty || !canGenerateVideo}
+              onClick={() => runSingleGeneration("video", !resumable && hasVideo)}
+              className="flex items-center gap-1.5 rounded-lg border border-accent/30 bg-accent/20 px-3 py-1.5 text-xs text-accent transition-colors hover:bg-accent/40 disabled:opacity-50"
+              title={settingsDirty ? "Save or cancel the scene settings before generating."
+                : resumable ? "Retrieve the saved provider job without submitting a new render."
+                : videoBlockedReason || (hasVideo ? "Generate another video variant; existing versions stay in history." : "Generate using this scene’s saved video settings.")}
+            >
+              {scene.status === "generating_video" ? <Loader2 className="h-3 w-3 animate-spin" /> : <Video className="h-3 w-3" />}
+              {resumable ? "Resume video" : scene.video_timing_stale ? "Regenerate video" : videoAssets.length > 0 ? "New video" : "Generate video"}
+            </button>
           }
         />
       </div>
 
       <CharacterRefsBadge
         scene={scene}
-        disabled={updateModel.isPending || isRunning}
+        disabled={actionBusy || settingsDirty}
         onModeChange={(video_reference_mode) => updateModel.mutate({
           video_reference_mode,
           audio_sync_enabled: false,

@@ -6,7 +6,6 @@ import { api } from "@/lib/api";
 import { useConfirm } from "@/components/ConfirmDialog";
 import type { Project, Song, Scene } from "@/lib/types";
 import ModelTag from "../ModelTag";
-import VideoModelCheatSheet from "./generate/VideoModelCheatSheet";
 import { mostCommon } from "./generate/shared";
 
 export default function StepPlanCell({
@@ -15,7 +14,7 @@ export default function StepPlanCell({
   const qc = useQueryClient();
   const confirm = useConfirm();
   const [planOpts, setPlanOpts] = useState({
-    duration: 8,
+    duration: project.target_scene_duration ?? (Number(mostCommon(scenes.map((scene) => String(Math.round(scene.audio_end - scene.audio_start))))) || 8),
     // Single LLM model used for both the batch generator and per-scene
     // re-expand. The two used to be configurable separately back when
     // planning and AI-expanding were distinct passes — now they're one
@@ -39,35 +38,10 @@ export default function StepPlanCell({
 
   const { data: models } = useQuery({ queryKey: ["models"], queryFn: api.models.list });
   const refresh = () => qc.invalidateQueries({ queryKey: ["project", project.id] });
-  const setPlanVideoModel = useMutation({
-    mutationFn: async ({ videoModel, resolution }: { videoModel: string; resolution: string }) => {
-      await Promise.all(scenes.map((scene) => api.scenes.update(scene.id, {
-        video_model: videoModel,
-        resolution,
-      })));
-    },
-    onSuccess: refresh,
-  });
 
   // Single LLM identifier used for both the batch generator and per-scene
   // re-expand. Resolves the user's preference to OpenRouter's full model_id.
   const llmId = models?.llm?.[planOpts.plan_llm]?.model_id || "google/gemini-3-flash-preview";
-
-  // ─── Per-batch retry on transient errors ──────────────────────────────
-  // Backend restart (uvicorn reload), network blip, or proxy upstream-
-  // unreachable shouldn't abort the whole multi-batch generation. Each
-  // batch retries up to 5 times with exponential backoff capped at 8s.
-  const isTransientError = (error: any): boolean => {
-    const msg: string = String((error as Error)?.message || "");
-    return (
-      /Backend unreachable/i.test(msg) ||
-      /Network error/i.test(msg) ||
-      /ECONNREFUSED|ECONNRESET|ETIMEDOUT/i.test(msg) ||
-      /^5\d\d: Internal Server Error$/.test(msg)
-    );
-  };
-  const TRANSIENT_RETRY_COUNT = 5;
-  const transientRetryDelay = (attempt: number) => Math.min(1000 * 2 ** attempt, 8000);
 
   // ─── Batch generator — the only scene-planning flow ───────────────────
   // One LLM call per batch (default 3 scenes), runs sequentially, each
@@ -78,11 +52,9 @@ export default function StepPlanCell({
   const [genSoFar, setGenSoFar] = useState<number>(0);
   const [genRunning, setGenRunning] = useState(false);
   const [genError, setGenError] = useState<string | null>(null);
-  // When a transient error trips the per-batch retry loop, surface the
-  // attempt number so the user sees "Retrying after blip…" instead of just
-  // a frozen progress bar.
-  const [genRetryAttempt, setGenRetryAttempt] = useState<number>(0);
   const genCancelRef = useRef(false);
+  const genRunningRef = useRef(false);
+  useEffect(() => () => { genCancelRef.current = true; }, []);
 
   // Three modes, all using the same batch endpoint:
   //
@@ -105,59 +77,37 @@ export default function StepPlanCell({
     oneBatch = false,
     startFrom = 0,
   }: { oneBatch?: boolean; startFrom?: number } = {}) => {
+    if (genRunningRef.current) return;
+    genRunningRef.current = true;
     setGenRunning(true);
     setGenError(null);
     setGenTotal(null);
     setGenSoFar(0);
-    setGenRetryAttempt(0);
     genCancelRef.current = false;
     let start = startFrom;
     // One-batch mode uses batch_size=1 so we get exactly the scene we want
     // (no accidentally over-planning). Full-song mode uses BATCH_SIZE (3).
     const callBatchSize = oneBatch ? 1 : BATCH_SIZE;
 
-    // Per-batch retry on transient errors (uvicorn restart, network blip,
-    // proxy upstream-unreachable). Each batch is its own request, so a
-    // single bad blip shouldn't abort the whole multi-minute generation.
-    // Up to 5 retries per batch, exponential backoff capped at 8s.
-    const callBatchWithRetry = async (startIdx: number) => {
-      let lastErr: unknown = null;
-      for (let attempt = 0; attempt <= TRANSIENT_RETRY_COUNT; attempt++) {
-        if (genCancelRef.current) throw new Error("Generation cancelled");
-        try {
-          const r = await api.scenes.generateBatch({
-            project_id: project.id,
-            song_id: song!.id,
-            target_scene_duration: planOpts.duration,
-            llm_model: models?.llm?.[planOpts.plan_llm]?.model_id || "google/gemini-3-flash-preview",
-            story_seed: planOpts.story_seed.trim() || undefined,
-            start_index: startIdx,
-            batch_size: callBatchSize,
-          });
-          setGenRetryAttempt(0);  // success — clear the retry indicator
-          return r;
-        } catch (e) {
-          lastErr = e;
-          if (!isTransientError(e) || attempt === TRANSIENT_RETRY_COUNT) {
-            throw e;
-          }
-          setGenRetryAttempt(attempt + 1);
-          // Sleep + retry. The polling effect refreshes the project query
-          // each 2s anyway, so the UI keeps showing progress.
-          await new Promise((r) => setTimeout(r, transientRetryDelay(attempt)));
-        }
-      }
-      throw lastErr;
-    };
+    // A disconnected response may already have incurred a provider charge.
+    // Submit each batch once and refresh saved scenes before explicit recovery.
+    const callBatch = (startIdx: number) => api.scenes.generateBatch({
+      project_id: project.id,
+      song_id: song!.id,
+      target_scene_duration: planOpts.duration,
+      llm_model: llmId,
+      story_seed: planOpts.story_seed.trim() || undefined,
+      start_index: startIdx,
+      batch_size: callBatchSize,
+    });
 
     try {
       while (!genCancelRef.current) {
-        const data = await callBatchWithRetry(start);
+        const data = await callBatch(start);
         setGenTotal(data.total_planned);
         setGenSoFar(data.scenes_so_far);
         // Pull fresh scenes immediately so the UI updates between batches.
         await qc.invalidateQueries({ queryKey: ["project", project.id] });
-        await qc.refetchQueries({ queryKey: ["project", project.id] });
         // Single-batch mode stops after one call regardless of has_more.
         // Used by "Just scene 1" and "Add scene N+1".
         if (oneBatch) break;
@@ -166,7 +116,9 @@ export default function StepPlanCell({
       }
     } catch (e: any) {
       setGenError(e?.message || "Generation failed");
+      await refresh();
     } finally {
+      genRunningRef.current = false;
       setGenRunning(false);
     }
   };
@@ -227,7 +179,7 @@ export default function StepPlanCell({
           <h3 className="text-sm font-semibold">Auto-Plan with AI</h3>
         </div>
         <p className="text-xs text-zinc-500 mb-2">
-          Claude reads lyrics, beats, sections, song theme, your story seed, and the cast — then designs a scene-by-scene plan.
+          Your selected planning model reads the song, story seed and cast to create a scene-by-scene plan.
         </p>
         <div className="text-[11px] text-zinc-400 mb-4 bg-surface-3 border border-white/5 rounded-md p-2.5 leading-relaxed">
           <span className="text-accent font-medium">How it works:</span>{" "}
@@ -235,8 +187,7 @@ export default function StepPlanCell({
           fully-expanded image + video prompts. Every new batch sees the scenes already planned
           (descriptions, image prompts, video prompts) so the visual vocabulary stays consistent
           across the song. Scenes are joined by hard cuts at assembly — no per-scene frame anchoring.
-          Short batches mean you see scenes appear progressively, and a network blip only loses the
-          in-flight batch.
+          Review scenes as each batch is saved. If the connection is interrupted, planning pauses so you can check saved work before continuing.
         </div>
 
         <div className="mb-3">
@@ -254,17 +205,21 @@ export default function StepPlanCell({
 
         <div className="mb-3">
           <label className="text-[10px] text-zinc-500 uppercase tracking-wide block mb-1">
-            Target Scene Length
+            Scene Length (fixed)
           </label>
           <div className="flex items-center gap-2">
             <input
               type="range" min={3} max={15} step={1}
+              disabled={genRunning}
               value={planOpts.duration}
               onChange={(e) => setPlanOpts({ ...planOpts, duration: Number(e.target.value) })}
               className="flex-1 accent-accent"
             />
             <span className="text-sm font-medium w-10 text-right">{planOpts.duration}s</span>
           </div>
+          <p className="mt-1 text-[10px] text-zinc-500">
+            Every clip is exactly {planOpts.duration}s. The final export trims the last clip at the song’s end.
+          </p>
         </div>
 
         {/* Single LLM picker — used for batch generation AND per-scene re-expand. */}
@@ -279,7 +234,7 @@ export default function StepPlanCell({
             className="w-full bg-surface-2 border border-white/10 rounded px-2 py-1 text-xs text-white focus:outline-none focus:border-accent"
           >
             {models && Object.entries(models.llm).map(([key, m]) => (
-              <option key={key} value={key}>{m.name}</option>
+              <option key={key} value={key} disabled={m.available === false}>{m.name}{m.available === false ? " — unavailable" : ""}</option>
             ))}
             {!models && <option value={planOpts.plan_llm}>{planOpts.plan_llm}</option>}
           </select>
@@ -318,10 +273,7 @@ export default function StepPlanCell({
             {genRunning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />}
             {(() => {
               if (!genRunning) {
-                return scenes.length ? "Re-generate Scenes" : "Generate Scenes";
-              }
-              if (genRetryAttempt > 0) {
-                return `Retrying after backend blip… (attempt ${genRetryAttempt + 1}/${TRANSIENT_RETRY_COUNT + 1})`;
+                return scenes.length ? "Replace scene plan" : "Plan the full song";
               }
               if (genTotal == null) return "Starting…";
               return `Generating ${genSoFar}/${genTotal} scenes…`;
@@ -339,7 +291,7 @@ export default function StepPlanCell({
             }
           >
             <Wand2 className="w-3.5 h-3.5" />
-            Just scene 1
+            Plan scene 1
           </button>
         </div>
         {genRunning && (
@@ -365,9 +317,7 @@ export default function StepPlanCell({
               <span className="font-medium">Generation failed at batch starting #{genSoFar + 1}: </span>
               {genError.length > 400 ? genError.slice(0, 400) + "…" : genError}
               <div className="text-[10px] text-red-300/70 mt-1">
-                {genSoFar > 0
-                  ? `${genSoFar} scenes were planned before the failure — click Re-generate to start fresh, or fix the issue and re-run to retry the failed batch.`
-                  : "No scenes were planned. Try again."}
+                Planning paused. A disconnected request may still finish on the server. Check the saved scenes below before starting another plan; replacing the plan generates new work.
               </div>
             </div>
             <button
@@ -386,18 +336,6 @@ export default function StepPlanCell({
           />
         </div>
       </div>
-
-      {models && scenes.length > 0 && (
-        <VideoModelCheatSheet
-          models={models}
-          selectedModel={mostCommon(scenes.map((scene) => scene.video_model)) || ""}
-          sceneDurations={scenes.map((scene) => Math.round(scene.audio_end - scene.audio_start))}
-          disabled={setPlanVideoModel.isPending}
-          onSelect={(videoModel, resolution) =>
-            setPlanVideoModel.mutate({ videoModel, resolution })
-          }
-        />
-      )}
 
       {/* Scenes list */}
       {scenes.length > 0 && (
@@ -421,7 +359,7 @@ export default function StepPlanCell({
                     project_id: project.id,
                     order: scenes.length + 1,
                     audio_start: scenes.length ? scenes[scenes.length - 1].audio_end : 0,
-                    audio_end: scenes.length ? scenes[scenes.length - 1].audio_end + 8 : 8,
+                    audio_end: (scenes.length ? scenes[scenes.length - 1].audio_end : 0) + planOpts.duration,
                     description: "",
                   })
                 }
@@ -693,7 +631,7 @@ function DurationSum({ scenes, song }: { scenes: Scene[]; song?: Song }) {
   const sceneTotal = Math.round(
     scenes.reduce((acc, s) => acc + (s.audio_end - s.audio_start), 0)
   );
-  const songTotal = song?.duration ? Math.floor(song.duration) : 0;
+  const songTotal = song?.duration ? Math.ceil(song.duration) : 0;
   if (!songTotal) {
     return (
       <span className="text-[10px] font-mono text-zinc-500">
@@ -703,12 +641,17 @@ function DurationSum({ scenes, song }: { scenes: Scene[]; song?: Song }) {
   }
   const diff = sceneTotal - songTotal;
   const matched = Math.abs(diff) <= 1;
-  const tone = matched
+  const ordered = [...scenes].sort((a, b) => a.order - b.order);
+  const last = ordered[ordered.length - 1];
+  const contiguous = ordered.every((scene, index) => Math.abs(scene.audio_start - (index ? ordered[index - 1].audio_end : 0)) < 0.001);
+  const closingTrim = contiguous && last && !!song?.duration
+    && last.audio_start < song.duration && last.audio_end > song.duration;
+  const tone = matched || closingTrim
     ? "text-green-400"
     : diff < 0 ? "text-amber-300" : "text-red-300";
   const label = matched
     ? "matches song"
-    : diff < 0 ? `${Math.abs(diff)}s short` : `${diff}s over`;
+    : closingTrim ? "last clip trimmed to song" : diff < 0 ? `${Math.abs(diff)}s short` : `${diff}s over`;
   return (
     <span className={`text-[10px] font-mono ${tone}`} title={`Scenes total: ${sceneTotal}s — Song: ${songTotal}s`}>
       {sceneTotal}s / {songTotal}s · {label}

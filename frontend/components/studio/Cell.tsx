@@ -42,7 +42,7 @@ export default function Cell({
   return (
     <section
       id={`cell-${step}`}
-      className={`relative rounded-2xl border transition-all ${
+      className={`relative scroll-mt-24 rounded-2xl border transition-all ${
         locked ? "border-white/5 opacity-50" : "border-white/10 bg-surface-1"
       } ${expanded ? "shadow-2xl shadow-black/40" : ""}`}
     >
@@ -54,6 +54,8 @@ export default function Cell({
       <button
         onClick={onToggle}
         disabled={locked}
+        aria-expanded={expanded && !locked}
+        aria-controls={`cell-content-${step}`}
         className={`w-full flex items-center gap-4 px-5 py-4 text-left transition-colors ${
           locked ? "cursor-not-allowed" : "hover:bg-white/[0.02]"
         }`}
@@ -92,7 +94,7 @@ export default function Cell({
       </button>
 
       {expanded && !locked && (
-        <div className="px-5 pb-5 pt-1 border-t border-white/5">{children}</div>
+        <div id={`cell-content-${step}`} className="px-3 sm:px-5 pb-5 pt-1 border-t border-white/5">{children}</div>
       )}
     </section>
   );

@@ -2,7 +2,8 @@
 import { Image as ImageIcon, Video } from "lucide-react";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { createPortal } from "react-dom";
-import type { Scene, Character } from "@/lib/types";
+import type { Scene, Character, VideoModel } from "@/lib/types";
+import { videoProviderLabel } from "@/lib/videoModels";
 import { fmt, textMentionsCharacter } from "./shared";
 
 export default function DescriptionWithPromptTooltip({
@@ -12,6 +13,8 @@ export default function DescriptionWithPromptTooltip({
   videoModelUsesRefs,
   audioSyncActive,
   audioUsesFrame,
+  audioInputMode,
+  videoProvider = "openrouter",
 }: {
   scene: Scene;
   characters?: Character[];
@@ -24,12 +27,12 @@ export default function DescriptionWithPromptTooltip({
   // are dropped at the OpenRouter passthrough layer. Drives the
   // "Sent to ..." summary so we don't lie about what reaches the model.
   videoModelUsesRefs?: boolean;
-  // Whether audio-sync is active on this scene (toggle + model supports it).
-  // When true, the request routes through fal Seedance R2V instead of
-  // OpenRouter I2V; no first_frame is sent, audio reference IS sent.
+  // Whether the model receives this scene's song as an input on fal.
   audioSyncActive?: boolean;
-  // Wan audio I2V keeps an exact first frame; Seedance audio R2V does not.
+  // Wan 2.7/LTX use a first frame; Seedance/Wan 3 use image references.
   audioUsesFrame?: boolean;
+  audioInputMode?: VideoModel["audio_input_mode"];
+  videoProvider?: "fal" | "openrouter";
 }) {
   // Portal-rendered tooltip — necessary because the parent scene card uses
   // overflow-hidden (for rounded corners on the inner divider), which clips
@@ -136,12 +139,12 @@ export default function DescriptionWithPromptTooltip({
   return (
     <div
       ref={triggerRef}
-      className="relative flex-1 min-w-0"
+      className="relative order-last min-w-0 basis-full sm:order-none sm:flex-1 sm:basis-auto"
       onMouseEnter={hasPrompts ? onEnter : undefined}
       onMouseLeave={hasPrompts ? scheduleClose : undefined}
     >
       <div className={hasPrompts ? "cursor-help" : ""}>
-        <p className="text-xs text-zinc-300 truncate">
+        <p className="line-clamp-2 text-xs text-zinc-300 sm:block sm:truncate">
           {scene.description || <span className="text-zinc-600 italic">no description</span>}
         </p>
         <p className="text-[10px] text-amber-200/65 truncate mt-0.5">
@@ -160,26 +163,22 @@ export default function DescriptionWithPromptTooltip({
           onMouseEnter={cancelClose}
           onMouseLeave={scheduleClose}
         >
-          {/* Honest summary of what the video call will include. Three routes:
-                - OpenRouter I2V (default): first_frame OR character refs.
-                - fal Seedance R2V: audio + refs, NO first_frame.
-                - fal Wan I2V: audio + exact first_frame, NO character refs.
-              The text changes per route so the user knows what's actually sent. */}
+          {/* Keep the input summary specific to the submitted provider route. */}
           <div className={`mb-3 text-[10px] ${audioSyncActive ? "text-fuchsia-200" : "text-zinc-400"} ${audioSyncActive ? "bg-fuchsia-500/10 border-fuchsia-500/30" : "bg-zinc-500/10 border-zinc-500/30"} border rounded px-2 py-1.5`}>
             <div className="font-semibold mb-1" style={{ color: audioSyncActive ? "rgb(244 114 182)" : "rgb(212 212 216)" }}>
               {audioSyncActive
-                ? `Sent to fal ${videoModelLabel || "video model"} (${audioUsesFrame ? "audio-driven I2V" : "audio-sync R2V"}):`
-                : `Sent to ${videoModelLabel || "OpenRouter"} (image-to-video route):`}
+                ? `Sent to fal · ${videoModelLabel || "video model"} (${audioUsesFrame ? "audio + first frame" : "audio + image references"}):`
+                : `Sent to ${videoProviderLabel(videoProvider)} · ${videoModelLabel || "video model"} (standard video):`}
             </div>
             <ul className="space-y-0.5 leading-snug">
               <li>· video_prompt (verbatim, below)</li>
               {audioSyncActive ? (
                 <>
                   <li>
-                    · {audioUsesFrame ? "audio_url" : "audio_urls[0]"} ={" "}
+                    · {audioUsesFrame ? "audio_url" : audioInputMode === "wan_r2v" ? "reference_audio_urls[0]" : "audio_urls[0]"} ={" "}
                     <span className="text-fuchsia-200">
                       song slice {fmt(scene.audio_start)}–{fmt(scene.audio_end)}
-                      {!audioUsesFrame && " (trimmed ~150ms under video duration)"}
+                      {!audioUsesFrame && audioInputMode !== "wan_r2v" && " (trimmed ~150ms under video duration)"}
                     </span>
                   </li>
                   {audioUsesFrame ? (
@@ -192,12 +191,12 @@ export default function DescriptionWithPromptTooltip({
                             ? <span className="text-fuchsia-100">this scene's generated still (exact first frame)</span>
                             : <span className="text-red-300">none — REQUIRED; the app will generate a still first</span>}
                       </li>
-                      <li className="text-zinc-500 italic">· no separate character portraits — Wan audio I2V uses the exact frame as its identity anchor.</li>
+                      <li className="text-zinc-500 italic">· no separate character portraits — the scene frame anchors character appearance.</li>
                     </>
                   ) : (
                     <>
                       <li>
-                        · image_urls ={" "}
+                        · {audioInputMode === "wan_r2v" ? "reference_image_urls" : "image_urls"} ={" "}
                         {(() => {
                           const frameSource = scene.chain_from_prev
                             ? "prev scene's extracted last frame"
@@ -213,7 +212,7 @@ export default function DescriptionWithPromptTooltip({
                           return items.reduce((acc, el, i) => i === 0 ? [el] : [...acc as any, <span key={`s${i}`} className="text-zinc-500"> + </span>, el], [] as React.ReactNode[]);
                         })()}
                       </li>
-                      <li className="text-zinc-500 italic">· no first_frame — Seedance treats all images as compositional/style/identity references.</li>
+                      <li className="text-zinc-500 italic">· no first-frame anchor — images guide composition, style, and identity.</li>
                     </>
                   )}
                 </>
@@ -250,10 +249,10 @@ export default function DescriptionWithPromptTooltip({
             <div className="mt-1 text-zinc-500">
               {audioSyncActive
                 ? audioUsesFrame
-                  ? "Wan audio mode: the uploaded song segment drives lip/action timing while the scene still or chained frame remains the exact visual start. Character-reference mode is not combined with this route."
-                  : "Audio-sync route: Seedance R2V composes the shot using the audio + all image_urls as combined references. Character portraits provide identity anchoring; the scene still adds composition without being a strict first frame."
+                  ? `${videoModelLabel || "This model"}: the uploaded song segment guides timing, with the scene still or chained frame as the first frame. Separate character portraits are not sent.`
+                  : `${videoModelLabel || "This model"} composes the shot using the song and image references. Character portraits guide identity; the scene still guides composition without anchoring the first frame. Precise singing or lip sync is not guaranteed.`
                 : videoModelUsesRefs === false
-                  ? `${videoModelLabel || "This model"} doesn't accept input_references on the OpenRouter route — character identity comes entirely from the first_frame. Switch to a Seedance variant if you need character-portrait identity anchoring.`
+                  ? `${videoModelLabel || "This model"} doesn't accept separate character references on this route; character appearance comes from the first frame.`
                   : characterReferenceMode
                     ? "Character-reference mode: named cast portraits are the identity anchors. No exact first/last frame is sent because OpenRouter treats frame images and character references as mutually exclusive inputs."
                     : "Frame mode: the scene still or chained final frame is used as the exact first frame. Separate character portraits are not sent."}

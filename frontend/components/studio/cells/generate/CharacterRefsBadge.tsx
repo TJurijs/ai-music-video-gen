@@ -5,6 +5,7 @@ import { AlertCircle, Image as ImageIcon, Link2, Users } from "lucide-react";
 import { api } from "@/lib/api";
 import type { Scene, Character } from "@/lib/types";
 import { textMentionsCharacter } from "./shared";
+import { audioUsesFirstFrame, usesSongAudio } from "@/lib/videoModels";
 
 export default function CharacterRefsBadge({ scene, onModeChange, disabled }: {
   scene: Scene;
@@ -17,8 +18,8 @@ export default function CharacterRefsBadge({ scene, onModeChange, disabled }: {
   const { data: models } = useQuery({ queryKey: ["models"], queryFn: api.models.list });
   const modelCfg = models?.video?.[scene.video_model];
   const modelUsesRefs = !!modelCfg?.supports_reference_images;
-  const audioSyncActive = !!scene.audio_sync_enabled && !!modelCfg?.supports_audio_input;
-  const audioUsesFrame = audioSyncActive && modelCfg?.audio_input_mode === "wan_i2v";
+  const audioSyncActive = usesSongAudio(modelCfg, scene.audio_sync_enabled);
+  const audioUsesFrame = audioSyncActive && audioUsesFirstFrame(modelCfg);
   const characterOnlyActive = modelUsesRefs
     && !audioSyncActive
     && scene.video_reference_mode === "character";
@@ -83,12 +84,12 @@ export default function CharacterRefsBadge({ scene, onModeChange, disabled }: {
                 ? "border-amber-400/25 bg-amber-500/10 text-amber-200"
                 : "border-blue-400/25 bg-blue-500/10 text-blue-200"
           }`}
-          title="This input source will be used the next time you press + Vid."
+          title="These inputs will be used the next time you generate this scene’s video."
         >
           {audioSyncActive
             ? audioUsesFrame
-              ? "Next video: audio + exact frame"
-              : "Next video: audio + scene/cast refs"
+              ? "Next video: fal · song + first frame"
+              : "Next video: fal · song + scene/cast refs"
             : characterOnlyActive
               ? "Next video: character refs only · no first frame"
               : "Next video: exact first frame · no character refs"}
@@ -107,7 +108,7 @@ export default function CharacterRefsBadge({ scene, onModeChange, disabled }: {
                 ? `${modelName} audio mode sends the song slice, a scene or chained image when available, and named cast portraits. Choose Character refs only to omit audio and the scene frame.`
             : modelUsesRefs
               ? "Frame mode is active. Exact frame anchors and separate character references are mutually exclusive, so portraits are not sent."
-              : `${modelName} does not support separate input_references on this OpenRouter route.`
+              : `${modelName} uses the scene's first frame for character appearance; separate portraits are not sent.`
         }
       >
         {characterOnlyActive || audioUsesCharacterRefs

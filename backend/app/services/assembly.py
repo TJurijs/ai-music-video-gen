@@ -24,6 +24,7 @@ from typing import Optional
 from sqlmodel import Session, select
 from app.config import settings
 from app.models import Project, Scene, Song
+from app.services.scene_timing import active_video_timing_matches
 
 
 def _run_ffmpeg(cmd: list[str]) -> None:
@@ -119,6 +120,17 @@ def assemble_project(project_id: int, engine, job_id: int | None = None) -> str:
             select(Song).where(Song.project_id == project_id)
         ).first()
 
+        stale_scenes = [
+            scene.order for scene in scenes
+            if scene.status == "done" and not active_video_timing_matches(db, scene)
+        ]
+        if stale_scenes:
+            numbers = ", ".join(str(order) for order in stale_scenes)
+            raise RuntimeError(
+                f"Scene(s) {numbers} have active videos for an earlier song window. "
+                "Generate videos for their current timing before assembling."
+            )
+
     prefix_length = 0
     while prefix_length < len(scenes) and scenes[prefix_length].status == "done":
         prefix_length += 1
@@ -133,19 +145,26 @@ def assemble_project(project_id: int, engine, job_id: int | None = None) -> str:
     output_dir = os.path.join(settings.storage_dir, str(project_id))
     os.makedirs(output_dir, exist_ok=True)
 
-    # Collect every on-disk clip in scene order, alongside per-clip flags
-    # (whether to trim the duplicated first frame of chained scenes).
-    clips: list[tuple[str, bool]] = []  # (path, is_chained)
+    # Every completed scene must contribute its active clip. Silently skipping
+    # a missing file shifts all later shots earlier against the original song.
+    clips: list[str] = []
+    missing_scenes: list[int] = []
     for scene in done_scenes:
-        if scene.video_path and os.path.exists(scene.video_path):
-            clips.append((scene.video_path, bool(scene.chain_from_prev)))
-    if not clips:
-        raise RuntimeError("No video files found on disk for any done scene")
+        if not scene.video_path or not os.path.isfile(scene.video_path):
+            missing_scenes.append(scene.order)
+        else:
+            clips.append(scene.video_path)
+    if missing_scenes:
+        numbers = ", ".join(str(order) for order in missing_scenes)
+        raise RuntimeError(
+            f"The active video file is missing for scene(s) {numbers}. "
+            "Restore the file or select an available video variant before assembling."
+        )
 
     # Probe each clip's dimensions; if any probe fails we still get a sane
     # fallback. We need this BEFORE building the filtergraph because the
     # target dims become a literal in the scale= filter.
-    dims_results = [_probe_video_dims(p) for p, _ in clips]
+    dims_results = [_probe_video_dims(p) for p in clips]
     valid_dims = [d for d in dims_results if d is not None]
     if not valid_dims:
         # Shouldn't happen in practice — ffprobe failing on every clip means
@@ -175,12 +194,11 @@ def assemble_project(project_id: int, engine, job_id: int | None = None) -> str:
     #   -i <clip1> -i <clip2> ... -filter_complex "<per-clip normalize>;<concat>" -map "[out]" ...
     #
     # Each clip gets a filter chain:
-    #   [N:v]<trim?>,scale=W:H:force_original_aspect_ratio=decrease,pad=W:H:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=24,format=yuv420p[vN]
+    #   [N:v]setpts=PTS-STARTPTS,scale=W:H:force_original_aspect_ratio=decrease,pad=W:H:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=24,format=yuv420p[vN]
     #
-    #   - trim=start=0.04,setpts=PTS-STARTPTS: only on chained scenes, skips
-    #     the duplicated first frame (the prev's extracted last frame is
-    #     this clip's first_frame, so the concat would show it twice).
-    #     setpts resets timestamps after the trim or concat drifts.
+    #   - setpts resets every input to zero, as required by the concat filter.
+    #     Preserve all frames, including chained anchors: removing one frame
+    #     per chain shortens the planned scene and accumulates song-sync drift.
     #   - scale + pad with force_original_aspect_ratio=decrease: fit each
     #     clip into the target box preserving its native aspect. If a clip's
     #     aspect doesn't match the target, padding adds black bars instead
@@ -197,11 +215,10 @@ def assemble_project(project_id: int, engine, job_id: int | None = None) -> str:
     #   - format=yuv420p: standard pixel format for h264 + browser playback.
     inputs: list[str] = []
     filter_parts: list[str] = []
-    for i, (path, is_chained) in enumerate(clips):
+    for i, path in enumerate(clips):
         inputs.extend(["-i", path])
         chain = (
-            f"[{i}:v]"
-            + ("trim=start=0.04,setpts=PTS-STARTPTS," if is_chained else "")
+            f"[{i}:v]setpts=PTS-STARTPTS,"
             + f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
             + f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,"
             + f"setsar=1,fps={target_fps},format=yuv420p"
@@ -224,44 +241,24 @@ def assemble_project(project_id: int, engine, job_id: int | None = None) -> str:
     has_audio = bool(song and song.file_path and os.path.exists(song.file_path))
 
     if has_audio:
-        # Step 1 — concat-filter all clips into a silent intermediate.
-        # The concat filter normalizes each input (scale/pad/setsar/fps/format)
-        # before concatenating, which is what fixes the freeze-on-spec-mismatch
-        # bug the concat demuxer had.
-        intermediate = os.path.join(output_dir, f"assembled_noaudio_{run_token}.mp4")
+        # Encode with the song in the same pass. Applying -shortest to a
+        # second stream-copy pass can cut reordered video packets early.
+        # Encoding here preserves the closing frames up to the song end,
+        # including a fixed-length final clip longer than the song remainder.
         _run_ffmpeg([
             "ffmpeg", "-y", "-v", "warning",
             *inputs,
+            "-i", song.file_path,
             "-filter_complex", filter_complex,
             "-map", "[out]",
+            "-map", f"{len(clips)}:a:0",
             "-c:v", "libx264", "-crf", "18", "-preset", "fast",
             "-pix_fmt", "yuv420p",
-            "-an",
-            intermediate,
-        ])
-
-        # Step 2 — mux intermediate video + song audio with explicit -map flags
-        # so streams are unambiguous. -shortest cuts to the shorter of the two.
-        # `-movflags +faststart` relocates the moov atom to the start of the
-        # file so browsers can seek to any timestamp without downloading the
-        # entire file first.
-        _run_ffmpeg([
-            "ffmpeg", "-y", "-v", "warning",
-            "-i", intermediate,
-            "-i", song.file_path,
-            "-map", "0:v:0",
-            "-map", "1:a:0",
-            "-c:v", "copy",
             "-c:a", "aac", "-b:a", "320k",
             "-movflags", "+faststart",
             "-shortest",
             temporary_output,
         ])
-
-        try:
-            os.remove(intermediate)
-        except OSError:
-            pass
     else:
         # No audio — single-pass concat-filter with re-encode straight to output.
         _run_ffmpeg([

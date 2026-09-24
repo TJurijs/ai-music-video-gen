@@ -1,7 +1,9 @@
 from datetime import datetime
 import asyncio
+import os
 import uuid
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse
 from sqlmodel import Session, select
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
@@ -16,6 +18,8 @@ from app.services.generation_state import (
     release_stale_scene_claim,
 )
 from app.services.assembly import assemble_project
+from app.services.provider_io import log_provider
+from app.services.media_files import storage_path_is_safe
 
 router = APIRouter()
 
@@ -164,14 +168,14 @@ async def trigger_scene_generation(
     # Image gen is ADDITIVE on a done scene — it creates a new still variant
     # without overwriting the video. Only video-phase regeneration on a done
     # scene requires explicit force, because that replaces the rendered clip.
-    if scene.status == "done" and not req.force and req.phase != "image":
-        raise HTTPException(400, "Scene already done. Use force=true to regenerate.")
     report = scene_generation_preflight(
         scene,
         db,
         phase=req.phase,
         force=req.force,
     )
+    if scene.status == "done" and not req.force and req.phase != "image" and not report["resuming"]:
+        raise HTTPException(400, "Scene already done. Use force=true to regenerate.")
     if not report["ready"]:
         raise HTTPException(
             400,
@@ -224,16 +228,66 @@ async def trigger_batch_generation(
         raise HTTPException(400, f"Generation preflight failed. {summary}")
 
     queued = []
+    runs = []
+    previous_by_order: dict[int, int] = {}
+    resuming_ids = {report["scene_id"] for report in reports if report["resuming"]}
     for scene in scenes:
         run_id = _claim_scene_run(db, scene.id, req.phase)
         if not run_id:
             continue
-        background_tasks.add_task(
-            generate_scene, scene.id, engine, req.phase, run_id, req.force,
+        dependency = (
+            previous_by_order.get(scene.order - 1)
+            if scene.chain_from_prev and req.phase != "image" and scene.id not in resuming_ids
+            else None
         )
+        runs.append((scene.id, run_id, dependency))
+        previous_by_order[scene.order] = scene.id
         queued.append(scene.id)
 
+    if runs:
+        background_tasks.add_task(_run_generation_batch, runs, req.phase, req.force)
+
     return {"message": f"Queued {len(queued)} scenes ({req.phase})", "scene_ids": queued, "phase": req.phase}
+
+
+async def _run_generation_batch(
+    runs: list[tuple[int, str, int | None]], phase: str, force: bool,
+) -> None:
+    """Render two independent scenes at once and isolate each scene's failure.
+
+    Starlette runs separate BackgroundTasks serially and aborts the remaining
+    callbacks on an exception. One batch callback prevents failed scenes from
+    stranding later ownership claims. Chained scenes await their predecessor.
+    """
+    semaphore = asyncio.Semaphore(2)
+    tasks: dict[int, asyncio.Task] = {}
+
+    async def run(scene_id: int, run_id: str, dependency: int | None) -> bool:
+        if dependency is not None and not await tasks[dependency]:
+            with Session(engine) as db:
+                scene = db.get(Scene, scene_id)
+                if scene and scene.generation_run_id == run_id:
+                    scene.status = "done" if scene.video_path and os.path.isfile(scene.video_path) else "error"
+                    scene.error_message = "The previous scene did not finish. Resume it before generating this chained scene."
+                    scene.generation_run_id = None
+                    scene.generation_phase = None
+                    scene.generation_requested_at = None
+                    db.add(scene)
+                    db.commit()
+            return False
+        async with semaphore:
+            try:
+                await generate_scene(scene_id, engine, phase, run_id, force)
+                with Session(engine) as db:
+                    scene = db.get(Scene, scene_id)
+                    return bool(scene and not scene.error_message and scene.status in ("done", "image_ready"))
+            except Exception as exc:
+                log_provider(f"[batch] scene {scene_id} stopped: {str(exc)[:300]}")
+                return False
+
+    for scene_id, run_id, dependency in runs:
+        tasks[scene_id] = asyncio.create_task(run(scene_id, run_id, dependency))
+    await asyncio.gather(*tasks.values())
 
 
 @router.post("/assemble/{project_id}")
@@ -323,6 +377,26 @@ def get_assembly_status(project_id: int, db: Session = Depends(get_session)):
     }
 
 
+@router.get("/assemble/{project_id}/download")
+def download_assembly(project_id: int, db: Session = Depends(get_session)):
+    """Stream the saved export as an attachment through the frontend proxy."""
+    project = db.get(Project, project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    job = db.exec(select(GenerationJob).where(
+        GenerationJob.project_id == project_id,
+        GenerationJob.job_type == "assembly",
+    ).order_by(GenerationJob.id.desc())).first()
+    if not job or job.status != "completed":
+        raise HTTPException(409, "Finish assembling the video before downloading it.")
+    path = job.result_path
+    if not path or not storage_path_is_safe(path) or not os.path.isfile(path):
+        raise HTTPException(404, "The assembled video file is missing. Re-assemble it to create a new export.")
+    name = "".join(c if c.isalnum() or c in " -_" else "_" for c in project.name).strip() or "music-video"
+    return FileResponse(path, media_type="video/mp4", filename=f"{name}.mp4",
+                        headers={"Cache-Control": "no-store"})
+
+
 @router.get("/jobs/{project_id}")
 def get_jobs(project_id: int, db: Session = Depends(get_session)):
     jobs = db.exec(
@@ -390,7 +464,7 @@ async def _assemble_bg(project_id: int, job_id: int):
     poll for completion + retrieve the final video URL."""
     try:
         output = await asyncio.to_thread(assemble_project, project_id, engine, job_id)
-        print(f"Assembly complete: {output}")
+        log_provider(f"Assembly complete: {output}")
         with Session(engine) as db:
             job = db.get(GenerationJob, job_id)
             if job:
@@ -399,7 +473,7 @@ async def _assemble_bg(project_id: int, job_id: int):
                 job.completed_at = datetime.utcnow()
                 db.add(job); db.commit()
     except Exception as e:
-        print(f"Assembly failed: {e}")
+        log_provider(f"Assembly failed: {e}")
         with Session(engine) as db:
             job = db.get(GenerationJob, job_id)
             if job:

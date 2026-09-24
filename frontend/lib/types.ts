@@ -7,6 +7,7 @@ export interface Project {
   // Persistent narrative seed — set by auto-plan, reused by AI Expand to
   // keep per-scene prompts anchored to the same story direction.
   story_seed?: string;
+  target_scene_duration?: number | null;
   created_at: string;
   updated_at: string;
   song_count?: number;
@@ -125,6 +126,7 @@ export interface ScenePromptVersion {
 }
 
 export interface Scene {
+  video_timing_stale?: boolean;
   id: number;
   project_id: number;
   order: number;
@@ -144,11 +146,9 @@ export interface Scene {
   resolution: string;
   align_to_beats: boolean;
   prompts_expanded: boolean;
-  // Audio-sync (fal Seedance reference-to-video). When true AND the
-  // chosen video_model has supports_audio_input=true, the backend
-  // routes through fal R2V instead of OpenRouter I2V: scene's audio
-  // window is sliced from the song and sent with character refs; no
-  // first_frame is used in this mode. No-op on other models.
+  // Send this scene's song segment through the model's fal audio route.
+  // Depending on audio_input_mode, it uses a first-frame anchor or image
+  // references. Audio input is guidance, not a guarantee of lip sync.
   audio_sync_enabled?: boolean;
   // Exact first/last frame conditioning and separate character references
   // are mutually exclusive OpenRouter modes.
@@ -193,6 +193,8 @@ export interface GenerationJob {
 }
 
 export interface SceneGenerationPreflight {
+  resuming?: boolean;
+  resumable_job_id?: number | null;
   scene_id: number;
   scene_order: number;
   ready: boolean;
@@ -225,16 +227,27 @@ export interface ProjectCosts {
 export type VideoTier = "debug" | "cheap" | "mid" | "premium";
 
 export interface VideoModel {
+  history?: {
+    attempts: number; submitted: number; provider_attempts: number; completed: number;
+    failed: number; pending: number; policy_rejections: number; possible_policy_rejections: number;
+    active_scenes: number; local_edits: number; video_assets: number; unique_scenes: number;
+    projects: { id: number; name: string }[]; evidence_note: string;
+    guardrail_status: "rejections_observed" | "possible_rejections" | "none_observed" | "no_history";
+    routes?: { provider: string; route: string; attempts: number; completed: number; policy_rejections: number }[];
+  };
+  available?: boolean;
+  unavailable_reason?: string;
   name: string;
   model_id: string;
-  // When set, the audio-sync toggle on a scene with this model becomes
-  // available: backend routes video gen through fal's R2V endpoint (the
-  // path that accepts an audio reference + character refs and rejects
-  // first_frame). Only set on Seedance variants today.
+  // Seedance and Wan 3 accept song plus image/character references via R2V.
   fal_r2v_model_id?: string;
-  // Wan uses fal image-to-video instead: exact first frame + driving audio.
+  // Wan and LTX use first-frame input plus driving audio through fal.
   fal_audio_model_id?: string;
-  audio_input_mode?: "seedance_r2v" | "wan_i2v";
+  provider?: "openrouter" | "fal";
+  requires_audio_input?: boolean;
+  audio_input_mode?: "seedance_r2v" | "wan_r2v" | "wan_i2v" | "ltx_a2v";
+  audio_durations?: number[];
+  audio_aspects?: string[];
   audio_resolutions?: string[];
   // fal reference-audio route pricing in USD per output second. This is a
   // separate SKU from the normal OpenRouter pricing matrix below.
@@ -270,6 +283,8 @@ export interface VideoModel {
 }
 
 export interface ImageModel {
+  available?: boolean;
+  unavailable_reason?: string;
   name: string;
   model_id: string;
   price_per_image: number;
@@ -278,6 +293,8 @@ export interface ImageModel {
 }
 
 export interface LLMModel {
+  available?: boolean;
+  unavailable_reason?: string;
   name: string;
   model_id: string;
   tier?: "cheap" | "mid" | "premium";
@@ -285,6 +302,7 @@ export interface LLMModel {
 }
 
 export interface ModelsConfig {
+  verified_at?: string;
   video: Record<string, VideoModel>;
   image: Record<string, ImageModel>;
   llm: Record<string, LLMModel>;

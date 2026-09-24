@@ -1,4 +1,9 @@
 @echo off
 setlocal
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0start.ps1"
+where pwsh.exe >nul 2>nul
+if %ERRORLEVEL% EQU 0 (
+  pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0start.ps1" %*
+) else (
+  powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0start.ps1" %*
+)
 exit /b %ERRORLEVEL%

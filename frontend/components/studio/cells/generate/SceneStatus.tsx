@@ -35,6 +35,17 @@ export function SceneErrorBanner({
   // (Seedance/Veo/Kling). Default to video if no clear signal.
   const isImageFilter = /image model|image content filter|image prompt/i.test(err);
   const which = isImageFilter ? "image" : "video";
+  const recovery = /duration differs from the scene plan/i.test(err)
+    ? "The provider returned a clip with the wrong length. Small shortfalls can be recovered by holding the final frame; larger gaps need a different render. Your planned scene length is preserved."
+    : /429|rate.limit|too many requests|capacity/i.test(err)
+    ? "The provider is busy. Wait before trying again; repeated submissions can delay recovery."
+    : /credit|balance|payment|402|billing/i.test(err)
+      ? "Check the provider account’s credits before submitting this scene again."
+      : /timeout|timed out|connection|interrupted|poll|download/i.test(err)
+        ? "The provider may still be processing this render. Use Resume video when available to check the existing job."
+        : /model|duration|resolution|reference|previous scene/i.test(err)
+          ? "Review this scene’s model and references. Choose the model, length and quality in the scene’s video settings."
+          : "Review the details below and adjust this scene before trying again. Saved variants remain available.";
 
   const soften = useMutation({
     mutationFn: (field: "video_prompt" | "image_prompt") =>
@@ -58,11 +69,13 @@ export function SceneErrorBanner({
   const dismissErr = dismiss.error instanceof Error ? dismiss.error.message : null;
 
   return (
-    <div className="px-3 py-2 bg-red-900/15 border-b border-red-900/40 space-y-1">
+    <div role="alert" className="px-3 py-3 bg-red-900/15 border-b border-red-900/40 space-y-2">
       <div className="flex items-start gap-2">
         <AlertCircle className="w-3 h-3 text-red-400 shrink-0 mt-0.5" />
         <div className="flex-1 min-w-0">
-          <p className={`text-[10px] text-red-300 ${expanded ? "" : "line-clamp-2"} leading-snug`}>
+          <p className="text-xs font-medium text-red-200">This scene needs attention</p>
+          <p className="mt-1 text-xs leading-relaxed text-red-200/80">{recovery}</p>
+          <p className={`mt-2 text-[11px] text-red-300/70 ${expanded ? "" : "line-clamp-2"} leading-relaxed break-words`}>
             {err}
           </p>
           {err.length > 100 && (
@@ -79,6 +92,7 @@ export function SceneErrorBanner({
           disabled={dismiss.isPending}
           className="text-red-400/60 hover:text-red-200 shrink-0 disabled:opacity-50"
           title="Dismiss this error and reset the row. Doesn't delete any assets — just clears the red banner so you can retry or move on. (Downstream chained scenes still need this scene to render successfully; dismissing won't unblock them.)"
+          aria-label="Dismiss scene error"
         >
           {dismiss.isPending
             ? <Loader2 className="w-3 h-3 animate-spin" />
@@ -91,7 +105,7 @@ export function SceneErrorBanner({
       {isContentFilter && (
         <div className="bg-amber-900/20 border border-amber-700/40 rounded px-2 py-1.5 text-[10px] text-amber-200/90 space-y-1.5">
           <p>
-            Content filter rejected the <span className="font-medium">{which} prompt</span>. Soften it (LLM rewrites without triggers) or pick a less strict model.
+            The provider rejected the <span className="font-medium">{which} prompt</span>. Review the content and references. You can revise the prompt with AI before another attempt.
           </p>
           <div className="flex gap-2">
             {/* Primary action: soften the SIDE that actually failed.
@@ -137,12 +151,14 @@ export function ExpandedBadge({ expanded: _expanded }: { expanded: boolean }) {
 
 export function StatusPill({ status }: { status: string }) {
   const cfg: Record<string, { label: string; cls: string; icon?: React.ReactNode }> = {
-    pending: { label: "Pending", cls: "bg-zinc-800 text-zinc-400" },
-    generating_image: { label: "Image", cls: "bg-blue-900/40 text-blue-300", icon: <Loader2 className="w-2.5 h-2.5 animate-spin" /> },
+    pending: { label: "Not started", cls: "bg-zinc-800 text-zinc-400" },
+    queued: { label: "Queued", cls: "bg-amber-900/30 text-amber-300", icon: <Loader2 className="w-2.5 h-2.5 animate-spin" /> },
+    stopping: { label: "Stopping", cls: "bg-amber-900/30 text-amber-300", icon: <Loader2 className="w-2.5 h-2.5 animate-spin" /> },
+    generating_image: { label: "Creating still", cls: "bg-blue-900/40 text-blue-300", icon: <Loader2 className="w-2.5 h-2.5 animate-spin" /> },
     image_ready: { label: "Still ready", cls: "bg-blue-900/40 text-blue-300", icon: <ImageIcon className="w-2.5 h-2.5" /> },
-    generating_video: { label: "Video", cls: "bg-purple-900/40 text-purple-300", icon: <Loader2 className="w-2.5 h-2.5 animate-spin" /> },
+    generating_video: { label: "Rendering video", cls: "bg-purple-900/40 text-purple-300", icon: <Loader2 className="w-2.5 h-2.5 animate-spin" /> },
     done: { label: "Done", cls: "bg-green-900/40 text-green-400", icon: <Check className="w-2.5 h-2.5" /> },
-    error: { label: "Error", cls: "bg-red-900/40 text-red-400", icon: <AlertCircle className="w-2.5 h-2.5" /> },
+    error: { label: "Needs attention", cls: "bg-red-900/40 text-red-400", icon: <AlertCircle className="w-2.5 h-2.5" /> },
     cancelled: { label: "Cancelled", cls: "bg-zinc-700/50 text-zinc-300", icon: <Square className="w-2.5 h-2.5" /> },
   };
   const c = cfg[status] ?? cfg.pending;

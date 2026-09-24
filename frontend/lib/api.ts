@@ -5,6 +5,21 @@ import type {
 
 const BASE = "/api";
 
+export class ApiError extends Error {
+  constructor(message: string, public readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+// Only query reads use this policy. A lost mutation response can still mean
+// paid work started, so writes must never be automatically replayed here.
+export function shouldRetryQuery(failureCount: number, error: Error): boolean {
+  if (failureCount >= 2) return false;
+  return !(error instanceof ApiError) || error.status === 408 ||
+    error.status === 429 || error.status >= 500;
+}
+
 async function responseError(res: Response): Promise<Error> {
   const raw = await res.text();
   let msg = raw || res.statusText || "Request failed";
@@ -23,12 +38,12 @@ async function responseError(res: Response): Promise<Error> {
     // Keep the raw response for non-JSON errors.
   }
   if (res.status === 500 && /^internal server error$/i.test(msg.trim())) {
-    return new Error(
-      "Backend unreachable (likely restarting). Your request did not reach " +
-      "the server, so nothing changed. Try again in a moment."
+    return new ApiError(
+      "The server could not complete the request. Refresh to check the latest " +
+      "status before trying again; work may already have started.", res.status,
     );
   }
-  return new Error(`${res.status}: ${msg}`);
+  return new ApiError(`${res.status}: ${msg}`, res.status);
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -43,7 +58,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     // closed mid-request. Rare; surface as-is for the toast.
     throw new Error(
       `Network error: ${(networkErr as Error).message || "request did not complete"}. ` +
-      `The backend may be restarting — retry in a moment.`
+      "Check the latest status before trying again; work may already have started."
     );
   }
   if (!res.ok) {
@@ -165,6 +180,8 @@ export const api = {
       request<Scene>("/scenes", { method: "POST", body: JSON.stringify(data) }),
     update: (id: number, data: Partial<Scene>) =>
       request<Scene>(`/scenes/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
+    updateTiming: (id: number, data: { duration: number; video_model?: string; resolution?: string; audio_sync_enabled?: boolean }) =>
+      request<{ scenes: Scene[]; shifted_scenes: number }>(`/scenes/${id}/timing`, { method: "POST", body: JSON.stringify(data) }),
     delete: (id: number) => request<void>(`/scenes/${id}`, { method: "DELETE" }),
     deleteAll: (projectId: number) =>
       request<{ deleted: number }>(`/scenes?project_id=${projectId}`, { method: "DELETE" }),
@@ -287,6 +304,7 @@ export const api = {
       request<{ message: string; scene_id: number }>(`/generation/scene/${sceneId}/cancel`, { method: "POST" }),
     assemble: (projectId: number) =>
       request<{ message: string; job_id: number }>(`/generation/assemble/${projectId}`, { method: "POST" }),
+    assembleDownloadUrl: (projectId: number) => `/api/generation/assemble/${projectId}/download`,
     assembleStatus: (projectId: number) =>
       request<{
         status: "none" | "running" | "completed" | "failed";

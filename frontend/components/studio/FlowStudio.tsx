@@ -13,6 +13,8 @@ import StepCharactersCell from "./cells/StepCharactersCell";
 import StepPlanCell from "./cells/StepPlanCell";
 import StepGenerateCell from "./cells/StepGenerateCell";
 import StepAssembleCell from "./cells/StepAssembleCell";
+import { isSceneBusy } from "@/lib/generationView";
+import ModelsButton from "./ModelsButton";
 
 interface Props {
   project: Project;
@@ -49,13 +51,11 @@ export default function FlowStudio({ project, song, scenes, characters, jobs, co
     ? "locked"
     : (() => {
         const done = scenes.filter((s) => s.status === "done").length;
-        const running = scenes.some((s) =>
-          ["generating_image", "generating_video"].includes(s.status)
-        );
-        const errored = scenes.some((s) => s.status === "error");
+        const running = scenes.some(isSceneBusy);
+        const errored = scenes.some((s) => s.status === "error" || !!s.error_message);
         if (running) return "running";
+        if (errored) return "error";
         if (done === scenes.length) return "complete";
-        if (errored && done < scenes.length) return "error";
         return "ready";
       })();
 
@@ -74,6 +74,12 @@ export default function FlowStudio({ project, song, scenes, characters, jobs, co
 
   const [expanded, setExpanded] = useState<Set<number>>(initialExpand);
   const [showEditProject, setShowEditProject] = useState(false);
+  const stepLabels = ["Song", "Characters", "Scene plan", "Generate", "Assemble"];
+  const stepStatuses = [songStatus, charactersStatus, planStatus, generateStatus, assembleStatus];
+  const openStep = (step: number) => {
+    setExpanded((current) => new Set(current).add(step));
+    requestAnimationFrame(() => document.getElementById(`cell-${step}`)?.scrollIntoView({ behavior: "smooth", block: "start" }));
+  };
 
   const toggle = (step: number) =>
     setExpanded((s) => {
@@ -108,7 +114,7 @@ export default function FlowStudio({ project, song, scenes, characters, jobs, co
           >
             <ChevronLeft className="w-5 h-5" />
           </button>
-          <Film className="w-4 h-4 text-accent" />
+          <Film className="hidden w-4 h-4 text-accent sm:block" />
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-1.5">
               <h1 className="font-semibold text-sm truncate">{project.name}</h1>
@@ -127,10 +133,11 @@ export default function FlowStudio({ project, song, scenes, characters, jobs, co
               {project.style || "no style set"} · {project.aspect_ratio}
             </p>
           </div>
+          <ModelsButton project={project} scenes={scenes} />
           {costs && costs.total_usd > 0 && (
             <div
               className="flex items-center gap-1.5 text-xs bg-green-900/20 border border-green-800/40 text-green-300 px-2.5 py-1 rounded-md font-mono"
-              title={`${costs.job_count} jobs · click to see breakdown`}
+              title={`Recorded cost across ${costs.job_count} jobs`}
             >
               <DollarSign className="w-3 h-3" />
               {fmtCost(costs.total_usd)}
@@ -144,6 +151,9 @@ export default function FlowStudio({ project, song, scenes, characters, jobs, co
 
       {/* Notebook content */}
       <main className="max-w-6xl mx-auto px-3 sm:px-6 py-5 sm:py-8 space-y-5 sm:space-y-6">
+        <nav aria-label="Project workflow" className="grid grid-cols-5 gap-1.5 rounded-xl border border-white/5 bg-surface-2/50 p-2">
+          {stepLabels.map((label, index) => <button key={label} onClick={() => openStep(index + 1)} disabled={stepStatuses[index] === "locked"} className={`rounded-lg px-1 sm:px-3 py-2.5 text-center text-[10px] sm:text-xs transition-colors disabled:opacity-35 ${expanded.has(index + 1) ? "bg-accent/15 text-violet-200" : "text-zinc-400 hover:bg-white/5 hover:text-white"}`}><span className="mr-1.5 text-zinc-500">{index + 1}</span>{label}{stepStatuses[index] === "complete" && <Check className="ml-1 inline h-3 w-3 text-emerald-400" />}</button>)}
+        </nav>
 
         <Cell
           step={1}
@@ -183,7 +193,7 @@ export default function FlowStudio({ project, song, scenes, characters, jobs, co
         <Cell
           step={3}
           title="Scene Plan"
-          subtitle={scenes.length ? `${scenes.length} scenes mapped to your song` : "Auto-plan or build scenes manually"}
+          subtitle={songStatus !== "complete" ? "Add and analyze your song to unlock scene planning" : scenes.length ? `${scenes.length} scenes mapped to your song` : "Auto-plan or build scenes manually"}
           status={planStatus}
           expanded={expanded.has(3)}
           onToggle={() => toggle(3)}
@@ -217,7 +227,7 @@ export default function FlowStudio({ project, song, scenes, characters, jobs, co
         <Cell
           step={5}
           title="Final Assembly"
-          subtitle="Stitch scenes with audio and export the finished video"
+          subtitle={hasContiguousOpening ? "Stitch scenes with audio and export the finished video" : "Finish the first scene’s video to unlock a preview export"}
           status={assembleStatus}
           expanded={expanded.has(5)}
           onToggle={() => toggle(5)}
@@ -367,7 +377,7 @@ function fmtCost(usd: number): string {
 
 function ProgressDots({ steps }: { steps: CellStatus[] }) {
   return (
-    <div className="flex items-center gap-1.5">
+    <div className="hidden items-center gap-1.5 sm:flex">
       {steps.map((s, i) => (
         <span
           key={i}

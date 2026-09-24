@@ -1,16 +1,17 @@
 import json
+import math
 import os
 import traceback
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse
 from sqlmodel import Session, select
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 
 from app.database import engine, get_session
 from app.models import Scene, SceneAsset, ScenePromptVersion, Song, Project, Character, GenerationJob
-from app.config import settings, VIDEO_MODELS
+from app.config import settings, VIDEO_MODELS, video_durations, video_uses_audio_input
 from app.services import openrouter, pricing
 from app.services.media_files import (
     MAX_VIDEO_UPLOAD_BYTES,
@@ -25,6 +26,7 @@ from app.services.media_files import (
     validated_extension,
 )
 from app.services.generation_state import release_stale_scene_claim
+from app.services.scene_timing import preserve_video_timing, video_timing_matches, active_video_timing_matches
 
 
 def _record_failed_chat_billing(
@@ -245,6 +247,13 @@ class SceneUpdate(BaseModel):
     chain_from_prev: Optional[bool] = None
 
 
+class SceneTimingUpdate(BaseModel):
+    duration: float = Field(gt=0, le=60, allow_inf_nan=False)
+    video_model: Optional[str] = None
+    resolution: Optional[str] = None
+    audio_sync_enabled: Optional[bool] = None
+
+
 class ExpandPromptsRequest(BaseModel):
     llm_model: Optional[str] = None  # default: google/gemini-3-flash-preview
 
@@ -252,7 +261,7 @@ class ExpandPromptsRequest(BaseModel):
 class GenerateBatchRequest(BaseModel):
     project_id: int
     song_id: int
-    target_scene_duration: float = 8.0
+    target_scene_duration: int = Field(default=8, ge=1, le=60)
     llm_model: Optional[str] = None
     story_seed: Optional[str] = None
     # Where in the global scene list this batch fills. Frontend starts at 0
@@ -269,7 +278,7 @@ def list_scenes(project_id: int, db: Session = Depends(get_session)):
         .where(Scene.project_id == project_id)
         .order_by(Scene.order)
     ).all()
-    return [_scene_with_urls(s, db) for s in scenes]
+    return _scenes_with_urls(scenes, db)
 
 
 @router.post("", status_code=201)
@@ -289,6 +298,47 @@ def get_scene(scene_id: int, db: Session = Depends(get_session)):
     if not scene:
         raise HTTPException(404, "Scene not found")
     return _scene_with_urls(scene, db)
+
+
+def _validate_video_settings(scene: Scene, payload: dict, db: Session):
+    if {"video_model", "audio_sync_enabled", "resolution", "audio_start", "audio_end"}.intersection(payload):
+        proposed_model = payload.get("video_model", scene.video_model)
+        selected_cfg = VIDEO_MODELS.get(proposed_model)
+        if not selected_cfg:
+            raise HTTPException(400, f"Unknown video model: {proposed_model}")
+        proposed_start = float(payload.get("audio_start", scene.audio_start))
+        proposed_end = float(payload.get("audio_end", scene.audio_end))
+        if not math.isfinite(proposed_start) or not math.isfinite(proposed_end) or proposed_start < 0 or proposed_end <= proposed_start:
+            raise HTTPException(400, "Scene timing must have a non-negative start and an end after its start.")
+        proposed_duration = int(round(proposed_end - proposed_start))
+        requested_audio = payload.get("audio_sync_enabled", scene.audio_sync_enabled)
+        if selected_cfg.get("requires_audio_input"):
+            if payload.get("audio_sync_enabled") is False:
+                raise HTTPException(400, f"{selected_cfg['name']} requires song sync. Choose another model to turn it off.")
+            payload["audio_sync_enabled"] = True
+        elif not selected_cfg.get("supports_audio_input"):
+            if payload.get("audio_sync_enabled") is True:
+                raise HTTPException(400, f"{selected_cfg['name']} does not support song sync.")
+            payload["audio_sync_enabled"] = False
+            requested_audio = False
+        audio_active = video_uses_audio_input(selected_cfg, requested_audio)
+        supported = video_durations(selected_cfg, audio_active)
+        if proposed_duration not in supported:
+            supported_label = ", ".join(f"{value}s" for value in supported)
+            raise HTTPException(
+                400,
+                f"{selected_cfg.get('name', proposed_model)} cannot render this "
+                f"{proposed_duration}s scene. Supported durations: {supported_label}. "
+                "Choose a compatible model or change the scene length.",
+            )
+        resolutions = (selected_cfg.get("audio_resolutions") if audio_active else None) or selected_cfg.get("resolutions", [])
+        proposed_resolution = payload.get("resolution", scene.resolution)
+        if proposed_resolution not in resolutions:
+            raise HTTPException(400, f"{selected_cfg['name']} supports {', '.join(resolutions)} in this mode. Choose a supported resolution.")
+        project = db.get(Project, scene.project_id)
+        aspects = (selected_cfg.get("audio_aspects") if audio_active else None) or selected_cfg.get("aspects", [])
+        if project and project.aspect_ratio not in aspects:
+            raise HTTPException(400, f"{selected_cfg['name']} does not support the project's {project.aspect_ratio} aspect ratio.")
 
 
 @router.patch("/{scene_id}")
@@ -318,24 +368,11 @@ def update_scene(scene_id: int, data: SceneUpdate, db: Session = Depends(get_ses
             # Switching away from a refs-capable model must not leave a
             # hidden character-mode selection that the new model can't use.
             payload["video_reference_mode"] = "frame"
-    if {"video_model", "audio_start", "audio_end"}.intersection(payload):
-        proposed_model = payload.get("video_model", scene.video_model)
-        selected_cfg = VIDEO_MODELS.get(proposed_model)
-        if not selected_cfg:
-            raise HTTPException(400, f"Unknown video model: {proposed_model}")
-        proposed_start = float(payload.get("audio_start", scene.audio_start))
-        proposed_end = float(payload.get("audio_end", scene.audio_end))
-        proposed_duration = int(round(proposed_end - proposed_start))
-        supported = selected_cfg.get("durations") or []
-        if proposed_duration not in supported:
-            supported_label = ", ".join(f"{value}s" for value in supported)
-            raise HTTPException(
-                400,
-                f"{selected_cfg.get('name', proposed_model)} cannot render this "
-                f"{proposed_duration}s scene. Supported durations: {supported_label}. "
-                "Choose a compatible model or change the scene length.",
-            )
-    boundary_changed = "audio_start" in payload or "audio_end" in payload
+    _validate_video_settings(scene, payload, db)
+    boundary_changed = any(key in payload and abs(payload[key] - getattr(scene, key)) > 0.001 for key in ("audio_start", "audio_end"))
+    if boundary_changed:
+        _ensure_no_saved_video_job(db, [scene.id])
+        preserve_video_timing(db, scene)
 
     # If user manually edited a prompt, save it as a "manual" version.
     # Pop these out of the payload and handle via _save_prompt_version so
@@ -358,6 +395,7 @@ def update_scene(scene_id: int, data: SceneUpdate, db: Session = Depends(get_ses
         if scene.status == "error" and scene.video_path and os.path.exists(scene.video_path):
             scene.status = "done"
     if boundary_changed:
+        scene.extracted_last_frame_path = None
         if scene.video_path and os.path.exists(scene.video_path):
             scene.status = "image_ready" if scene.reference_image_path else "pending"
             scene.error_message = (
@@ -385,6 +423,84 @@ def update_scene(scene_id: int, data: SceneUpdate, db: Session = Depends(get_ses
     db.commit()
     db.refresh(scene)
     return _scene_with_urls(scene, db)
+
+
+def _ensure_no_saved_video_job(db, scene_ids):
+    pending = db.exec(select(GenerationJob).where(
+        GenerationJob.scene_id.in_(scene_ids), GenerationJob.job_type == "video",
+        GenerationJob.status == "running",
+    )).first()
+    if pending:
+        raise HTTPException(409, "A scene has a saved video job awaiting recovery. Resume or cancel it before changing timing.")
+    scenes = db.exec(select(Scene).where(Scene.id.in_(scene_ids))).all()
+    project_ids = list({scene.project_id for scene in scenes})
+    assembly = db.exec(select(GenerationJob).where(GenerationJob.project_id.in_(project_ids),
+        GenerationJob.job_type == "assembly", GenerationJob.status == "running")).first()
+    if assembly:
+        raise HTTPException(409, "Wait for the current assembly to finish before changing scene timing.")
+
+
+@router.post("/{scene_id}/timing")
+def update_scene_timing(scene_id: int, data: SceneTimingUpdate, db: Session = Depends(get_session)):
+    """Change one scene's length and shift following song windows atomically."""
+    try:
+        scene = db.get(Scene, scene_id)
+        if not scene:
+            raise HTTPException(404, "Scene not found")
+        following = db.exec(select(Scene).where(Scene.project_id == scene.project_id,
+            Scene.order > scene.order).order_by(Scene.order)).all()
+        delta = data.duration - (scene.audio_end - scene.audio_start)
+        changed = abs(delta) > 0.001
+        affected = [scene, *following] if changed else [scene]
+        for item in affected:
+            _ensure_scene_idle(item, db)
+        if changed:
+            _ensure_no_saved_video_job(db, [item.id for item in affected])
+            previous_end = scene.audio_end
+            for item in following:
+                if abs(item.audio_start - previous_end) > 0.01:
+                    raise HTTPException(409, "The timeline already has a gap or overlap. Fix it before shifting scene lengths.")
+                previous_end = item.audio_end
+        payload = data.model_dump(exclude_none=True, exclude={"duration"})
+        payload["audio_end"] = scene.audio_start + data.duration
+        _validate_video_settings(scene, payload, db)
+        if changed and abs(data.duration - round(data.duration)) > 0.001:
+            raise HTTPException(400, "Choose an exact supported whole-second generation length.")
+        song = db.exec(select(Song).where(Song.project_id == scene.project_id)).first()
+        words = None
+        if song and song.transcription_json:
+            try:
+                words = json.loads(song.transcription_json)
+            except (ValueError, TypeError):
+                pass
+        for item in affected:
+            if changed:
+                preserve_video_timing(db, item)
+            if item.id == scene_id:
+                for key, value in payload.items():
+                    setattr(item, key, value)
+                if not VIDEO_MODELS[item.video_model].get("supports_reference_images"):
+                    item.video_reference_mode = "frame"
+            else:
+                item.audio_start += delta
+                item.audio_end += delta
+            if changed:
+                item.extracted_last_frame_path = None
+                item.status = "image_ready" if item.reference_image_path else "pending"
+                item.error_message = "Scene timing changed. Review the prompt and regenerate this video before assembly. Previous versions are preserved."
+                if words is not None:
+                    from app.services.audio_analysis import words_in_range
+                    item.lyrics_segment = words_in_range(words, item.audio_start, item.audio_end)
+            db.add(item)
+        db.commit()
+        return {"scenes": _scenes_with_urls(affected, db), "shifted_scenes": len(following) if changed else 0}
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        traceback.print_exc()
+        raise HTTPException(500, f"Could not update scene timing ({type(exc).__name__}).") from exc
 
 
 @router.delete("/{scene_id}", status_code=204)
@@ -530,7 +646,16 @@ async def generate_scene_batch(req: GenerateBatchRequest, db: Session = Depends(
             theme_analysis = {}
 
         from app.services.scene_planner import plan_scene_batch, compute_scene_windows
-        windows = compute_scene_windows(song.duration or 0, req.target_scene_duration)
+        try:
+            windows = compute_scene_windows(song.duration or 0, req.target_scene_duration)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if req.start_index == 0:
+            project.target_scene_duration = req.target_scene_duration
+            db.add(project)
+        elif (project.target_scene_duration is not None
+                and project.target_scene_duration != req.target_scene_duration):
+            raise HTTPException(409, "Scene length changed. Start a new plan to use the new length.")
         total_scenes = len(windows)
 
         if req.start_index >= total_scenes:
@@ -556,6 +681,15 @@ async def generate_scene_batch(req: GenerateBatchRequest, db: Session = Depends(
             for s in previous_scenes_raw
         ]
 
+        # A continuation must use the same fixed timeline as its saved prefix.
+        # Reject old redistributed plans or manually shifted scenes before any
+        # paid request, rather than creating overlaps or gaps in later batches.
+        for index in range(req.start_index):
+            expected = windows[index]
+            saved = next((s for s in previous_scenes_raw if s.order == index + 1), None)
+            if saved is None or (saved.audio_start, saved.audio_end) != expected:
+                raise HTTPException(409, "Existing scene timings do not match the chosen length. Start a new plan to use fixed-length scenes.")
+
         batch_windows = windows[req.start_index: req.start_index + req.batch_size]
 
         # ─── Idempotency guard ──────────────────────────────────────────────
@@ -570,6 +704,8 @@ async def generate_scene_batch(req: GenerateBatchRequest, db: Session = Depends(
         existing_by_order = {s.order: s for s in previous_scenes_raw if s.order in target_orders}
         for existing_scene in existing_by_order.values():
             _ensure_scene_idle(existing_scene, db, include_remote_job=True)
+            if (existing_scene.audio_start, existing_scene.audio_end) != windows[existing_scene.order - 1]:
+                raise HTTPException(409, "Saved batch timings do not match the chosen scene length. Start a new plan.")
         if req.start_index > 0 and len(existing_by_order) == len(target_orders) and target_orders:
             print(f"[generate-batch] start_index={req.start_index}: scenes at "
                   f"orders {target_orders} already exist — returning idempotent "
@@ -824,7 +960,9 @@ def chain_to_next(scene_id: int, db: Session = Depends(get_session)):
 
     # Case 1: create. Inherit per-scene settings from THIS scene so the user
     # doesn't have to re-pick models/resolution every time they add a scene.
-    duration = max(3.0, scene.audio_end - scene.audio_start)
+    duration = scene.audio_end - scene.audio_start
+    if duration <= 0:
+        raise HTTPException(400, "The source scene must have a positive duration.")
     next_scene = Scene(
         project_id=scene.project_id,
         order=scene.order + 1,
@@ -839,6 +977,9 @@ def chain_to_next(scene_id: int, db: Session = Depends(get_session)):
         video_model=scene.video_model,
         image_model=scene.image_model,
         resolution=scene.resolution,
+        audio_sync_enabled=video_uses_audio_input(
+            VIDEO_MODELS.get(scene.video_model, {}), scene.audio_sync_enabled,
+        ),
         align_to_beats=scene.align_to_beats,
         prompts_expanded=False,
         status="pending",
@@ -1197,6 +1338,8 @@ def dismiss_scene_error(scene_id: int, db: Session = Depends(get_session)):
     if not scene:
         raise HTTPException(404, "Scene not found")
     import os as _os
+    if not active_video_timing_matches(db, scene):
+        raise HTTPException(409, "This video belongs to an older song window. Regenerate it before dismissing the timing warning.")
     if scene.video_path and _os.path.exists(scene.video_path):
         scene.status = "done"
     elif scene.reference_image_path and _os.path.exists(scene.reference_image_path):
@@ -1261,7 +1404,36 @@ def _asset_to_dict(a: SceneAsset) -> dict:
     }
 
 
-def _scene_with_urls(scene: Scene, db: Optional[Session] = None) -> dict:
+def _scenes_with_urls(scenes: list[Scene], db: Session) -> list[dict]:
+    """Load version histories in bulk for the frequently polled project view."""
+    if not scenes:
+        return []
+    scene_ids = [scene.id for scene in scenes]
+    assets_by_scene: dict[int, list[SceneAsset]] = {}
+    prompts_by_scene: dict[int, list[ScenePromptVersion]] = {}
+    for asset in db.exec(
+        select(SceneAsset).where(SceneAsset.scene_id.in_(scene_ids))
+        .order_by(SceneAsset.created_at.desc(), SceneAsset.id.desc())
+    ).all():
+        assets_by_scene.setdefault(asset.scene_id, []).append(asset)
+    for version in db.exec(
+        select(ScenePromptVersion).where(ScenePromptVersion.scene_id.in_(scene_ids))
+        .order_by(ScenePromptVersion.created_at.desc(), ScenePromptVersion.id.desc())
+    ).all():
+        prompts_by_scene.setdefault(version.scene_id, []).append(version)
+    return [
+        _scene_with_urls(
+            scene, assets=assets_by_scene.get(scene.id, []),
+            prompt_versions=prompts_by_scene.get(scene.id, []),
+        ) for scene in scenes
+    ]
+
+
+def _scene_with_urls(
+    scene: Scene, db: Optional[Session] = None,
+    *, assets: list[SceneAsset] | None = None,
+    prompt_versions: list[ScenePromptVersion] | None = None,
+) -> dict:
     d = scene.model_dump()
     d["reference_image_url"] = _to_storage_url(scene.reference_image_path)
     d["video_url"] = _to_storage_url(scene.video_path)
@@ -1273,20 +1445,23 @@ def _scene_with_urls(scene: Scene, db: Optional[Session] = None) -> dict:
     # the "chained from prev" preview look like it's from an earlier video.
     d["extracted_last_frame_url"] = _to_storage_url(scene.extracted_last_frame_path, cache_bust=True)
     d["duration"] = round(scene.audio_end - scene.audio_start, 2)
-    if db is not None:
+    if assets is None and db is not None:
         assets = db.exec(
             select(SceneAsset).where(SceneAsset.scene_id == scene.id).order_by(SceneAsset.created_at.desc())
         ).all()
-        d["assets"] = [_asset_to_dict(a) for a in assets]
+    if prompt_versions is None and db is not None:
         prompt_versions = db.exec(
             select(ScenePromptVersion)
             .where(ScenePromptVersion.scene_id == scene.id)
             .order_by(ScenePromptVersion.created_at.desc())
         ).all()
-        d["prompt_versions"] = [_prompt_version_to_dict(v) for v in prompt_versions]
-    else:
-        d["assets"] = []
-        d["prompt_versions"] = []
+    d["assets"] = [_asset_to_dict(a) for a in assets or []]
+    active_video = next((a for a in assets or [] if a.asset_type == "video" and a.is_active), None)
+    d["video_timing_stale"] = bool(active_video and not video_timing_matches(scene, active_video))
+    if active_video and not video_timing_matches(scene, active_video) and not scene.generation_run_id:
+        d["status"] = "image_ready" if scene.reference_image_path else "pending"
+        d["error_message"] = "Scene timing changed. Review the prompt and regenerate this video before assembly. Previous versions are preserved."
+    d["prompt_versions"] = [_prompt_version_to_dict(v) for v in prompt_versions or []]
     return d
 
 
@@ -1388,6 +1563,8 @@ def activate_scene_asset(scene_id: int, asset_id: int, db: Session = Depends(get
         raise HTTPException(404, "Asset not found")
     if not os.path.isfile(asset.file_path):
         raise HTTPException(409, "Asset file is missing from storage")
+    if asset.asset_type == "video" and not video_timing_matches(scene, asset):
+        raise HTTPException(409, "This version belongs to an older scene timing. Restore its song window or generate a new video.")
 
     from app.services.versioning import make_active
     make_active(
@@ -1437,7 +1614,12 @@ def delete_scene_asset(scene_id: int, asset_id: int, db: Session = Depends(get_s
         ),
     )
     if asset_type == "video" and was_active:
-        _refresh_scene_last_frame(scene, promoted.file_path if promoted else None)
+        if promoted and not video_timing_matches(scene, promoted):
+            scene.extracted_last_frame_path = None
+            scene.status = "image_ready" if scene.reference_image_path else "pending"
+            scene.error_message = "Scene timing changed. Regenerate this video before assembly."
+        else:
+            _refresh_scene_last_frame(scene, promoted.file_path if promoted else None)
     db.commit()
 
     remove_storage_file(file_path)
@@ -1494,24 +1676,26 @@ def download_first_frame(scene_id: int, db: Session = Depends(get_session)):
 
 @router.get("/{scene_id}/audio-chunk")
 async def download_audio_chunk(scene_id: int, db: Session = Depends(get_session)):
-    """Slice the song segment for this scene's [audio_start, audio_end]
-    window (via the same ffmpeg helper the audio-sync gen path uses) and
-    return it as an MP3 download. Useful for testing fal Seedance's web UI
-    with the exact audio our backend sends."""
+    """Download the same audio window and encoding used by the selected route."""
     scene = db.get(Scene, scene_id)
     if not scene:
         raise HTTPException(404, "Scene not found")
     from app.services.generation_service import _extract_audio_segment
+    config = VIDEO_MODELS.get(scene.video_model, {})
+    audio_active = video_uses_audio_input(config, scene.audio_sync_enabled)
+    lossless = audio_active and config.get("audio_input_mode") in ("wan_i2v", "ltx_a2v", "wan_r2v")
+    duration = scene.audio_end - scene.audio_start
+    limit = duration - 0.15 if audio_active and not lossless else duration
     try:
-        path = await _extract_audio_segment(scene, db)
+        path = await _extract_audio_segment(scene, db, max_duration=limit, lossless=lossless)
     except Exception as e:
         raise HTTPException(500, f"Audio slice failed ({type(e).__name__}: {str(e)[:200]})")
     if not os.path.exists(path):
         raise HTTPException(500, "Audio slice helper returned a path that doesn't exist on disk.")
     return FileResponse(
         path,
-        media_type="audio/mpeg",
-        filename=f"scene_{scene.order}_{scene.audio_start:.1f}-{scene.audio_end:.1f}s.mp3",
+        media_type="audio/wav" if lossless else "audio/mpeg",
+        filename=f"scene_{scene.order}_{scene.audio_start:.1f}-{scene.audio_end:.1f}s.{'wav' if lossless else 'mp3'}",
     )
 
 

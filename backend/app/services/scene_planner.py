@@ -5,6 +5,7 @@ a list of Scene objects aligned to musical sections and beats.
 """
 
 import json
+import math
 from typing import Optional
 from app.services import openrouter
 from app.services.audio_analysis import words_in_range, beats_in_range
@@ -281,26 +282,21 @@ async def auto_plan_scenes(
 
 
 def compute_scene_windows(duration: float, target_scene_duration: float) -> list[tuple[int, int]]:
-    """Decide scene boundaries up-front so batches don't have to coordinate.
+    """Use the requested render length exactly, including the closing clip.
 
-    Returns a list of (start_sec, end_sec) integer pairs covering [0, duration]
-    with each scene as close to `target_scene_duration` seconds as possible
-    while staying a whole-second-boundary plan. Minimum 3 scenes; minimum 3s
-    per scene (matches the duration slider's lower bound).
+    Never distribute leftover song time across scenes: that can exceed both
+    the user's setting and a provider's maximum. The last full-length clip
+    covers the song's remainder; assembly trims the export at the song end.
     """
-    if duration <= 0:
-        return [(0, max(3, int(target_scene_duration)))] * 3
-    n = max(3, round(duration / max(target_scene_duration, 3.0)))
-    raw_step = duration / n
-    windows: list[tuple[int, int]] = []
-    cursor = 0.0
-    for i in range(n):
-        end = duration if i == n - 1 else (i + 1) * raw_step
-        s = round(cursor)
-        e = max(s + 3, round(end))
-        windows.append((s, e))
-        cursor = end
-    return windows
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("Song duration must be a positive finite number")
+    if (not math.isfinite(target_scene_duration)
+            or not 1 <= target_scene_duration <= 60
+            or int(target_scene_duration) != target_scene_duration):
+        raise ValueError("Scene length must be a whole number from 1 to 60 seconds")
+    length = int(target_scene_duration)
+    count = math.ceil(duration / length)
+    return [(index * length, (index + 1) * length) for index in range(count)]
 
 
 async def plan_scene_batch(
@@ -423,6 +419,9 @@ async def plan_scene_batch(
         f"{batch_block}\n\n"
         f"Total plan size: {total_scenes} scenes. This batch is scenes "
         f"#{batch_start_index + 1}–#{batch_start_index + len(batch_windows)}.\n\n"
+        f"Every clip must be exactly {target_scene_duration:g}s. The song ends at "
+        f"{duration:g}s; any final clip extending beyond that will be trimmed in "
+        "assembly. Place the closing action before the song ends, then hold.\n\n"
         f"Return a JSON array of exactly {len(batch_windows)} scene objects, in order. Each:\n"
         f"  - order: integer (match the # shown above)\n"
         f"  - audio_start, audio_end: integers (match the window shown — do NOT change)\n"

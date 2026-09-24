@@ -385,7 +385,13 @@ app = FastAPI(title="Music Video Studio API", version="1.0.0", lifespan=lifespan
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_url, "http://localhost:3000", "http://localhost:3001"],
+    # The launcher binds Next to 127.0.0.1. Media URLs may still use localhost;
+    # fetch-based downloads need CORS permission for either frontend spelling.
+    allow_origins=[
+        settings.frontend_url,
+        "http://localhost:3000", "http://localhost:3001",
+        "http://127.0.0.1:3000", "http://127.0.0.1:3001",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -553,9 +559,20 @@ async def health():
 
 @app.get("/api/models")
 async def list_models():
-    from app.config import VIDEO_MODELS, IMAGE_MODELS, LLM_MODELS
+    from sqlmodel import Session
+    from app.database import engine
+    from app.config import VIDEO_MODELS, IMAGE_MODELS, LLM_MODELS, MODEL_CATALOG_VERIFIED_AT
+    from app.services.model_inventory import build_video_inventory
+    with Session(engine) as db:
+        inventory = build_video_inventory(db)
+    used_models = {
+        key: {**config, **inventory[key]}
+        for key, config in VIDEO_MODELS.items()
+        if config.get("show_in_catalog") or inventory[key]["history"]["attempts"] or inventory[key]["history"]["video_assets"]
+    }
     return {
-        "video": VIDEO_MODELS,
+        "verified_at": MODEL_CATALOG_VERIFIED_AT,
+        "video": used_models,
         "image": IMAGE_MODELS,
         "llm": LLM_MODELS,
     }

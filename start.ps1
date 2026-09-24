@@ -1,6 +1,11 @@
+param([switch]$Reload)
+
 $ErrorActionPreference = "Stop"
 $env:PYTHONUTF8 = "1"
 $env:PYTHONUNBUFFERED = "1"
+# This launcher always starts the backend here. Override stale .env.local
+# destinations in the frontend process to keep the two services connected.
+$env:BACKEND_URL = "http://127.0.0.1:8010"
 
 function Assert-NativeSuccess([string]$Operation) {
     if ($LASTEXITCODE -ne 0) {
@@ -40,7 +45,8 @@ if (-not (Test-Path -LiteralPath $pythonExe -PathType Leaf)) {
 
 $requirementsFile = Join-Path $backendDir "requirements.txt"
 $requirementsMarker = Join-Path $venvDir ".requirements.sha256"
-$requirementsHash = (Get-FileHash -LiteralPath $requirementsFile -Algorithm SHA256).Hash
+$requirementsHash = (& $pythonExe -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], 'rb').read()).hexdigest().upper())" $requirementsFile).Trim()
+Assert-NativeSuccess "Requirements hash"
 $installedRequirementsHash = if (Test-Path -LiteralPath $requirementsMarker) {
     (Get-Content -LiteralPath $requirementsMarker -Raw).Trim()
 } else { "" }
@@ -54,7 +60,8 @@ if ($requirementsHash -ne $installedRequirementsHash) {
 $nodeModulesDir = Join-Path $frontendDir "node_modules"
 $packageLock = Join-Path $frontendDir "package-lock.json"
 $packageMarker = Join-Path $nodeModulesDir ".package-lock.sha256"
-$packageHash = (Get-FileHash -LiteralPath $packageLock -Algorithm SHA256).Hash
+$packageHash = (& $pythonExe -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], 'rb').read()).hexdigest().upper())" $packageLock).Trim()
+Assert-NativeSuccess "Package lock hash"
 $installedPackageHash = if (Test-Path -LiteralPath $packageMarker) {
     (Get-Content -LiteralPath $packageMarker -Raw).Trim()
 } else { "" }
@@ -79,18 +86,22 @@ Write-Host "Frontend: http://localhost:3000"
 Write-Host "Backend:  http://localhost:8010"
 Write-Host "API docs: http://localhost:8010/docs"
 Write-Host "Press Ctrl+C to stop both services."
+if ($Reload) {
+    Write-Warning "Development reload is enabled. Code changes can interrupt generation."
+}
 Write-Host ""
+
+$backendArgs = @(
+    "-m", "uvicorn", "app.main:app",
+    "--host", "127.0.0.1", "--port", "8010",
+    "--timeout-graceful-shutdown", "300"
+)
+if ($Reload) { $backendArgs += "--reload" }
 
 try {
     $backendProcess = Start-Process `
         -FilePath $pythonExe `
-        -ArgumentList @(
-            "-m", "uvicorn", "app.main:app",
-            "--host", "127.0.0.1",
-            "--port", "8010",
-            "--reload",
-            "--timeout-graceful-shutdown", "300"
-        ) `
+        -ArgumentList $backendArgs `
         -WorkingDirectory $backendDir `
         -NoNewWindow `
         -PassThru

@@ -1,6 +1,6 @@
 "use client";
 import { useState, useRef, useEffect } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, X, User, Upload, Sparkles, Loader2, ImageIcon, Wand2, ZoomIn, Pencil, Check, Dices } from "lucide-react";
 import { api } from "@/lib/api";
 import { useConfirm } from "@/components/ConfirmDialog";
@@ -194,11 +194,6 @@ export default function StepCharactersCell({
   );
 }
 
-const PORTRAIT_MODELS = [
-  { key: "gemini-3.1-flash-image", short: "Flash", full: "Gemini 3.1 Flash Image", price: "$0.04" },
-  { key: "gemini-3-pro-image",     short: "Pro",   full: "Gemini 3 Pro Image",   price: "~$0.14" },
-] as const;
-
 function CharacterRow({
   character, projectId, onDelete, onRefresh, onPreview,
 }: {
@@ -209,6 +204,8 @@ function CharacterRow({
   onPreview: (src: string) => void;
 }) {
   const confirm = useConfirm();
+  const { data: models, error: modelError, refetch: reloadModels } = useQuery({ queryKey: ["models"], queryFn: api.models.list });
+  const portraitModels = Object.entries(models?.image || {}).filter(([, model]) => model.available !== false);
   const fileRef = useRef<HTMLInputElement>(null);
   const [imageModel, setImageModel] = useState<string>("gemini-3.1-flash-image");
   const [isEditing, setIsEditing] = useState(false);
@@ -386,24 +383,17 @@ function CharacterRow({
         )}
 
         <div className="flex items-center gap-1.5 flex-wrap">
-          {/* Per-character model toggle */}
-          <div className="flex bg-surface-3 rounded-md p-0.5 border border-white/5">
-            {PORTRAIT_MODELS.map((m) => (
-              <button
-                key={m.key}
-                onClick={() => setImageModel(m.key)}
-                disabled={isWorking}
-                title={`${m.full} (${m.price}/img)`}
-                className={`text-[10px] px-2 py-0.5 rounded transition-colors disabled:opacity-40 ${
-                  imageModel === m.key
-                    ? "bg-accent/30 text-accent font-medium"
-                    : "text-zinc-500 hover:text-white"
-                }`}
-              >
-                {m.short}
-              </button>
-            ))}
-          </div>
+          <select
+            aria-label={`Portrait model for ${character.name}`}
+            value={imageModel}
+            onChange={(event) => setImageModel(event.target.value)}
+            disabled={isWorking || !models}
+            className="max-w-full rounded-md border border-white/10 bg-surface-3 px-2 py-1 text-[10px] text-zinc-300 disabled:opacity-40"
+          >
+            {!models && <option value={imageModel}>Loading image models…</option>}
+            {portraitModels.map(([key, model]) => <option key={key} value={key}>{model.name} · ~${model.price_per_image.toFixed(2)}/image</option>)}
+          </select>
+          {modelError && <button onClick={() => reloadModels()} className="text-[10px] text-amber-300 underline">Reload image models</button>}
 
           <input
             ref={fileRef}
@@ -436,11 +426,11 @@ function CharacterRow({
           )}
           <button
             onClick={() => generate.mutate()}
-            disabled={isWorking}
+            disabled={isWorking || !portraitModels.some(([key]) => key === imageModel)}
             className="text-[10px] flex items-center gap-1 px-2 py-1 bg-accent/20 hover:bg-accent/30 text-accent border border-accent/30 rounded-md transition-colors disabled:opacity-40"
             title={hasImage
-              ? `Add another variant via ${PORTRAIT_MODELS.find(m => m.key === imageModel)?.full} — keeps prior portraits, you pick which is active`
-              : `Generate first portrait via ${PORTRAIT_MODELS.find(m => m.key === imageModel)?.full}`}
+              ? `Add another variant via ${models?.image[imageModel]?.name || imageModel} — keeps prior portraits, you pick which is active`
+              : `Generate first portrait via ${models?.image[imageModel]?.name || imageModel}`}
           >
             <Sparkles className="w-2.5 h-2.5" />
             {hasImage ? "+ Variant" : "Generate"}
@@ -454,7 +444,7 @@ function CharacterRow({
             <div className="flex-1 min-w-0">
               <p className="text-[10px] text-accent font-medium">
                 Generating portrait{character.portrait_model ? ` with ${
-                  PORTRAIT_MODELS.find(m => m.key === character.portrait_model)?.full
+                  models?.image[character.portrait_model]?.name
                   || character.portrait_model
                 }` : "..."}
               </p>

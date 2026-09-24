@@ -3,6 +3,15 @@ set -Eeuo pipefail
 
 export PYTHONUTF8=1
 export PYTHONUNBUFFERED=1
+export BACKEND_URL=http://127.0.0.1:8010
+
+reload_args=()
+if [[ "${1:-}" == "--reload" ]]; then
+  reload_args=(--reload)
+elif [[ $# -gt 0 ]]; then
+  echo "Usage: ./start.sh [--reload]" >&2
+  exit 2
+fi
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND_DIR="$PROJECT_ROOT/backend"
@@ -78,9 +87,12 @@ echo "Frontend: http://localhost:3000"
 echo "Backend:  http://localhost:8010"
 echo "API docs: http://localhost:8010/docs"
 echo "Press Ctrl+C to stop both services."
+if [[ ${#reload_args[@]} -gt 0 ]]; then
+  echo "Development reload is enabled. Code changes can interrupt generation." >&2
+fi
 
 (cd "$BACKEND_DIR" && exec "$VENV_PYTHON" -m uvicorn app.main:app \
-  --host 127.0.0.1 --port 8010 --reload --timeout-graceful-shutdown 300) &
+  --host 127.0.0.1 --port 8010 "${reload_args[@]}" --timeout-graceful-shutdown 300) &
 backend_pid=$!
 
 (cd "$FRONTEND_DIR" && exec npm run dev) &

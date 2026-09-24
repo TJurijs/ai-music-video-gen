@@ -8,7 +8,9 @@ import json
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlparse
 from app.config import settings, OPENROUTER_BASE
+from app.services.provider_io import log_provider, RemoteJobFailedError, download_result, retry_delay
 
 
 class RemoteJobPendingError(RuntimeError):
@@ -126,10 +128,8 @@ async def generate_image(
     so the model preserves character/style identity. Only useful with image
     models that support multi-image conditioning (e.g. Gemini 2.5 Flash Image).
 
-    aspect_ratio (e.g. "16:9", "9:16", "1:1") is appended to the prompt as
-    an explicit instruction. Image models on OpenRouter don't take aspect
-    ratio as a structured parameter, but they reliably honor prompt-level
-    cues when they're emphatic.
+    Gemini image models accept aspect_ratio through image_config. The prompt
+    also describes the required format for consistent composition.
 
     Retry-on-text: Gemini 2.5 Flash Image sometimes returns a text description
     instead of an image (typical when the prompt mentions a real person's name
@@ -139,7 +139,13 @@ async def generate_image(
     """
     from app.config import IMAGE_MODELS
     model_key = model or settings.default_image_model
-    model_id = IMAGE_MODELS.get(model_key, {}).get("model_id", "openai/gpt-image-1")
+    model_cfg = IMAGE_MODELS.get(model_key)
+    if not model_cfg or model_cfg.get("available") is False:
+        raise ValueError(
+            (model_cfg or {}).get("unavailable_reason")
+            or f"Image model '{model_key}' is unavailable. Choose an available image model."
+        )
+    model_id = model_cfg["model_id"]
 
     # Inject aspect ratio cue if provided. Doubled emphasis because some
     # image models otherwise default to 1:1 regardless of prompt content.
@@ -169,6 +175,8 @@ async def generate_image(
         "modalities": ["image"],
         "messages": [{"role": "user", "content": content if len(content) > 1 else prompt}],
     }
+    if aspect_ratio and model_id.startswith("google/"):
+        payload["image_config"] = {"aspect_ratio": aspect_ratio}
 
     async with httpx.AsyncClient(timeout=120) as client:
         r = await client.post(
@@ -417,7 +425,7 @@ async def submit_video_job(
     # an invalid state. Diagnostic output must never abort a paid provider
     # request with ``OSError: [Errno 22] Invalid argument`` before submission.
     try:
-        print(
+        log_provider(
             f"[openrouter video] submit model={model_id} duration={duration}s "
             f"resolution={resolution} aspect={aspect_ratio} "
             f"first_frame={'yes' if first_frame_path else 'no'} "
@@ -539,11 +547,16 @@ async def poll_video_job(
         try:
             data = await get_video_status(job_id)
             consecutive_network_fails = 0  # any success resets the counter
-        except (httpx.ConnectError, httpx.ReadError, httpx.WriteError,
-                httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectTimeout,
-                httpx.PoolTimeout) as net_err:
+        except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as net_err:
+            response = net_err.response if isinstance(net_err, httpx.HTTPStatusError) else None
+            if response is not None and response.status_code not in (408, 429) and response.status_code < 500:
+                raise RemoteJobPendingError(
+                    f"Cannot read OpenRouter job {job_id} (HTTP {response.status_code}). "
+                    "Its provider handle is preserved; resolve the connection or account "
+                    "issue and resume without submitting another render."
+                ) from net_err
             consecutive_network_fails += 1
-            print(
+            log_provider(
                 f"[poll {job_id}] transient network error "
                 f"({type(net_err).__name__}: {str(net_err)[:120]}) — "
                 f"attempt {consecutive_network_fails}/{MAX_CONSECUTIVE_NETWORK_FAILS}, "
@@ -555,16 +568,23 @@ async def poll_video_job(
                     f"network errors. Job {job_id} is preserved; retry this scene "
                     f"to resume polling without submitting another paid render."
                 ) from net_err
-            await asyncio.sleep(interval)
+            await asyncio.sleep(max(interval, retry_delay(response, consecutive_network_fails - 1)))
             continue
+        if not isinstance(data, dict):
+            raise RemoteJobPendingError(
+                f"OpenRouter returned an invalid status for {job_id}; the saved job can be resumed."
+            )
         status = data.get("status")
         if status == "completed":
             urls = data.get("unsigned_urls") or data.get("urls") or []
-            if urls:
+            if isinstance(urls, list) and urls and isinstance(urls[0], str):
                 return urls[0]
-            raise ValueError("Job completed but no URLs returned")
-        if status in ("failed", "error"):
-            raise RuntimeError(f"Video job failed: {data.get('error', 'unknown')}")
+            raise RemoteJobPendingError(
+                f"OpenRouter completed {job_id} but has not returned a video URL. "
+                "Resume to retrieve the same render."
+            )
+        if status in ("failed", "error", "cancelled", "expired"):
+            raise RemoteJobFailedError(f"Video job {status}: {data.get('error', 'unknown')}")
         await asyncio.sleep(interval)
     raise RemoteJobPendingError(
         f"Video job {job_id} exceeded the local {timeout}s polling window. "
@@ -680,12 +700,9 @@ async def download_file(url: str, dest_path: str) -> str:
     auth even though the response calls them "unsigned_urls". Send the bearer
     token whenever the URL is on the OpenRouter API host.
     """
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    headers = _headers() if "openrouter.ai/api" in url else {}
-    async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
-        async with client.stream("GET", url, headers=headers) as r:
-            r.raise_for_status()
-            with open(dest_path, "wb") as f:
-                async for chunk in r.aiter_bytes(65536):
-                    f.write(chunk)
-    return dest_path
+    parsed = urlparse(url)
+    headers = _headers() if (
+        parsed.scheme == "https" and parsed.hostname == "openrouter.ai"
+        and parsed.path.startswith("/api/")
+    ) else {}
+    return await download_result(url, dest_path, headers=headers)

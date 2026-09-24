@@ -126,7 +126,7 @@ export default function StepAssembleCell({
       {isCompleted && s?.url ? (
         <AssembledVideoPanel
           videoUrl={s.url}
-          projectName={project.name}
+          downloadUrl={api.generation.assembleDownloadUrl(project.id)}
           completedAt={s.completed_at}
           scenes={doneScenes}
           onReassemble={() => assemble.mutate()}
@@ -194,11 +194,11 @@ function AssemblyRunningPanel({ startedAt }: { startedAt?: string | null }) {
 }
 
 function AssembledVideoPanel({
-  videoUrl, projectName, completedAt, scenes, onReassemble, reassembling,
+  videoUrl, downloadUrl, completedAt, scenes, onReassemble, reassembling,
   canReassemble,
 }: {
   videoUrl: string;
-  projectName: string;
+  downloadUrl: string;
   completedAt?: string | null;
   scenes: Scene[];
   onReassemble: () => void;
@@ -268,27 +268,6 @@ function AssembledVideoPanel({
     }
   };
 
-  // Browser-native "Save as…" dialog: fetch the video as a blob, then
-  // trigger a download with the project name. This avoids navigating away
-  // (which `<a href download>` does on some Windows + browser combos).
-  const handleDownload = async () => {
-    try {
-      const res = await fetch(videoUrl);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const blob = await res.blob();
-      const blobUrl = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = blobUrl;
-      a.download = `${projectName.replace(/[^a-zA-Z0-9 \-_]/g, "_")}.mp4`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
-    } catch (e) {
-      alert(`Download failed: ${(e as Error).message}`);
-    }
-  };
-
   // Cache-bust the video URL on each completion so the player loads the
   // newly-assembled file rather than a previously-cached version.
   const cacheBuster = completedAt ? `?t=${encodeURIComponent(completedAt)}` : "";
@@ -306,13 +285,14 @@ function AssembledVideoPanel({
           )}
         </div>
         <div className="flex items-center gap-1">
-          <button
-            onClick={handleDownload}
+          <a
+            href={downloadUrl}
+            download
             className="text-xs px-2 py-1 bg-green-500/15 hover:bg-green-500/30 text-green-300 border border-green-500/30 rounded flex items-center gap-1"
-            title="Save the final .mp4 to disk (opens your browser's Save As dialog)"
+            title="Download the final MP4 using your browser's download settings"
           >
             <Download className="w-3 h-3" /> Download
-          </button>
+          </a>
           <button
             onClick={onReassemble}
             disabled={reassembling || !canReassemble}

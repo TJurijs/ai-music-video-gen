@@ -6,6 +6,7 @@ import { Film, Plus, Music, Layers, Trash2, Wand2, Loader2 } from "lucide-react"
 import { api } from "@/lib/api";
 import { useConfirm } from "@/components/ConfirmDialog";
 import type { Project } from "@/lib/types";
+import ModelsButton from "@/components/studio/ModelsButton";
 
 export default function ProjectsPage() {
   const router = useRouter();
@@ -14,7 +15,7 @@ export default function ProjectsPage() {
   const [showNew, setShowNew] = useState(false);
   const [form, setForm] = useState({ name: "", description: "", style: "", aspect_ratio: "16:9" });
 
-  const { data: projects = [], isLoading, error: projectsError } = useQuery({
+  const { data: projects = [], isLoading, error: projectsError, refetch, isFetching } = useQuery({
     queryKey: ["projects"],
     queryFn: api.projects.list,
   });
@@ -46,27 +47,26 @@ export default function ProjectsPage() {
   return (
     <div className="min-h-screen bg-surface text-white">
       {/* Header */}
-      <header className="border-b border-white/5 px-4 sm:px-8 py-4 flex items-center justify-between">
+      <header className="sticky top-0 z-40 flex flex-wrap items-center justify-between gap-3 border-b border-white/5 bg-surface/85 px-4 py-4 backdrop-blur sm:px-8">
         <div className="flex items-center gap-3">
           <Film className="w-6 h-6 text-accent" />
           <span className="font-semibold text-lg tracking-tight">Music Video Studio</span>
         </div>
-        <button
+        <div className="flex items-center gap-2"><ModelsButton /><button
           onClick={() => setShowNew(true)}
           className="flex items-center gap-2 bg-accent hover:bg-accent-hover text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
         >
           <Plus className="w-4 h-4" /> New Project
-        </button>
+        </button></div>
       </header>
 
       <main className="max-w-5xl mx-auto px-4 sm:px-8 py-8 sm:py-10">
         <h1 className="text-2xl font-bold mb-6">Projects</h1>
 
-        {projectsError ? (
-          <ErrorMessage error={projectsError as Error} />
-        ) : isLoading ? (
+        {projectsError && <div role="alert" className="mb-5 rounded-xl border border-amber-800/40 bg-amber-900/10 p-4 text-sm text-amber-200"><p className="font-medium">Cannot refresh projects right now</p><p className="mt-1 text-xs text-amber-200/70">{(projectsError as Error).message}</p><button onClick={() => refetch()} disabled={isFetching} className="mt-3 rounded-lg border border-amber-500/30 px-3 py-1.5 text-xs hover:bg-amber-500/10 disabled:opacity-50">{isFetching ? "Reconnecting…" : "Try again"}</button></div>}
+        {isLoading ? (
           <div className="text-zinc-500 text-sm">Loading...</div>
-        ) : projects.length === 0 ? (
+        ) : projects.length === 0 && !projectsError ? (
           <div className="border border-dashed border-white/10 rounded-xl p-16 text-center">
             <Film className="w-12 h-12 text-zinc-600 mx-auto mb-4" />
             <p className="text-zinc-400 mb-4">No projects yet</p>
